@@ -1,0 +1,2 @@
+"""Schedule Helper application package."""
+
