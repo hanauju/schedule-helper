@@ -2,7 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, time
 
-from app.models import AppUsageSession, AvailabilityRule, Event, FocusEvent, FocusSession, QuickNote, Task, TrackedProgram
+from app.models import (
+    AppUsageSession,
+    AvailabilityRule,
+    Event,
+    FocusEvent,
+    FocusSession,
+    LinkFavorite,
+    LayoutProfile,
+    QuickNote,
+    Task,
+    TrackedProgram,
+)
 from app.storage.database import ScheduleRepository
 
 
@@ -92,6 +103,9 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_today_checklist_inline = True
     preferences.show_today_flow_panel = False
     preferences.show_quick_memo_panel = False
+    preferences.show_link_favorites_panel = False
+    preferences.show_compact_favorites_panel = True
+    preferences.favorite_display_mode = "icon_only"
     repository.save_preferences(preferences)
 
     reloaded_preferences = repository.get_preferences()
@@ -102,6 +116,24 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.show_today_checklist_inline
     assert not reloaded_preferences.show_today_flow_panel
     assert not reloaded_preferences.show_quick_memo_panel
+    assert not reloaded_preferences.show_link_favorites_panel
+    assert reloaded_preferences.show_compact_favorites_panel
+    assert reloaded_preferences.favorite_display_mode == "icon_only"
+
+
+def test_repository_saves_named_layout_profiles(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profile = repository.save_layout_profile(LayoutProfile(name="작업 배치", data='{"body":[700,300]}'))
+
+    assert profile.id is not None
+    assert repository.get_layout_profile("작업 배치").data == '{"body":[700,300]}'
+
+    repository.save_layout_profile(LayoutProfile(name="작업 배치", data='{"body":[600,400]}'))
+    profiles = repository.list_layout_profiles()
+
+    assert len(profiles) == 1
+    assert profiles[0].name == "작업 배치"
+    assert profiles[0].data == '{"body":[600,400]}'
 
 
 def test_repository_persists_app_usage_and_summaries(tmp_path) -> None:
@@ -187,9 +219,66 @@ def test_repository_updates_quick_note_body(tmp_path) -> None:
     )
 
     note.body = "after"
+    note.content_html = "<p><u>after</u></p>"
     repository.save_quick_note(note)
 
     reloaded = repository.get_quick_note(note.id)
     assert reloaded is not None
     assert reloaded.body == "after"
+    assert reloaded.content_html == "<p><u>after</u></p>"
     assert reloaded.created_at == datetime(2026, 6, 8, 12, 0)
+
+
+def test_repository_manages_quick_note_attachments(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    source = tmp_path / "source image.png"
+    source.write_text("image-bytes", encoding="utf-8")
+    note = repository.save_quick_note(
+        QuickNote(
+            body="with attachment",
+            created_at=datetime(2026, 6, 8, 12, 0),
+        )
+    )
+
+    attachment = repository.add_quick_note_attachment(note.id, source)
+
+    assert attachment.id is not None
+    assert attachment.file_name == "source image.png"
+    assert repository.list_quick_note_attachments(note.id)[0].id == attachment.id
+    assert repository.get_quick_note_attachment(attachment.id).stored_path == attachment.stored_path
+
+    copied_path = tmp_path / "attachments" / str(note.id)
+    assert copied_path.exists()
+
+    repository.delete_quick_note(note.id)
+
+    assert repository.list_quick_note_attachments(note.id) == []
+    assert not any(copied_path.glob("*"))
+
+
+def test_repository_manages_link_favorites(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    icon_source = tmp_path / "icon.png"
+    icon_source.write_text("icon", encoding="utf-8")
+    favorite = repository.save_link_favorite(LinkFavorite(title="Docs", target="example.com", icon_text="D"))
+
+    assert favorite.id is not None
+    assert repository.list_link_favorites()[0].title == "Docs"
+    assert repository.list_link_favorites()[0].icon_text == "D"
+
+    favorite.title = "Reference"
+    favorite.target = "C:\\Tools\\editor.exe"
+    favorite.icon_path = repository.copy_link_favorite_icon(favorite.id, icon_source)
+    repository.save_link_favorite(favorite)
+
+    reloaded = repository.get_link_favorite(favorite.id)
+    assert reloaded is not None
+    assert reloaded.title == "Reference"
+    assert reloaded.target == "C:\\Tools\\editor.exe"
+    assert reloaded.icon_path
+    assert (tmp_path / "favorite_icons" / str(favorite.id)).exists()
+
+    repository.delete_link_favorite(favorite.id)
+
+    assert repository.list_link_favorites() == []

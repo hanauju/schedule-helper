@@ -53,7 +53,19 @@ class Preference:
     show_today_checklist_inline: bool = False
     show_today_flow_panel: bool = True
     show_quick_memo_panel: bool = True
+    show_link_favorites_panel: bool = True
+    show_compact_favorites_panel: bool = False
+    favorite_display_mode: str = "text"
     id: int = 1
+
+
+@dataclass(slots=True)
+class LayoutProfile:
+    name: str
+    data: str
+    created_at: datetime = field(default_factory=datetime.now)
+    updated_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
 
 
 @dataclass(slots=True)
@@ -127,8 +139,28 @@ class FocusEvent:
 @dataclass(slots=True)
 class QuickNote:
     body: str
+    content_html: str = ""
     created_at: datetime = field(default_factory=datetime.now)
     focus_session_id: int | None = None
     task_id: int | None = None
     process_name: str = ""
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class QuickNoteAttachment:
+    quick_note_id: int
+    file_name: str
+    stored_path: str
+    created_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class LinkFavorite:
+    title: str
+    target: str
+    icon_text: str = ""
+    icon_path: str = ""
+    created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None

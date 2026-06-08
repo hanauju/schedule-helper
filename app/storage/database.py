@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import datetime, time
 from pathlib import Path
@@ -14,8 +16,11 @@ from app.models import (
     Event,
     FocusEvent,
     FocusSession,
+    LinkFavorite,
+    LayoutProfile,
     Preference,
     QuickNote,
+    QuickNoteAttachment,
     Task,
     TrackedProgram,
 )
@@ -55,6 +60,16 @@ def _time(value: time) -> str:
 
 def _parse_time(value: str) -> time:
     return time.fromisoformat(value)
+
+
+def _safe_file_stem(value: str) -> str:
+    safe = "".join(character if character.isalnum() or character in "._- " else "_" for character in value)
+    safe = safe.strip(" ._")[:80]
+    return safe or "attachment"
+
+
+def _favorite_display_mode(value: str) -> str:
+    return value if value in {"text", "icon_with_label", "icon_only"} else "text"
 
 
 def normalize_process_name(value: str) -> str:
@@ -129,7 +144,18 @@ class ScheduleRepository:
                     show_today_timeline_inline INTEGER NOT NULL DEFAULT 0,
                     show_today_checklist_inline INTEGER NOT NULL DEFAULT 0,
                     show_today_flow_panel INTEGER NOT NULL DEFAULT 1,
-                    show_quick_memo_panel INTEGER NOT NULL DEFAULT 1
+                    show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
+                    show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
+                    show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
+                    favorite_display_mode TEXT NOT NULL DEFAULT 'text'
+                );
+
+                CREATE TABLE IF NOT EXISTS layout_profiles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL UNIQUE,
+                    data TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 );
 
                 CREATE TABLE IF NOT EXISTS app_targets (
@@ -181,10 +207,28 @@ class ScheduleRepository:
                 CREATE TABLE IF NOT EXISTS quick_notes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     body TEXT NOT NULL,
+                    content_html TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     focus_session_id INTEGER REFERENCES focus_sessions(id) ON DELETE SET NULL,
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     process_name TEXT NOT NULL DEFAULT ''
+                );
+
+                CREATE TABLE IF NOT EXISTS quick_note_attachments (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    quick_note_id INTEGER NOT NULL REFERENCES quick_notes(id) ON DELETE CASCADE,
+                    file_name TEXT NOT NULL,
+                    stored_path TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE TABLE IF NOT EXISTS link_favorites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    target TEXT NOT NULL,
+                    icon_text TEXT NOT NULL DEFAULT '',
+                    icon_path TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_focus_sessions_started
@@ -192,6 +236,9 @@ class ScheduleRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_quick_notes_created
                     ON quick_notes (created_at);
+
+                CREATE INDEX IF NOT EXISTS idx_quick_note_attachments_note
+                    ON quick_note_attachments (quick_note_id);
                 """
             )
             task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
@@ -225,6 +272,28 @@ class ScheduleRepository:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_quick_memo_panel INTEGER NOT NULL DEFAULT 1"
                 )
+            if "show_link_favorites_panel" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_link_favorites_panel INTEGER NOT NULL DEFAULT 1"
+                )
+            if "show_compact_favorites_panel" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0"
+                )
+            if "favorite_display_mode" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN favorite_display_mode TEXT NOT NULL DEFAULT 'text'"
+                )
+
+            favorite_columns = {row["name"] for row in connection.execute("PRAGMA table_info(link_favorites)")}
+            if "icon_text" not in favorite_columns:
+                connection.execute("ALTER TABLE link_favorites ADD COLUMN icon_text TEXT NOT NULL DEFAULT ''")
+            if "icon_path" not in favorite_columns:
+                connection.execute("ALTER TABLE link_favorites ADD COLUMN icon_path TEXT NOT NULL DEFAULT ''")
+
+            quick_note_columns = {row["name"] for row in connection.execute("PRAGMA table_info(quick_notes)")}
+            if "content_html" not in quick_note_columns:
+                connection.execute("ALTER TABLE quick_notes ADD COLUMN content_html TEXT NOT NULL DEFAULT ''")
 
     def seed_defaults(self) -> None:
         with self.connect() as connection:
@@ -245,8 +314,9 @@ class ScheduleRepository:
                     INSERT INTO preferences
                       (id, day_max_minutes, break_minutes, strategy, week_start_day,
                        show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
-                       show_today_flow_panel, show_quick_memo_panel)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 0, 0, 1, 1)
+                       show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
+                       show_compact_favorites_panel, favorite_display_mode)
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 0, 0, 1, 1, 1, 0, 'text')
                     """
                 )
 
@@ -525,6 +595,9 @@ class ScheduleRepository:
             show_today_checklist_inline=bool(row["show_today_checklist_inline"]),
             show_today_flow_panel=bool(row["show_today_flow_panel"]),
             show_quick_memo_panel=bool(row["show_quick_memo_panel"]),
+            show_link_favorites_panel=bool(row["show_link_favorites_panel"]),
+            show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
+            favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
         )
 
     def save_preferences(self, preferences: Preference) -> Preference:
@@ -535,8 +608,9 @@ class ScheduleRepository:
                 INSERT INTO preferences
                   (id, day_max_minutes, break_minutes, strategy, week_start_day,
                    show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
-                   show_today_flow_panel, show_quick_memo_panel)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
+                   show_compact_favorites_panel, favorite_display_mode)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -546,7 +620,10 @@ class ScheduleRepository:
                     show_today_timeline_inline = excluded.show_today_timeline_inline,
                     show_today_checklist_inline = excluded.show_today_checklist_inline,
                     show_today_flow_panel = excluded.show_today_flow_panel,
-                    show_quick_memo_panel = excluded.show_quick_memo_panel
+                    show_quick_memo_panel = excluded.show_quick_memo_panel,
+                    show_link_favorites_panel = excluded.show_link_favorites_panel,
+                    show_compact_favorites_panel = excluded.show_compact_favorites_panel,
+                    favorite_display_mode = excluded.favorite_display_mode
                 """,
                 (
                     preferences.day_max_minutes,
@@ -558,9 +635,76 @@ class ScheduleRepository:
                     int(preferences.show_today_checklist_inline),
                     int(preferences.show_today_flow_panel),
                     int(preferences.show_quick_memo_panel),
+                    int(preferences.show_link_favorites_panel),
+                    int(preferences.show_compact_favorites_panel),
+                    _favorite_display_mode(preferences.favorite_display_mode),
                 ),
             )
         return preferences
+
+    def save_layout_profile(self, profile: LayoutProfile) -> LayoutProfile:
+        now = datetime.now()
+        name = profile.name.strip()
+        if not name:
+            raise ValueError("Layout profile name is required")
+
+        with self.connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM layout_profiles WHERE name = ?",
+                (name,),
+            ).fetchone()
+            if existing:
+                profile.id = int(existing["id"])
+                profile.created_at = _parse_dt(existing["created_at"]) or profile.created_at
+                profile.updated_at = now
+                connection.execute(
+                    """
+                    UPDATE layout_profiles
+                    SET data = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    (profile.data, _dt_exact(profile.updated_at), profile.id),
+                )
+            else:
+                profile.name = name
+                profile.created_at = now
+                profile.updated_at = now
+                cursor = connection.execute(
+                    """
+                    INSERT INTO layout_profiles (name, data, created_at, updated_at)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        profile.name,
+                        profile.data,
+                        _dt_exact(profile.created_at),
+                        _dt_exact(profile.updated_at),
+                    ),
+                )
+                profile.id = int(cursor.lastrowid)
+        return profile
+
+    def list_layout_profiles(self) -> list[LayoutProfile]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM layout_profiles
+                ORDER BY updated_at DESC, name ASC
+                """
+            ).fetchall()
+        return [self._layout_profile_from_row(row) for row in rows]
+
+    def get_layout_profile(self, name: str) -> LayoutProfile | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM layout_profiles WHERE name = ?",
+                (name.strip(),),
+            ).fetchone()
+        return self._layout_profile_from_row(row) if row else None
+
+    def delete_layout_profile(self, profile_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM layout_profiles WHERE id = ?", (profile_id,))
 
     def save_tracked_program(self, program: TrackedProgram) -> TrackedProgram:
         program.process_name = normalize_process_name(program.process_name)
@@ -862,11 +1006,12 @@ class ScheduleRepository:
             if note.id is None:
                 cursor = connection.execute(
                     """
-                    INSERT INTO quick_notes (body, created_at, focus_session_id, task_id, process_name)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO quick_notes (body, content_html, created_at, focus_session_id, task_id, process_name)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note.body.strip(),
+                        note.content_html,
                         _dt_exact(note.created_at),
                         note.focus_session_id,
                         note.task_id,
@@ -879,6 +1024,7 @@ class ScheduleRepository:
                     """
                     UPDATE quick_notes
                     SET body = ?,
+                        content_html = ?,
                         created_at = ?,
                         focus_session_id = ?,
                         task_id = ?,
@@ -887,6 +1033,7 @@ class ScheduleRepository:
                     """,
                     (
                         note.body.strip(),
+                        note.content_html,
                         _dt_exact(note.created_at),
                         note.focus_session_id,
                         note.task_id,
@@ -922,8 +1069,170 @@ class ScheduleRepository:
         return self._quick_note_from_row(row) if row else None
 
     def delete_quick_note(self, note_id: int) -> None:
+        attachments = self.list_quick_note_attachments(note_id)
         with self.connect() as connection:
             connection.execute("DELETE FROM quick_notes WHERE id = ?", (note_id,))
+        for attachment in attachments:
+            self._delete_attachment_file(attachment)
+
+    def add_quick_note_attachment(self, note_id: int, source_path: Path | str) -> QuickNoteAttachment:
+        if self.get_quick_note(note_id) is None:
+            raise ValueError("Quick note does not exist")
+
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(str(source))
+
+        target = self._attachment_storage_path(note_id, source)
+        shutil.copy2(source, target)
+
+        attachment = QuickNoteAttachment(
+            quick_note_id=note_id,
+            file_name=source.name,
+            stored_path=str(target),
+            created_at=datetime.now(),
+        )
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                INSERT INTO quick_note_attachments (quick_note_id, file_name, stored_path, created_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    attachment.quick_note_id,
+                    attachment.file_name,
+                    attachment.stored_path,
+                    _dt_exact(attachment.created_at),
+                ),
+            )
+            attachment.id = int(cursor.lastrowid)
+        return attachment
+
+    def list_quick_note_attachments(self, note_id: int) -> list[QuickNoteAttachment]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM quick_note_attachments
+                WHERE quick_note_id = ?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (note_id,),
+            ).fetchall()
+        return [self._quick_note_attachment_from_row(row) for row in rows]
+
+    def get_quick_note_attachment(self, attachment_id: int) -> QuickNoteAttachment | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM quick_note_attachments WHERE id = ?",
+                (attachment_id,),
+            ).fetchone()
+        return self._quick_note_attachment_from_row(row) if row else None
+
+    def delete_quick_note_attachment(self, attachment_id: int) -> None:
+        attachment = self.get_quick_note_attachment(attachment_id)
+        with self.connect() as connection:
+            connection.execute("DELETE FROM quick_note_attachments WHERE id = ?", (attachment_id,))
+        if attachment is not None:
+            self._delete_attachment_file(attachment)
+
+    def _attachment_storage_path(self, note_id: int, source: Path) -> Path:
+        directory = self.db_path.parent / "attachments" / str(note_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_stem = _safe_file_stem(source.stem)
+        suffix = source.suffix[:20]
+        return directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
+
+    def copy_inline_note_image(self, source_path: Path | str) -> str:
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(str(source))
+
+        directory = self.db_path.parent / "inline_images"
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_stem = _safe_file_stem(source.stem)
+        suffix = source.suffix[:20]
+        target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
+        shutil.copy2(source, target)
+        return str(target)
+
+    def _delete_attachment_file(self, attachment: QuickNoteAttachment) -> None:
+        try:
+            Path(attachment.stored_path).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def save_link_favorite(self, favorite: LinkFavorite) -> LinkFavorite:
+        title = favorite.title.strip()
+        target = favorite.target.strip()
+        icon_text = favorite.icon_text.strip()[:12]
+        icon_path = favorite.icon_path.strip()
+        if not title:
+            title = target
+        if not title or not target:
+            raise ValueError("Link favorite title and target are required")
+
+        with self.connect() as connection:
+            if favorite.id is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO link_favorites (title, target, icon_text, icon_path, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (title, target, icon_text, icon_path, _dt_exact(favorite.created_at)),
+                )
+                favorite.id = int(cursor.lastrowid)
+            else:
+                connection.execute(
+                    """
+                    UPDATE link_favorites
+                    SET title = ?,
+                        target = ?,
+                        icon_text = ?,
+                        icon_path = ?
+                    WHERE id = ?
+                    """,
+                    (title, target, icon_text, icon_path, favorite.id),
+                )
+        favorite.title = title
+        favorite.target = target
+        favorite.icon_text = icon_text
+        favorite.icon_path = icon_path
+        return favorite
+
+    def copy_link_favorite_icon(self, favorite_id: int, source_path: Path | str) -> str:
+        if self.get_link_favorite(favorite_id) is None:
+            raise ValueError("Link favorite does not exist")
+
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(str(source))
+
+        directory = self.db_path.parent / "favorite_icons" / str(favorite_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_stem = _safe_file_stem(source.stem)
+        suffix = source.suffix[:20]
+        target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
+        shutil.copy2(source, target)
+        return str(target)
+
+    def list_link_favorites(self) -> list[LinkFavorite]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM link_favorites
+                ORDER BY title COLLATE NOCASE ASC, id ASC
+                """
+            ).fetchall()
+        return [self._link_favorite_from_row(row) for row in rows]
+
+    def get_link_favorite(self, favorite_id: int) -> LinkFavorite | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM link_favorites WHERE id = ?", (favorite_id,)).fetchone()
+        return self._link_favorite_from_row(row) if row else None
+
+    def delete_link_favorite(self, favorite_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM link_favorites WHERE id = ?", (favorite_id,))
 
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> Task:
@@ -1038,10 +1347,50 @@ class ScheduleRepository:
         return QuickNote(
             id=int(row["id"]),
             body=str(row["body"]),
+            content_html=str(row["content_html"]),
             created_at=created_at,
             focus_session_id=row["focus_session_id"],
             task_id=row["task_id"],
             process_name=str(row["process_name"]),
+        )
+
+    @staticmethod
+    def _quick_note_attachment_from_row(row: sqlite3.Row) -> QuickNoteAttachment:
+        created_at = _parse_dt(row["created_at"])
+        if created_at is None:
+            raise ValueError("Stored quick note attachment is missing a valid created_at")
+        return QuickNoteAttachment(
+            id=int(row["id"]),
+            quick_note_id=int(row["quick_note_id"]),
+            file_name=str(row["file_name"]),
+            stored_path=str(row["stored_path"]),
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _link_favorite_from_row(row: sqlite3.Row) -> LinkFavorite:
+        created_at = _parse_dt(row["created_at"])
+        if created_at is None:
+            raise ValueError("Stored link favorite is missing a valid created_at")
+        return LinkFavorite(
+            id=int(row["id"]),
+            title=str(row["title"]),
+            target=str(row["target"]),
+            icon_text=str(row["icon_text"]),
+            icon_path=str(row["icon_path"]),
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _layout_profile_from_row(row: sqlite3.Row) -> LayoutProfile:
+        created_at = _parse_dt(row["created_at"]) or datetime.now()
+        updated_at = _parse_dt(row["updated_at"]) or created_at
+        return LayoutProfile(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            data=str(row["data"]),
+            created_at=created_at,
+            updated_at=updated_at,
         )
 
 
