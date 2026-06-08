@@ -12,6 +12,7 @@ class Task:
     priority: int = 3
     category: str = ""
     completed: bool = False
+    completed_at: datetime | None = None
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None
 
@@ -24,6 +25,8 @@ class Event:
     fixed: bool = True
     task_id: int | None = None
     category: str = ""
+    completed: bool = False
+    completed_at: datetime | None = None
     id: int | None = None
 
     @property
@@ -44,5 +47,83 @@ class Preference:
     day_max_minutes: int = 480
     break_minutes: int = 10
     strategy: str = "deadline_priority"
+    week_start_day: int = 0
     id: int = 1
 
+
+@dataclass(slots=True)
+class TrackedProgram:
+    display_name: str
+    process_name: str
+    enabled: bool = True
+    created_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
+
+    @property
+    def normalized_process_name(self) -> str:
+        return self.process_name.strip().lower()
+
+
+@dataclass(slots=True)
+class AppUsageSession:
+    target_id: int | None
+    process_name: str
+    window_title: str
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: int
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class AppUsageSummary:
+    target_id: int | None
+    display_name: str
+    process_name: str
+    total_seconds: int
+    last_used_at: datetime | None = None
+
+
+@dataclass(slots=True)
+class FocusSession:
+    title: str
+    planned_seconds: int
+    focused_seconds: int = 0
+    paused_seconds: int = 0
+    away_seconds: int = 0
+    status: str = "ready"
+    started_at: datetime | None = None
+    ended_at: datetime | None = None
+    task_id: int | None = None
+    target_process_name: str = ""
+    target_window_title: str = ""
+    id: int | None = None
+
+    @property
+    def elapsed_seconds(self) -> int:
+        return self.focused_seconds + self.away_seconds
+
+    @property
+    def remaining_seconds(self) -> int:
+        return max(0, self.planned_seconds - self.focused_seconds)
+
+
+@dataclass(slots=True)
+class FocusEvent:
+    focus_session_id: int
+    event_type: str
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: int
+    metadata: str = ""
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class QuickNote:
+    body: str
+    created_at: datetime = field(default_factory=datetime.now)
+    focus_session_id: int | None = None
+    task_id: int | None = None
+    process_name: str = ""
+    id: int | None = None

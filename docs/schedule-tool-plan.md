@@ -294,10 +294,11 @@ schedule-helper/
 - [x] 기본 설정 화면
 - [x] 충돌 경고
 - [x] 실행 파일 패키징
+- [x] 특정 프로그램 화면 사용 시간 기록
 
 ## 5.1 Implementation Status
 
-현재 MVP 구현은 `app/` 패키지에 들어 있다. PySide6 UI, SQLite 저장소, 자동 배치 엔진, pytest 테스트, PyInstaller 패키징 스크립트까지 포함한다.
+현재 MVP 구현은 `app/` 패키지에 들어 있다. PySide6 UI, SQLite 저장소, 자동 배치 엔진, 프로그램 사용 시간 추적, pytest 테스트, PyInstaller 패키징 스크립트까지 포함한다.
 
 ## 6. Suggested Milestones
 
