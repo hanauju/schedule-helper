@@ -124,7 +124,12 @@ class ScheduleRepository:
                     day_max_minutes INTEGER NOT NULL,
                     break_minutes INTEGER NOT NULL,
                     strategy TEXT NOT NULL,
-                    week_start_day INTEGER NOT NULL DEFAULT 0
+                    week_start_day INTEGER NOT NULL DEFAULT 0,
+                    show_pomodoro_controls INTEGER NOT NULL DEFAULT 1,
+                    show_today_timeline_inline INTEGER NOT NULL DEFAULT 0,
+                    show_today_checklist_inline INTEGER NOT NULL DEFAULT 0,
+                    show_today_flow_panel INTEGER NOT NULL DEFAULT 1,
+                    show_quick_memo_panel INTEGER NOT NULL DEFAULT 1
                 );
 
                 CREATE TABLE IF NOT EXISTS app_targets (
@@ -200,6 +205,26 @@ class ScheduleRepository:
             preference_columns = {row["name"] for row in connection.execute("PRAGMA table_info(preferences)")}
             if "week_start_day" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN week_start_day INTEGER NOT NULL DEFAULT 0")
+            if "show_pomodoro_controls" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_pomodoro_controls INTEGER NOT NULL DEFAULT 1"
+                )
+            if "show_today_timeline_inline" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_today_timeline_inline INTEGER NOT NULL DEFAULT 0"
+                )
+            if "show_today_checklist_inline" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_today_checklist_inline INTEGER NOT NULL DEFAULT 0"
+                )
+            if "show_today_flow_panel" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_today_flow_panel INTEGER NOT NULL DEFAULT 1"
+                )
+            if "show_quick_memo_panel" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_quick_memo_panel INTEGER NOT NULL DEFAULT 1"
+                )
 
     def seed_defaults(self) -> None:
         with self.connect() as connection:
@@ -217,8 +242,11 @@ class ScheduleRepository:
             if has_preferences == 0:
                 connection.execute(
                     """
-                    INSERT INTO preferences (id, day_max_minutes, break_minutes, strategy, week_start_day)
-                    VALUES (1, 480, 10, 'deadline_priority', 0)
+                    INSERT INTO preferences
+                      (id, day_max_minutes, break_minutes, strategy, week_start_day,
+                       show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
+                       show_today_flow_panel, show_quick_memo_panel)
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 0, 0, 1, 1)
                     """
                 )
 
@@ -492,6 +520,11 @@ class ScheduleRepository:
             break_minutes=int(row["break_minutes"]),
             strategy=str(row["strategy"]),
             week_start_day=int(row["week_start_day"]),
+            show_pomodoro_controls=bool(row["show_pomodoro_controls"]),
+            show_today_timeline_inline=bool(row["show_today_timeline_inline"]),
+            show_today_checklist_inline=bool(row["show_today_checklist_inline"]),
+            show_today_flow_panel=bool(row["show_today_flow_panel"]),
+            show_quick_memo_panel=bool(row["show_quick_memo_panel"]),
         )
 
     def save_preferences(self, preferences: Preference) -> Preference:
@@ -499,19 +532,32 @@ class ScheduleRepository:
         with self.connect() as connection:
             connection.execute(
                 """
-                INSERT INTO preferences (id, day_max_minutes, break_minutes, strategy, week_start_day)
-                VALUES (1, ?, ?, ?, ?)
+                INSERT INTO preferences
+                  (id, day_max_minutes, break_minutes, strategy, week_start_day,
+                   show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
+                   show_today_flow_panel, show_quick_memo_panel)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
                     strategy = excluded.strategy,
-                    week_start_day = excluded.week_start_day
+                    week_start_day = excluded.week_start_day,
+                    show_pomodoro_controls = excluded.show_pomodoro_controls,
+                    show_today_timeline_inline = excluded.show_today_timeline_inline,
+                    show_today_checklist_inline = excluded.show_today_checklist_inline,
+                    show_today_flow_panel = excluded.show_today_flow_panel,
+                    show_quick_memo_panel = excluded.show_quick_memo_panel
                 """,
                 (
                     preferences.day_max_minutes,
                     preferences.break_minutes,
                     preferences.strategy,
                     preferences.week_start_day,
+                    int(preferences.show_pomodoro_controls),
+                    int(preferences.show_today_timeline_inline),
+                    int(preferences.show_today_checklist_inline),
+                    int(preferences.show_today_flow_panel),
+                    int(preferences.show_quick_memo_panel),
                 ),
             )
         return preferences
@@ -869,6 +915,11 @@ class ScheduleRepository:
         with self.connect() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [self._quick_note_from_row(row) for row in rows]
+
+    def get_quick_note(self, note_id: int) -> QuickNote | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM quick_notes WHERE id = ?", (note_id,)).fetchone()
+        return self._quick_note_from_row(row) if row else None
 
     def delete_quick_note(self, note_id: int) -> None:
         with self.connect() as connection:

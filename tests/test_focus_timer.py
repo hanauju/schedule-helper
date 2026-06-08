@@ -45,6 +45,36 @@ def test_focus_timer_tracks_focused_away_and_paused_time(tmp_path) -> None:
     assert saved.status == "completed"
 
 
+def test_focus_timer_accepts_multiple_target_windows(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    provider = FakeProvider()
+    service = FocusTimerService(repository, provider)
+    start = datetime(2026, 6, 8, 9, 0, 0)
+
+    provider.snapshot = ActiveWindowSnapshot("code.exe", "main.py")
+    session = service.start(
+        "Build",
+        25 * 60,
+        target_windows=[
+            {"process_name": "code.exe", "window_title": "main.py"},
+            {"process_name": "chrome.exe", "window_title": "Docs"},
+        ],
+        now=start,
+    )
+    service.tick(start + timedelta(seconds=10))
+
+    provider.snapshot = ActiveWindowSnapshot("chrome.exe", "Docs")
+    service.tick(start + timedelta(seconds=25))
+
+    provider.snapshot = ActiveWindowSnapshot("chrome.exe", "Search")
+    service.tick(start + timedelta(seconds=35))
+
+    saved = repository.get_focus_session(session.id)
+    assert saved is not None
+    assert saved.focused_seconds == 25
+    assert saved.away_seconds == 10
+
+
 def test_quick_notes_keep_created_time_and_session_link(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     service = FocusTimerService(repository)

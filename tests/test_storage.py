@@ -87,11 +87,21 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences = repository.get_preferences()
     preferences.break_minutes = 20
     preferences.week_start_day = 6
+    preferences.show_pomodoro_controls = False
+    preferences.show_today_timeline_inline = True
+    preferences.show_today_checklist_inline = True
+    preferences.show_today_flow_panel = False
+    preferences.show_quick_memo_panel = False
     repository.save_preferences(preferences)
 
     reloaded_preferences = repository.get_preferences()
     assert reloaded_preferences.break_minutes == 20
     assert reloaded_preferences.week_start_day == 6
+    assert not reloaded_preferences.show_pomodoro_controls
+    assert reloaded_preferences.show_today_timeline_inline
+    assert reloaded_preferences.show_today_checklist_inline
+    assert not reloaded_preferences.show_today_flow_panel
+    assert not reloaded_preferences.show_quick_memo_panel
 
 
 def test_repository_persists_app_usage_and_summaries(tmp_path) -> None:
@@ -165,3 +175,21 @@ def test_repository_deletes_quick_note(tmp_path) -> None:
     repository.delete_quick_note(note.id)
 
     assert repository.list_quick_notes() == []
+
+
+def test_repository_updates_quick_note_body(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    note = repository.save_quick_note(
+        QuickNote(
+            body="before",
+            created_at=datetime(2026, 6, 8, 12, 0),
+        )
+    )
+
+    note.body = "after"
+    repository.save_quick_note(note)
+
+    reloaded = repository.get_quick_note(note.id)
+    assert reloaded is not None
+    assert reloaded.body == "after"
+    assert reloaded.created_at == datetime(2026, 6, 8, 12, 0)

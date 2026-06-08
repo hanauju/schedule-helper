@@ -48,6 +48,11 @@ class Preference:
     break_minutes: int = 10
     strategy: str = "deadline_priority"
     week_start_day: int = 0
+    show_pomodoro_controls: bool = True
+    show_today_timeline_inline: bool = False
+    show_today_checklist_inline: bool = False
+    show_today_flow_panel: bool = True
+    show_quick_memo_panel: bool = True
     id: int = 1
 
 

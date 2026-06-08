@@ -1,10 +1,70 @@
 from __future__ import annotations
 
+import json
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timedelta
 
 from app.models import FocusEvent, FocusSession
 from app.services.app_usage import ActiveWindowProvider
 from app.storage.database import ScheduleRepository, normalize_process_name
+
+FocusTarget = dict[str, str]
+
+
+def normalize_focus_targets(targets: Iterable[Mapping[str, str]] | None) -> list[FocusTarget]:
+    normalized: list[FocusTarget] = []
+    seen: set[tuple[str, str]] = set()
+    for target in targets or []:
+        process_name = normalize_process_name(str(target.get("process_name", "")))
+        if not process_name:
+            continue
+        window_title = str(target.get("window_title", "")).strip()
+        key = (process_name, window_title.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append({"process_name": process_name, "window_title": window_title})
+    return normalized
+
+
+def encode_focus_targets(targets: Iterable[Mapping[str, str]] | None) -> tuple[str, str]:
+    normalized = normalize_focus_targets(targets)
+    if not normalized:
+        return "", ""
+    if len(normalized) == 1:
+        target = normalized[0]
+        return target["process_name"], target["window_title"]
+    return (
+        json.dumps([target["process_name"] for target in normalized], ensure_ascii=False),
+        json.dumps([target["window_title"] for target in normalized], ensure_ascii=False),
+    )
+
+
+def decode_focus_targets(target_process_name: str, target_window_title: str = "") -> list[FocusTarget]:
+    process_names = _decode_text_list(target_process_name)
+    window_titles = _decode_text_list(target_window_title)
+    targets: list[FocusTarget] = []
+    for index, process_name in enumerate(process_names):
+        normalized_process = normalize_process_name(process_name)
+        if not normalized_process:
+            continue
+        window_title = window_titles[index] if index < len(window_titles) else ""
+        targets.append({"process_name": normalized_process, "window_title": window_title})
+    return targets
+
+
+def _decode_text_list(value: str) -> list[str]:
+    text = value.strip()
+    if not text:
+        return []
+    if text.startswith("["):
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, list):
+            return [str(item).strip() for item in parsed if str(item).strip()]
+    return [text]
 
 
 class FocusTimerService:
@@ -30,6 +90,7 @@ class FocusTimerService:
         planned_seconds: int,
         target_process_name: str = "",
         target_window_title: str = "",
+        target_windows: Iterable[Mapping[str, str]] | None = None,
         task_id: int | None = None,
         now: datetime | None = None,
     ) -> FocusSession:
@@ -37,12 +98,18 @@ class FocusTimerService:
         if self.session is not None and self.session.status not in {"completed", "interrupted", "cancelled"}:
             self.stop(now, status="interrupted")
         self.session = None
+        targets = normalize_focus_targets(target_windows)
+        if not targets and target_process_name:
+            targets = normalize_focus_targets(
+                [{"process_name": target_process_name, "window_title": target_window_title}]
+            )
+        stored_process_name, stored_window_title = encode_focus_targets(targets)
         self.session = self.repository.save_focus_session(
             FocusSession(
                 title=title.strip() or "집중 세션",
                 task_id=task_id,
-                target_process_name=normalize_process_name(target_process_name) if target_process_name else "",
-                target_window_title=target_window_title,
+                target_process_name=stored_process_name,
+                target_window_title=stored_window_title,
                 planned_seconds=max(60, planned_seconds),
                 started_at=now,
                 status="running",
@@ -161,12 +228,12 @@ class FocusTimerService:
             if snapshot.idle_seconds > self.idle_cutoff_seconds:
                 return "away"
 
-        target = self.session.target_process_name
-        if not target:
+        targets = decode_focus_targets(self.session.target_process_name, self.session.target_window_title)
+        if not targets:
             return "focused"
         if snapshot is None:
             return "away"
-        return "focused" if normalize_process_name(snapshot.process_name) == normalize_process_name(target) else "away"
+        return "focused" if _matches_focus_target(snapshot.process_name, snapshot.window_title, targets) else "away"
 
     def _switch_segment(self, next_type: str | None, now: datetime) -> None:
         if self.session is None:
@@ -208,3 +275,15 @@ class FocusTimerService:
         self.last_tick_at = now
         self.repository.save_focus_session(self.session)
         return self.session
+
+
+def _matches_focus_target(process_name: str, window_title: str, targets: list[FocusTarget]) -> bool:
+    current_process = normalize_process_name(process_name)
+    current_title = window_title.strip().casefold()
+    for target in targets:
+        if current_process != target["process_name"]:
+            continue
+        target_title = target["window_title"].strip()
+        if not target_title or current_title == target_title.casefold():
+            return True
+    return False
