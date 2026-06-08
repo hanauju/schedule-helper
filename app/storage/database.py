@@ -72,6 +72,10 @@ def _favorite_display_mode(value: str) -> str:
     return value if value in {"text", "icon_with_label", "icon_only"} else "text"
 
 
+def _time_format(value: str) -> str:
+    return value if value in {"24h", "12h"} else "24h"
+
+
 def normalize_process_name(value: str) -> str:
     process_name = value.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
     if process_name and "." not in process_name:
@@ -141,13 +145,14 @@ class ScheduleRepository:
                     strategy TEXT NOT NULL,
                     week_start_day INTEGER NOT NULL DEFAULT 0,
                     show_pomodoro_controls INTEGER NOT NULL DEFAULT 1,
-                    show_today_timeline_inline INTEGER NOT NULL DEFAULT 0,
+                    show_today_timeline_inline INTEGER NOT NULL DEFAULT 1,
                     show_today_checklist_inline INTEGER NOT NULL DEFAULT 0,
-                    show_today_flow_panel INTEGER NOT NULL DEFAULT 1,
+                    show_today_flow_panel INTEGER NOT NULL DEFAULT 0,
                     show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
                     show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
-                    favorite_display_mode TEXT NOT NULL DEFAULT 'text'
+                    favorite_display_mode TEXT NOT NULL DEFAULT 'text',
+                    time_format TEXT NOT NULL DEFAULT '24h'
                 );
 
                 CREATE TABLE IF NOT EXISTS layout_profiles (
@@ -258,7 +263,7 @@ class ScheduleRepository:
                 )
             if "show_today_timeline_inline" not in preference_columns:
                 connection.execute(
-                    "ALTER TABLE preferences ADD COLUMN show_today_timeline_inline INTEGER NOT NULL DEFAULT 0"
+                    "ALTER TABLE preferences ADD COLUMN show_today_timeline_inline INTEGER NOT NULL DEFAULT 1"
                 )
             if "show_today_checklist_inline" not in preference_columns:
                 connection.execute(
@@ -266,7 +271,7 @@ class ScheduleRepository:
                 )
             if "show_today_flow_panel" not in preference_columns:
                 connection.execute(
-                    "ALTER TABLE preferences ADD COLUMN show_today_flow_panel INTEGER NOT NULL DEFAULT 1"
+                    "ALTER TABLE preferences ADD COLUMN show_today_flow_panel INTEGER NOT NULL DEFAULT 0"
                 )
             if "show_quick_memo_panel" not in preference_columns:
                 connection.execute(
@@ -284,6 +289,8 @@ class ScheduleRepository:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN favorite_display_mode TEXT NOT NULL DEFAULT 'text'"
                 )
+            if "time_format" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN time_format TEXT NOT NULL DEFAULT '24h'")
 
             favorite_columns = {row["name"] for row in connection.execute("PRAGMA table_info(link_favorites)")}
             if "icon_text" not in favorite_columns:
@@ -315,8 +322,8 @@ class ScheduleRepository:
                       (id, day_max_minutes, break_minutes, strategy, week_start_day,
                        show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
                        show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                       show_compact_favorites_panel, favorite_display_mode)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 0, 0, 1, 1, 1, 0, 'text')
+                       show_compact_favorites_panel, favorite_display_mode, time_format)
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
                     """
                 )
 
@@ -598,10 +605,12 @@ class ScheduleRepository:
             show_link_favorites_panel=bool(row["show_link_favorites_panel"]),
             show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
             favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
+            time_format=_time_format(str(row["time_format"])),
         )
 
     def save_preferences(self, preferences: Preference) -> Preference:
         preferences.week_start_day = 6 if preferences.week_start_day == 6 else 0
+        preferences.time_format = _time_format(preferences.time_format)
         with self.connect() as connection:
             connection.execute(
                 """
@@ -609,8 +618,8 @@ class ScheduleRepository:
                   (id, day_max_minutes, break_minutes, strategy, week_start_day,
                    show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
                    show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                   show_compact_favorites_panel, favorite_display_mode)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   show_compact_favorites_panel, favorite_display_mode, time_format)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -623,7 +632,8 @@ class ScheduleRepository:
                     show_quick_memo_panel = excluded.show_quick_memo_panel,
                     show_link_favorites_panel = excluded.show_link_favorites_panel,
                     show_compact_favorites_panel = excluded.show_compact_favorites_panel,
-                    favorite_display_mode = excluded.favorite_display_mode
+                    favorite_display_mode = excluded.favorite_display_mode,
+                    time_format = excluded.time_format
                 """,
                 (
                     preferences.day_max_minutes,
@@ -638,6 +648,7 @@ class ScheduleRepository:
                     int(preferences.show_link_favorites_panel),
                     int(preferences.show_compact_favorites_panel),
                     _favorite_display_mode(preferences.favorite_display_mode),
+                    _time_format(preferences.time_format),
                 ),
             )
         return preferences

@@ -106,6 +106,7 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_link_favorites_panel = False
     preferences.show_compact_favorites_panel = True
     preferences.favorite_display_mode = "icon_only"
+    preferences.time_format = "12h"
     repository.save_preferences(preferences)
 
     reloaded_preferences = repository.get_preferences()
@@ -119,6 +120,7 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert not reloaded_preferences.show_link_favorites_panel
     assert reloaded_preferences.show_compact_favorites_panel
     assert reloaded_preferences.favorite_display_mode == "icon_only"
+    assert reloaded_preferences.time_format == "12h"
 
 
 def test_repository_saves_named_layout_profiles(tmp_path) -> None:

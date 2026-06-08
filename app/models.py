@@ -49,13 +49,14 @@ class Preference:
     strategy: str = "deadline_priority"
     week_start_day: int = 0
     show_pomodoro_controls: bool = True
-    show_today_timeline_inline: bool = False
+    show_today_timeline_inline: bool = True
     show_today_checklist_inline: bool = False
-    show_today_flow_panel: bool = True
+    show_today_flow_panel: bool = False
     show_quick_memo_panel: bool = True
     show_link_favorites_panel: bool = True
     show_compact_favorites_panel: bool = False
     favorite_display_mode: str = "text"
+    time_format: str = "24h"
     id: int = 1
 
 
