@@ -82,7 +82,7 @@ class MainWindow(QMainWindow):
 
     def _build_full_page(self) -> QWidget:
         page = QWidget()
-        page.setMinimumWidth(1120)
+        page.setMinimumWidth(860)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(22, 18, 22, 18)
         layout.setSpacing(16)
@@ -97,6 +97,11 @@ class MainWindow(QMainWindow):
         title_box.addWidget(title)
         top_row.addLayout(title_box)
         top_row.addStretch(1)
+
+        date_review_button = QPushButton("날짜별 보기")
+        _stabilize_control(date_review_button, 106)
+        date_review_button.clicked.connect(self.show_date_review_window)
+        top_row.addWidget(date_review_button)
 
         settings_button = QPushButton("설정")
         _stabilize_control(settings_button, 78)
@@ -115,7 +120,6 @@ class MainWindow(QMainWindow):
         lower_row.setSpacing(16)
         lower_row.addWidget(self._build_today_panel(), 1)
         lower_row.addWidget(self._build_memo_panel(), 1)
-        lower_row.addWidget(self._build_date_review_panel(), 1)
         layout.addLayout(lower_row, 1)
 
         scroll = QScrollArea()
@@ -165,28 +169,34 @@ class MainWindow(QMainWindow):
         self.planned_minutes_spin.setValue(25)
         self.planned_minutes_spin.setSuffix("분")
         _stabilize_control(self.planned_minutes_spin, 120)
+        self.pomodoro_enabled_check = QCheckBox("사용")
+        self.pomodoro_enabled_check.setChecked(True)
+        self.pomodoro_enabled_check.toggled.connect(self.update_pomodoro_controls)
         self.pomodoro_minutes_spin = QSpinBox()
         self.pomodoro_minutes_spin.setRange(5, 90)
         self.pomodoro_minutes_spin.setValue(25)
-        self.pomodoro_minutes_spin.setSuffix("분")
+        self.pomodoro_minutes_spin.setSuffix("분 집중")
         _stabilize_control(self.pomodoro_minutes_spin, 120)
         self.break_minutes_spin = QSpinBox()
         self.break_minutes_spin.setRange(1, 60)
         self.break_minutes_spin.setValue(5)
-        self.break_minutes_spin.setSuffix("분")
+        self.break_minutes_spin.setSuffix("분 휴식")
         _stabilize_control(self.break_minutes_spin, 120)
         self.idle_cutoff_spin = QSpinBox()
         self.idle_cutoff_spin.setRange(10, 600)
         self.idle_cutoff_spin.setValue(60)
         self.idle_cutoff_spin.setSuffix("초")
         _stabilize_control(self.idle_cutoff_spin, 120)
-        form.addWidget(QLabel("목표"), 2, 0)
+        form.addWidget(QLabel("목표 시간"), 2, 0)
         form.addWidget(self.planned_minutes_spin, 2, 1)
-        form.addWidget(self.pomodoro_minutes_spin, 2, 2)
-        form.addWidget(self.break_minutes_spin, 2, 3)
-        form.addWidget(QLabel("자리 비움"), 3, 0)
-        form.addWidget(self.idle_cutoff_spin, 3, 1)
+        form.addWidget(QLabel("뽀모도로"), 3, 0)
+        form.addWidget(self.pomodoro_enabled_check, 3, 1)
+        form.addWidget(self.pomodoro_minutes_spin, 3, 2)
+        form.addWidget(self.break_minutes_spin, 3, 3)
+        form.addWidget(QLabel("자리 비움"), 4, 0)
+        form.addWidget(self.idle_cutoff_spin, 4, 1)
         layout.addLayout(form)
+        self.update_pomodoro_controls()
 
         meter_row = QHBoxLayout()
         meter_box = QVBoxLayout()
@@ -357,42 +367,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.notes_list, 1)
         delete_note_shortcut = QShortcut(QKeySequence("Delete"), self.notes_list)
         delete_note_shortcut.activated.connect(self.delete_selected_quick_note)
-        return panel
-
-    def _build_date_review_panel(self) -> QWidget:
-        panel = QWidget()
-        panel.setObjectName("plainPanel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(10)
-
-        heading = QLabel("날짜별 보기")
-        heading.setObjectName("sectionTitle")
-        layout.addWidget(heading)
-
-        self.date_review_calendar = QCalendarWidget()
-        self.date_review_calendar.setGridVisible(True)
-        self.date_review_calendar.setFirstDayOfWeek(_qt_week_start_day(self.preferences.week_start_day))
-        self.date_review_calendar.setSelectedDate(QDate.currentDate())
-        self.date_review_calendar.selectionChanged.connect(self.refresh_date_review)
-        layout.addWidget(self.date_review_calendar)
-
-        self.date_review_label = QLabel()
-        self.date_review_label.setObjectName("statusLabel")
-        layout.addWidget(self.date_review_label)
-
-        self.date_review_summary_label = QLabel()
-        self.date_review_summary_label.setObjectName("mutedLabel")
-        layout.addWidget(self.date_review_summary_label)
-
-        self.date_schedule_list = QListWidget()
-        self.date_schedule_list.setMaximumHeight(120)
-        layout.addWidget(QLabel("일정"))
-        layout.addWidget(self.date_schedule_list)
-
-        self.date_record_list = QListWidget()
-        layout.addWidget(QLabel("기록"))
-        layout.addWidget(self.date_record_list, 1)
         return panel
 
     def _build_compact_page(self) -> QWidget:
@@ -569,7 +543,6 @@ class MainWindow(QMainWindow):
         self.refresh_today()
         self.refresh_notes()
         self.refresh_history()
-        self.refresh_date_review()
         self.update_focus_display()
 
     def refresh_targets(self) -> None:
@@ -683,28 +656,16 @@ class MainWindow(QMainWindow):
         dialog.exec()
         self.refresh_today()
 
+    def show_date_review_window(self) -> None:
+        dialog = DateReviewDialog(self.repository, self.preferences, self)
+        dialog.exec()
+
     def show_settings_window(self) -> None:
         dialog = SettingsDialog(self.preferences, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self.preferences = self.repository.save_preferences(dialog.preferences())
-        self.apply_preferences()
         self.statusBar().showMessage("설정을 저장했습니다.", 2500)
-
-    def apply_preferences(self) -> None:
-        self.date_review_calendar.setFirstDayOfWeek(_qt_week_start_day(self.preferences.week_start_day))
-        self.refresh_date_review()
-
-    def refresh_date_review(self) -> None:
-        selected_date = _date_from_qdate(self.date_review_calendar.selectedDate())
-        start_at, end_at = _day_window(selected_date)
-        schedule_items = _schedule_items_for_date(self.repository, selected_date, start_at, end_at)
-        record_items = _record_items_for_date(self.repository, selected_date, start_at, end_at)
-
-        self.date_review_label.setText(selected_date.strftime("%Y년 %m월 %d일"))
-        self.date_review_summary_label.setText(f"일정 {len(schedule_items)}개 · 기록 {len(record_items)}개")
-        _fill_list(self.date_schedule_list, [text for _, text in schedule_items], "이 날짜에 표시할 일정이 없습니다.")
-        _fill_list(self.date_record_list, [text for _, text in record_items], "이 날짜에 표시할 기록이 없습니다.")
 
     def show_today_context_menu(self, position: QPoint) -> None:
         item = self.today_list.itemAt(position)
@@ -828,7 +789,7 @@ class MainWindow(QMainWindow):
             target_window_title=window_title,
             task_id=self.selected_task_id,
         )
-        self.next_pomodoro_mark_seconds = self.pomodoro_minutes_spin.value() * 60
+        self.next_pomodoro_mark_seconds = self._pomodoro_interval_seconds()
         self.break_until = None
         self.focus_tick_timer.start()
         self.update_focus_display()
@@ -868,7 +829,7 @@ class MainWindow(QMainWindow):
             ):
                 self.focus_timer.start_break(now)
                 self.break_until = now + timedelta(minutes=self.break_minutes_spin.value())
-                self.next_pomodoro_mark_seconds += self.pomodoro_minutes_spin.value() * 60
+                self.next_pomodoro_mark_seconds += self._pomodoro_interval_seconds()
                 session = self.focus_timer.session
         elif session is not None and session.status == "break":
             if self.break_until is not None and now >= self.break_until:
@@ -928,6 +889,18 @@ class MainWindow(QMainWindow):
         if session.status == "break" and self.break_until is not None:
             return max(0, int((self.break_until - datetime.now()).total_seconds()))
         return session.remaining_seconds
+
+    def update_pomodoro_controls(self) -> None:
+        enabled = self.pomodoro_enabled_check.isChecked()
+        self.pomodoro_minutes_spin.setEnabled(enabled)
+        self.break_minutes_spin.setEnabled(enabled)
+        if not enabled:
+            self.next_pomodoro_mark_seconds = 0
+
+    def _pomodoro_interval_seconds(self) -> int:
+        if not self.pomodoro_enabled_check.isChecked():
+            return 0
+        return self.pomodoro_minutes_spin.value() * 60
 
     def save_quick_note(self) -> None:
         body = self.quick_note_edit.toPlainText().strip()
@@ -1163,6 +1136,183 @@ class CompletedTasksDialog(QDialog):
         self.refresh_completed_tasks()
 
 
+class DateReviewDialog(QDialog):
+    def __init__(
+        self,
+        repository: ScheduleRepository,
+        preferences: Preference,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.setWindowTitle("날짜별 보기")
+        self.resize(860, 640)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        title = QLabel("날짜별 보기")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        content = QHBoxLayout()
+        content.setSpacing(16)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setGridVisible(True)
+        self.calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
+        self.calendar.setFirstDayOfWeek(_qt_week_start_day(preferences.week_start_day))
+        self.calendar.setSelectedDate(QDate.currentDate())
+        self.calendar.selectionChanged.connect(self.refresh_selected_date)
+        content.addWidget(self.calendar, 1)
+
+        detail_column = QVBoxLayout()
+        detail_column.setSpacing(10)
+
+        self.selected_date_label = QLabel()
+        self.selected_date_label.setObjectName("statusLabel")
+        detail_column.addWidget(self.selected_date_label)
+
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("mutedLabel")
+        detail_column.addWidget(self.summary_label)
+
+        detail_column.addWidget(QLabel("일정"))
+        self.schedule_list = QListWidget()
+        self.schedule_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.schedule_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.schedule_list.customContextMenuRequested.connect(self.show_schedule_context_menu)
+        detail_column.addWidget(self.schedule_list, 1)
+
+        detail_column.addWidget(QLabel("기록"))
+        self.record_list = QListWidget()
+        self.record_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.record_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.record_list.customContextMenuRequested.connect(self.show_record_context_menu)
+        detail_column.addWidget(self.record_list, 1)
+
+        detail_column.addWidget(QLabel("빠른 메모"))
+        self.quick_note_list = QListWidget()
+        self.quick_note_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.quick_note_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.quick_note_list.customContextMenuRequested.connect(self.show_quick_note_context_menu)
+        detail_column.addWidget(self.quick_note_list, 1)
+
+        content.addLayout(detail_column, 2)
+        layout.addLayout(content, 1)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        close_button = QPushButton("닫기")
+        _stabilize_control(close_button, 84)
+        close_button.clicked.connect(self.accept)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        self.refresh_selected_date()
+
+    def refresh_selected_date(self) -> None:
+        selected_date = _date_from_qdate(self.calendar.selectedDate())
+        start_at, end_at = _day_window(selected_date)
+        schedule_items = _schedule_items_for_date(self.repository, selected_date, start_at, end_at)
+        record_items = _record_items_for_date(self.repository, selected_date, start_at, end_at)
+        quick_note_items = _quick_note_items_for_date(self.repository, start_at, end_at)
+
+        self.selected_date_label.setText(selected_date.strftime("%Y년 %m월 %d일"))
+        self.summary_label.setText(
+            f"일정 {len(schedule_items)}개 · 기록 {len(record_items)}개 · 메모 {len(quick_note_items)}개"
+        )
+        _fill_list(self.schedule_list, schedule_items, "이 날짜에 표시할 일정이 없습니다.")
+        _fill_list(self.record_list, record_items, "이 날짜에 표시할 기록이 없습니다.")
+        _fill_list(self.quick_note_list, quick_note_items, "이 날짜에 작성한 빠른 메모가 없습니다.")
+
+    def show_schedule_context_menu(self, position: QPoint) -> None:
+        self._show_delete_context_menu(self.schedule_list, position)
+
+    def show_record_context_menu(self, position: QPoint) -> None:
+        self._show_delete_context_menu(self.record_list, position)
+
+    def show_quick_note_context_menu(self, position: QPoint) -> None:
+        self._show_delete_context_menu(self.quick_note_list, position)
+
+    def _show_delete_context_menu(self, list_widget: QListWidget, position: QPoint) -> None:
+        item = list_widget.itemAt(position)
+        if item is None:
+            return
+        list_widget.setCurrentItem(item)
+        if item.data(Qt.ItemDataRole.UserRole) is None:
+            return
+
+        menu = QMenu(list_widget)
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(lambda _checked=False, target=list_widget: self.delete_selected_date_item(target))
+        menu.exec(list_widget.mapToGlobal(position))
+
+    def delete_selected_date_item(self, list_widget: QListWidget) -> None:
+        item = list_widget.currentItem()
+        if item is None:
+            return
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            QMessageBox.information(self, "날짜별 보기 삭제", "삭제할 항목을 선택하세요.")
+            return
+
+        item_type = str(data["type"])
+        item_id = int(data["id"])
+        kind = str(data["kind"])
+        title = str(data["title"])
+        message = f"'{title}' {kind}을 삭제할까요?"
+        if item_type == "focus_session" and self._is_active_focus_session(item_id):
+            message += "\n진행 중인 타이머도 함께 중단됩니다."
+
+        answer = QMessageBox.question(self, "날짜별 보기 삭제", message)
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        if item_type == "task":
+            self.repository.delete_task(item_id)
+        elif item_type == "event":
+            self.repository.delete_event(item_id)
+        elif item_type == "focus_session":
+            self._stop_active_focus_session_if_needed(item_id)
+            self.repository.delete_focus_session(item_id)
+        elif item_type == "quick_note":
+            self.repository.delete_quick_note(item_id)
+        else:
+            return
+
+        self.refresh_selected_date()
+        parent = self.parent()
+        if hasattr(parent, "refresh_all"):
+            parent.refresh_all()
+
+    def _is_active_focus_session(self, session_id: int) -> bool:
+        parent = self.parent()
+        focus_timer = getattr(parent, "focus_timer", None)
+        session = focus_timer.session if focus_timer else None
+        return session is not None and session.id == session_id
+
+    def _stop_active_focus_session_if_needed(self, session_id: int) -> None:
+        parent = self.parent()
+        focus_timer = getattr(parent, "focus_timer", None)
+        session = focus_timer.session if focus_timer else None
+        if session is None or session.id != session_id:
+            return
+        if session.status in {"running", "paused", "break"}:
+            focus_timer.stop(status="cancelled")
+        focus_timer.session = None
+        focus_timer.last_tick_at = None
+        focus_timer.segment_type = None
+        focus_timer.segment_started_at = None
+        if hasattr(parent, "break_until"):
+            parent.break_until = None
+        if hasattr(parent, "focus_tick_timer"):
+            parent.focus_tick_timer.stop()
+        if hasattr(parent, "update_focus_display"):
+            parent.update_focus_display()
+
+
 class SettingsDialog(QDialog):
     def __init__(self, preferences: Preference, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -1211,8 +1361,8 @@ def _schedule_items_for_date(
     selected_date: date,
     start_at: datetime,
     end_at: datetime,
-) -> list[tuple[datetime, str]]:
-    items: list[tuple[datetime, str]] = []
+) -> list[tuple[datetime, str, dict[str, object]]]:
+    items: list[tuple[datetime, str, dict[str, object]]] = []
 
     for event in repository.list_events(start_at, end_at, include_completed=True):
         status = " · 완료" if event.completed else ""
@@ -1220,6 +1370,7 @@ def _schedule_items_for_date(
             (
                 event.start_at,
                 f"{event.start_at:%H:%M}-{event.end_at:%H:%M}  [일정] {event.title}{status}",
+                {"type": "event", "id": event.id, "kind": "일정", "title": event.title},
             )
         )
 
@@ -1233,6 +1384,7 @@ def _schedule_items_for_date(
             (
                 reference_at,
                 f"{time_label}  [할 일] {task.title} · {task.duration_minutes}분 · {status}",
+                {"type": "task", "id": task.id, "kind": "할 일", "title": task.title},
             )
         )
 
@@ -1244,8 +1396,8 @@ def _record_items_for_date(
     selected_date: date,
     start_at: datetime,
     end_at: datetime,
-) -> list[tuple[datetime, str]]:
-    items: list[tuple[datetime, str]] = []
+) -> list[tuple[datetime, str, dict[str, object]]]:
+    items: list[tuple[datetime, str, dict[str, object]]] = []
 
     for session in repository.list_focus_sessions(start_at, end_at):
         reference_at = session.started_at or session.ended_at or start_at
@@ -1253,12 +1405,9 @@ def _record_items_for_date(
             (
                 reference_at,
                 f"{reference_at:%H:%M}  [집중] {session.title} · 집중 {_format_duration(session.focused_seconds)} · {_status_label(session.status)}",
+                {"type": "focus_session", "id": session.id, "kind": "집중 기록", "title": session.title},
             )
         )
-
-    for note in repository.list_quick_notes(start_at, end_at):
-        body = _shorten(" ".join(note.body.split()), 64)
-        items.append((note.created_at, f"{note.created_at:%H:%M}  [메모] {body}"))
 
     for task in repository.list_completed_tasks():
         if task.completed_at is None or task.completed_at.date() != selected_date:
@@ -1267,6 +1416,7 @@ def _record_items_for_date(
             (
                 task.completed_at,
                 f"{task.completed_at:%H:%M}  [완료] 할 일 · {task.title}",
+                {"type": "task", "id": task.id, "kind": "할 일", "title": task.title},
             )
         )
 
@@ -1277,21 +1427,46 @@ def _record_items_for_date(
             (
                 event.completed_at,
                 f"{event.completed_at:%H:%M}  [완료] 일정 · {event.title}",
+                {"type": "event", "id": event.id, "kind": "일정", "title": event.title},
             )
         )
 
     return sorted(items, key=lambda item: item[0], reverse=True)
 
 
-def _fill_list(list_widget: QListWidget, rows: list[str], empty_message: str) -> None:
+def _quick_note_items_for_date(
+    repository: ScheduleRepository,
+    start_at: datetime,
+    end_at: datetime,
+) -> list[tuple[datetime, str, dict[str, object]]]:
+    items: list[tuple[datetime, str, dict[str, object]]] = []
+    for note in repository.list_quick_notes(start_at, end_at):
+        body = _shorten(" ".join(note.body.split()), 96)
+        items.append(
+            (
+                note.created_at,
+                f"{note.created_at:%H:%M}  {body}",
+                {"type": "quick_note", "id": note.id, "kind": "메모", "title": body},
+            )
+        )
+    return sorted(items, key=lambda item: item[0], reverse=True)
+
+
+def _fill_list(
+    list_widget: QListWidget,
+    rows: list[tuple[datetime, str, dict[str, object]]],
+    empty_message: str,
+) -> None:
     list_widget.clear()
     if not rows:
         item = QListWidgetItem(empty_message)
         item.setFlags(Qt.ItemFlag.NoItemFlags)
         list_widget.addItem(item)
         return
-    for row in rows:
-        list_widget.addItem(QListWidgetItem(row))
+    for _, text, data in rows:
+        item = QListWidgetItem(text)
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        list_widget.addItem(item)
 
 
 def _today_window() -> tuple[datetime, datetime]:
