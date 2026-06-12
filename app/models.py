@@ -15,6 +15,7 @@ class Task:
     completed_at: datetime | None = None
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None
+    item_type_id: int | None = None
 
 
 @dataclass(slots=True)
@@ -28,6 +29,7 @@ class Event:
     completed: bool = False
     completed_at: datetime | None = None
     id: int | None = None
+    item_type_id: int | None = None
 
     @property
     def duration_minutes(self) -> int:
@@ -48,8 +50,11 @@ class Preference:
     break_minutes: int = 10
     strategy: str = "deadline_priority"
     week_start_day: int = 0
+    show_focus_panel: bool = True
     show_pomodoro_controls: bool = True
     show_today_timeline_inline: bool = True
+    show_today_timeline_waiting_panel: bool = True
+    show_today_timeline_waiting_pinned: bool = True
     show_today_checklist_inline: bool = False
     show_today_flow_panel: bool = False
     show_quick_memo_panel: bool = True
@@ -66,6 +71,15 @@ class LayoutProfile:
     data: str
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class ItemType:
+    name: str
+    base_kind: str = "task"
+    created_at: datetime = field(default_factory=datetime.now)
+    is_default: bool = False
     id: int | None = None
 
 
@@ -144,7 +158,17 @@ class QuickNote:
     created_at: datetime = field(default_factory=datetime.now)
     focus_session_id: int | None = None
     task_id: int | None = None
+    folder_id: int | None = None
     process_name: str = ""
+    window_title: str = ""
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class QuickNoteFolder:
+    name: str
+    created_at: datetime = field(default_factory=datetime.now)
+    is_default: bool = False
     id: int | None = None
 
 

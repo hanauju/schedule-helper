@@ -16,11 +16,13 @@ from app.models import (
     Event,
     FocusEvent,
     FocusSession,
+    ItemType,
     LinkFavorite,
     LayoutProfile,
     Preference,
     QuickNote,
     QuickNoteAttachment,
+    QuickNoteFolder,
     Task,
     TrackedProgram,
 )
@@ -76,6 +78,17 @@ def _time_format(value: str) -> str:
     return value if value in {"24h", "12h"} else "24h"
 
 
+DEFAULT_TASK_ITEM_TYPE_NAME = "할 일"
+DEFAULT_EVENT_ITEM_TYPE_NAME = "일정"
+
+
+def _item_base_kind(value: str) -> str:
+    return value if value in {"task", "event"} else "task"
+
+
+DEFAULT_QUICK_NOTE_FOLDER_NAME = "메모함"
+
+
 def normalize_process_name(value: str) -> str:
     process_name = value.strip().replace("\\", "/").rsplit("/", 1)[-1].lower()
     if process_name and "." not in process_name:
@@ -107,6 +120,14 @@ class ScheduleRepository:
                 """
                 PRAGMA foreign_keys = ON;
 
+                CREATE TABLE IF NOT EXISTS item_types (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    base_kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    is_default INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS tasks (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     title TEXT NOT NULL,
@@ -114,6 +135,7 @@ class ScheduleRepository:
                     due_at TEXT,
                     priority INTEGER NOT NULL,
                     category TEXT NOT NULL DEFAULT '',
+                    item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL,
                     completed INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT,
                     created_at TEXT NOT NULL
@@ -127,6 +149,7 @@ class ScheduleRepository:
                     fixed INTEGER NOT NULL DEFAULT 1,
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     category TEXT NOT NULL DEFAULT '',
+                    item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL,
                     completed INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT
                 );
@@ -144,8 +167,11 @@ class ScheduleRepository:
                     break_minutes INTEGER NOT NULL,
                     strategy TEXT NOT NULL,
                     week_start_day INTEGER NOT NULL DEFAULT 0,
+                    show_focus_panel INTEGER NOT NULL DEFAULT 1,
                     show_pomodoro_controls INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_inline INTEGER NOT NULL DEFAULT 1,
+                    show_today_timeline_waiting_panel INTEGER NOT NULL DEFAULT 1,
+                    show_today_timeline_waiting_pinned INTEGER NOT NULL DEFAULT 1,
                     show_today_checklist_inline INTEGER NOT NULL DEFAULT 0,
                     show_today_flow_panel INTEGER NOT NULL DEFAULT 0,
                     show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
@@ -209,6 +235,13 @@ class ScheduleRepository:
                     metadata TEXT NOT NULL DEFAULT ''
                 );
 
+                CREATE TABLE IF NOT EXISTS quick_note_folders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    is_default INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS quick_notes (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     body TEXT NOT NULL,
@@ -216,7 +249,9 @@ class ScheduleRepository:
                     created_at TEXT NOT NULL,
                     focus_session_id INTEGER REFERENCES focus_sessions(id) ON DELETE SET NULL,
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
-                    process_name TEXT NOT NULL DEFAULT ''
+                    folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL,
+                    process_name TEXT NOT NULL DEFAULT '',
+                    window_title TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS quick_note_attachments (
@@ -246,17 +281,43 @@ class ScheduleRepository:
                     ON quick_note_attachments (quick_note_id);
                 """
             )
+            item_type_columns = {row["name"] for row in connection.execute("PRAGMA table_info(item_types)")}
+            if "is_default" not in item_type_columns:
+                connection.execute("ALTER TABLE item_types ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0")
             task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
+            if "item_type_id" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL")
             if "completed_at" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
             event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)")}
+            if "item_type_id" not in event_columns:
+                connection.execute("ALTER TABLE events ADD COLUMN item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL")
             if "completed" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
             if "completed_at" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN completed_at TEXT")
+            default_task_type_id = self._ensure_default_item_type(connection, "task")
+            default_event_type_id = self._ensure_default_item_type(connection, "event")
+            connection.execute(
+                "UPDATE tasks SET item_type_id = ? WHERE item_type_id IS NULL",
+                (default_task_type_id,),
+            )
+            connection.execute(
+                "UPDATE events SET item_type_id = ? WHERE item_type_id IS NULL",
+                (default_event_type_id,),
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_item_types_default
+                    ON item_types (base_kind, is_default)
+                    WHERE is_default = 1
+                """
+            )
             preference_columns = {row["name"] for row in connection.execute("PRAGMA table_info(preferences)")}
             if "week_start_day" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN week_start_day INTEGER NOT NULL DEFAULT 0")
+            if "show_focus_panel" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_panel INTEGER NOT NULL DEFAULT 1")
             if "show_pomodoro_controls" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_pomodoro_controls INTEGER NOT NULL DEFAULT 1"
@@ -264,6 +325,14 @@ class ScheduleRepository:
             if "show_today_timeline_inline" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_today_timeline_inline INTEGER NOT NULL DEFAULT 1"
+                )
+            if "show_today_timeline_waiting_panel" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_today_timeline_waiting_panel INTEGER NOT NULL DEFAULT 1"
+                )
+            if "show_today_timeline_waiting_pinned" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN show_today_timeline_waiting_pinned INTEGER NOT NULL DEFAULT 1"
                 )
             if "show_today_checklist_inline" not in preference_columns:
                 connection.execute(
@@ -301,6 +370,32 @@ class ScheduleRepository:
             quick_note_columns = {row["name"] for row in connection.execute("PRAGMA table_info(quick_notes)")}
             if "content_html" not in quick_note_columns:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN content_html TEXT NOT NULL DEFAULT ''")
+            if "folder_id" not in quick_note_columns:
+                connection.execute("ALTER TABLE quick_notes ADD COLUMN folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL")
+            if "window_title" not in quick_note_columns:
+                connection.execute("ALTER TABLE quick_notes ADD COLUMN window_title TEXT NOT NULL DEFAULT ''")
+
+            quick_note_folder_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(quick_note_folders)")
+            }
+            if "is_default" not in quick_note_folder_columns:
+                connection.execute("ALTER TABLE quick_note_folders ADD COLUMN is_default INTEGER NOT NULL DEFAULT 0")
+
+            default_folder_id = self._ensure_default_quick_note_folder(connection)
+            connection.execute("UPDATE quick_notes SET folder_id = ? WHERE folder_id IS NULL", (default_folder_id,))
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_quick_notes_folder
+                    ON quick_notes (folder_id, created_at)
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_quick_note_folders_default
+                    ON quick_note_folders (is_default)
+                    WHERE is_default = 1
+                """
+            )
 
     def seed_defaults(self) -> None:
         with self.connect() as connection:
@@ -320,12 +415,133 @@ class ScheduleRepository:
                     """
                     INSERT INTO preferences
                       (id, day_max_minutes, break_minutes, strategy, week_start_day,
-                       show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
+                       show_focus_panel,
+                       show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
+                       show_today_timeline_waiting_pinned,
+                       show_today_checklist_inline,
                        show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
                        show_compact_favorites_panel, favorite_display_mode, time_format)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
                     """
                 )
+
+            self._ensure_default_quick_note_folder(connection)
+            self._ensure_default_item_type(connection, "task")
+            self._ensure_default_item_type(connection, "event")
+
+    def default_item_type(self, base_kind: str) -> ItemType:
+        kind = _item_base_kind(base_kind)
+        with self.connect() as connection:
+            type_id = self._ensure_default_item_type(connection, kind)
+            row = connection.execute("SELECT * FROM item_types WHERE id = ?", (type_id,)).fetchone()
+        if row is None:
+            raise ValueError("Default item type could not be created")
+        return self._item_type_from_row(row)
+
+    def list_item_types(self, base_kind: str | None = None) -> list[ItemType]:
+        query = "SELECT * FROM item_types"
+        params: tuple[object, ...] = ()
+        if base_kind is not None:
+            query += " WHERE base_kind = ?"
+            params = (_item_base_kind(base_kind),)
+        query += (
+            " ORDER BY CASE base_kind WHEN 'task' THEN 0 ELSE 1 END, "
+            "is_default DESC, name COLLATE NOCASE ASC, id ASC"
+        )
+
+        with self.connect() as connection:
+            self._ensure_default_item_type(connection, "task")
+            self._ensure_default_item_type(connection, "event")
+            rows = connection.execute(query, params).fetchall()
+        return [self._item_type_from_row(row) for row in rows]
+
+    def get_item_type(self, item_type_id: int | None) -> ItemType | None:
+        if item_type_id is None:
+            return None
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM item_types WHERE id = ?", (item_type_id,)).fetchone()
+        return self._item_type_from_row(row) if row else None
+
+    def save_item_type(self, item_type: ItemType) -> ItemType:
+        item_type.name = item_type.name.strip()
+        if not item_type.name:
+            raise ValueError("Item type name is required")
+        item_type.base_kind = _item_base_kind(item_type.base_kind)
+
+        with self.connect() as connection:
+            if item_type.is_default:
+                connection.execute(
+                    "UPDATE item_types SET is_default = 0 WHERE base_kind = ?",
+                    (item_type.base_kind,),
+                )
+
+            if item_type.id is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO item_types (name, base_kind, created_at, is_default)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        item_type.name,
+                        item_type.base_kind,
+                        _dt_exact(item_type.created_at),
+                        int(item_type.is_default),
+                    ),
+                )
+                item_type.id = int(cursor.lastrowid)
+            else:
+                connection.execute(
+                    """
+                    UPDATE item_types
+                    SET name = ?,
+                        base_kind = ?,
+                        is_default = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        item_type.name,
+                        item_type.base_kind,
+                        int(item_type.is_default),
+                        item_type.id,
+                    ),
+                )
+
+            self._ensure_default_item_type(connection, item_type.base_kind)
+        return item_type
+
+    def set_default_item_type(self, item_type_id: int) -> ItemType | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM item_types WHERE id = ?", (item_type_id,)).fetchone()
+            if row is None:
+                return None
+            item_type = self._item_type_from_row(row)
+            connection.execute(
+                "UPDATE item_types SET is_default = 0 WHERE base_kind = ?",
+                (item_type.base_kind,),
+            )
+            connection.execute("UPDATE item_types SET is_default = 1 WHERE id = ?", (item_type.id,))
+            updated = connection.execute("SELECT * FROM item_types WHERE id = ?", (item_type.id,)).fetchone()
+        return self._item_type_from_row(updated) if updated else None
+
+    def delete_item_type(self, item_type_id: int) -> bool:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM item_types WHERE id = ?", (item_type_id,)).fetchone()
+            if row is None:
+                return False
+            item_type = self._item_type_from_row(row)
+            if item_type.is_default:
+                return False
+            default_type_id = self._ensure_default_item_type(connection, item_type.base_kind)
+            table = "tasks" if item_type.base_kind == "task" else "events"
+            connection.execute(
+                f"UPDATE {table} SET item_type_id = ? WHERE item_type_id = ?",
+                (default_type_id, item_type_id),
+            )
+            connection.execute("DELETE FROM item_types WHERE id = ?", (item_type_id,))
+        return True
+
+    def _default_item_type_id(self, connection: sqlite3.Connection, base_kind: str) -> int:
+        return self._ensure_default_item_type(connection, _item_base_kind(base_kind))
 
     def save_task(self, task: Task) -> Task:
         if task.completed and task.completed_at is None:
@@ -334,12 +550,13 @@ class ScheduleRepository:
             task.completed_at = None
 
         with self.connect() as connection:
+            task.item_type_id = task.item_type_id or self._default_item_type_id(connection, "task")
             if task.id is None:
                 cursor = connection.execute(
                     """
                     INSERT INTO tasks
-                      (title, duration_minutes, due_at, priority, category, completed, completed_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      (title, duration_minutes, due_at, priority, category, item_type_id, completed, completed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.title,
@@ -347,6 +564,7 @@ class ScheduleRepository:
                         _dt(task.due_at),
                         task.priority,
                         task.category,
+                        task.item_type_id,
                         int(task.completed),
                         _dt_exact(task.completed_at),
                         _dt(task.created_at),
@@ -362,6 +580,7 @@ class ScheduleRepository:
                         due_at = ?,
                         priority = ?,
                         category = ?,
+                        item_type_id = ?,
                         completed = ?,
                         completed_at = ?,
                         created_at = ?
@@ -373,6 +592,7 @@ class ScheduleRepository:
                         _dt(task.due_at),
                         task.priority,
                         task.category,
+                        task.item_type_id,
                         int(task.completed),
                         _dt_exact(task.completed_at),
                         _dt(task.created_at),
@@ -434,12 +654,13 @@ class ScheduleRepository:
             event.completed_at = None
 
         with self.connect() as connection:
+            event.item_type_id = event.item_type_id or self._default_item_type_id(connection, "event")
             if event.id is None:
                 cursor = connection.execute(
                     """
                     INSERT INTO events
-                      (title, start_at, end_at, fixed, task_id, category, completed, completed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      (title, start_at, end_at, fixed, task_id, category, item_type_id, completed, completed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.title,
@@ -448,6 +669,7 @@ class ScheduleRepository:
                         int(event.fixed),
                         event.task_id,
                         event.category,
+                        event.item_type_id,
                         int(event.completed),
                         _dt_exact(event.completed_at),
                     ),
@@ -463,6 +685,7 @@ class ScheduleRepository:
                         fixed = ?,
                         task_id = ?,
                         category = ?,
+                        item_type_id = ?,
                         completed = ?,
                         completed_at = ?
                     WHERE id = ?
@@ -474,6 +697,7 @@ class ScheduleRepository:
                         int(event.fixed),
                         event.task_id,
                         event.category,
+                        event.item_type_id,
                         int(event.completed),
                         _dt_exact(event.completed_at),
                         event.id,
@@ -597,8 +821,11 @@ class ScheduleRepository:
             break_minutes=int(row["break_minutes"]),
             strategy=str(row["strategy"]),
             week_start_day=int(row["week_start_day"]),
+            show_focus_panel=bool(row["show_focus_panel"]),
             show_pomodoro_controls=bool(row["show_pomodoro_controls"]),
             show_today_timeline_inline=bool(row["show_today_timeline_inline"]),
+            show_today_timeline_waiting_panel=bool(row["show_today_timeline_waiting_panel"]),
+            show_today_timeline_waiting_pinned=bool(row["show_today_timeline_waiting_pinned"]),
             show_today_checklist_inline=bool(row["show_today_checklist_inline"]),
             show_today_flow_panel=bool(row["show_today_flow_panel"]),
             show_quick_memo_panel=bool(row["show_quick_memo_panel"]),
@@ -616,17 +843,21 @@ class ScheduleRepository:
                 """
                 INSERT INTO preferences
                   (id, day_max_minutes, break_minutes, strategy, week_start_day,
-                   show_pomodoro_controls, show_today_timeline_inline, show_today_checklist_inline,
+                   show_focus_panel, show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
+                   show_today_timeline_waiting_pinned, show_today_checklist_inline,
                    show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
                    show_compact_favorites_panel, favorite_display_mode, time_format)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
                     strategy = excluded.strategy,
                     week_start_day = excluded.week_start_day,
+                    show_focus_panel = excluded.show_focus_panel,
                     show_pomodoro_controls = excluded.show_pomodoro_controls,
                     show_today_timeline_inline = excluded.show_today_timeline_inline,
+                    show_today_timeline_waiting_panel = excluded.show_today_timeline_waiting_panel,
+                    show_today_timeline_waiting_pinned = excluded.show_today_timeline_waiting_pinned,
                     show_today_checklist_inline = excluded.show_today_checklist_inline,
                     show_today_flow_panel = excluded.show_today_flow_panel,
                     show_quick_memo_panel = excluded.show_quick_memo_panel,
@@ -640,8 +871,11 @@ class ScheduleRepository:
                     preferences.break_minutes,
                     preferences.strategy,
                     preferences.week_start_day,
+                    int(preferences.show_focus_panel),
                     int(preferences.show_pomodoro_controls),
                     int(preferences.show_today_timeline_inline),
+                    int(preferences.show_today_timeline_waiting_panel),
+                    int(preferences.show_today_timeline_waiting_pinned),
                     int(preferences.show_today_checklist_inline),
                     int(preferences.show_today_flow_panel),
                     int(preferences.show_quick_memo_panel),
@@ -1012,13 +1246,110 @@ class ScheduleRepository:
             ).fetchall()
         return [self._focus_event_from_row(row) for row in rows]
 
+    def default_quick_note_folder(self) -> QuickNoteFolder:
+        with self.connect() as connection:
+            folder_id = self._ensure_default_quick_note_folder(connection)
+            row = connection.execute("SELECT * FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+        if row is None:
+            raise ValueError("Default quick note folder could not be created")
+        return self._quick_note_folder_from_row(row)
+
+    def list_quick_note_folders(self) -> list[QuickNoteFolder]:
+        with self.connect() as connection:
+            self._ensure_default_quick_note_folder(connection)
+            rows = connection.execute(
+                """
+                SELECT * FROM quick_note_folders
+                ORDER BY is_default DESC, name COLLATE NOCASE ASC, id ASC
+                """
+            ).fetchall()
+        return [self._quick_note_folder_from_row(row) for row in rows]
+
+    def get_quick_note_folder(self, folder_id: int) -> QuickNoteFolder | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+        return self._quick_note_folder_from_row(row) if row else None
+
+    def save_quick_note_folder(self, folder: QuickNoteFolder) -> QuickNoteFolder:
+        name = folder.name.strip() or DEFAULT_QUICK_NOTE_FOLDER_NAME
+        with self.connect() as connection:
+            if folder.is_default:
+                connection.execute("UPDATE quick_note_folders SET is_default = 0 WHERE is_default = 1")
+            if folder.id is None:
+                cursor = connection.execute(
+                    """
+                    INSERT INTO quick_note_folders (name, created_at, is_default)
+                    VALUES (?, ?, ?)
+                    """,
+                    (name, _dt_exact(folder.created_at), int(folder.is_default)),
+                )
+                folder.id = int(cursor.lastrowid)
+            else:
+                connection.execute(
+                    """
+                    UPDATE quick_note_folders
+                    SET name = ?,
+                        is_default = ?
+                    WHERE id = ?
+                    """,
+                    (name, int(folder.is_default), folder.id),
+                )
+            if not folder.is_default:
+                self._ensure_default_quick_note_folder(connection)
+        folder.name = name
+        return folder
+
+    def set_default_quick_note_folder(self, folder_id: int) -> QuickNoteFolder | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+            if row is None:
+                return None
+            connection.execute("UPDATE quick_note_folders SET is_default = 0 WHERE is_default = 1")
+            connection.execute("UPDATE quick_note_folders SET is_default = 1 WHERE id = ?", (folder_id,))
+            updated = connection.execute("SELECT * FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+        return self._quick_note_folder_from_row(updated) if updated else None
+
+    def delete_quick_note_folder(self, folder_id: int) -> bool:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+            if row is None:
+                return False
+            folder = self._quick_note_folder_from_row(row)
+            if folder.is_default:
+                return False
+            default_folder_id = self._ensure_default_quick_note_folder(connection)
+            connection.execute(
+                "UPDATE quick_notes SET folder_id = ? WHERE folder_id = ?",
+                (default_folder_id, folder_id),
+            )
+            connection.execute("DELETE FROM quick_note_folders WHERE id = ?", (folder_id,))
+        return True
+
+    def move_quick_notes_to_folder(self, note_ids: list[int] | tuple[int, ...] | set[int], folder_id: int) -> int:
+        unique_note_ids = sorted({int(note_id) for note_id in note_ids if int(note_id) > 0})
+        if not unique_note_ids:
+            return 0
+
+        with self.connect() as connection:
+            folder = connection.execute("SELECT id FROM quick_note_folders WHERE id = ?", (folder_id,)).fetchone()
+            if folder is None:
+                return 0
+            placeholders = ", ".join("?" for _ in unique_note_ids)
+            cursor = connection.execute(
+                f"UPDATE quick_notes SET folder_id = ? WHERE id IN ({placeholders})",
+                (folder_id, *unique_note_ids),
+            )
+        return int(cursor.rowcount)
+
     def save_quick_note(self, note: QuickNote) -> QuickNote:
         with self.connect() as connection:
+            folder_id = note.folder_id or self._ensure_default_quick_note_folder(connection)
             if note.id is None:
                 cursor = connection.execute(
                     """
-                    INSERT INTO quick_notes (body, content_html, created_at, focus_session_id, task_id, process_name)
-                    VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO quick_notes
+                      (body, content_html, created_at, focus_session_id, task_id, folder_id, process_name, window_title)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note.body.strip(),
@@ -1026,7 +1357,9 @@ class ScheduleRepository:
                         _dt_exact(note.created_at),
                         note.focus_session_id,
                         note.task_id,
+                        folder_id,
                         normalize_process_name(note.process_name) if note.process_name else "",
+                        note.window_title.strip(),
                     ),
                 )
                 note.id = int(cursor.lastrowid)
@@ -1039,7 +1372,9 @@ class ScheduleRepository:
                         created_at = ?,
                         focus_session_id = ?,
                         task_id = ?,
-                        process_name = ?
+                        folder_id = ?,
+                        process_name = ?,
+                        window_title = ?
                     WHERE id = ?
                     """,
                     (
@@ -1048,10 +1383,13 @@ class ScheduleRepository:
                         _dt_exact(note.created_at),
                         note.focus_session_id,
                         note.task_id,
+                        folder_id,
                         normalize_process_name(note.process_name) if note.process_name else "",
+                        note.window_title.strip(),
                         note.id,
                     ),
                 )
+        note.folder_id = folder_id
         return note
 
     def list_quick_notes(
@@ -1059,12 +1397,19 @@ class ScheduleRepository:
         start_at: datetime | None = None,
         end_at: datetime | None = None,
         limit: int | None = None,
+        folder_id: int | None = None,
     ) -> list[QuickNote]:
         query = "SELECT * FROM quick_notes"
         params: list[object] = []
+        conditions: list[str] = []
         if start_at and end_at:
-            query += " WHERE created_at >= ? AND created_at < ?"
+            conditions.append("created_at >= ? AND created_at < ?")
             params.extend([_dt_exact(start_at), _dt_exact(end_at)])
+        if folder_id is not None:
+            conditions.append("folder_id = ?")
+            params.append(folder_id)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY created_at DESC, id DESC"
         if limit is not None:
             query += " LIMIT ?"
@@ -1247,6 +1592,7 @@ class ScheduleRepository:
 
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> Task:
+        keys = set(row.keys())
         return Task(
             id=int(row["id"]),
             title=str(row["title"]),
@@ -1257,6 +1603,7 @@ class ScheduleRepository:
             completed=bool(row["completed"]),
             completed_at=_parse_dt(row["completed_at"]),
             created_at=_parse_dt(row["created_at"]) or datetime.now(),
+            item_type_id=row["item_type_id"] if "item_type_id" in keys else None,
         )
 
     @staticmethod
@@ -1265,6 +1612,7 @@ class ScheduleRepository:
         end_at = _parse_dt(row["end_at"])
         if start_at is None or end_at is None:
             raise ValueError("Stored event is missing a valid time range")
+        keys = set(row.keys())
         return Event(
             id=int(row["id"]),
             title=str(row["title"]),
@@ -1275,6 +1623,7 @@ class ScheduleRepository:
             category=str(row["category"]),
             completed=bool(row["completed"]),
             completed_at=_parse_dt(row["completed_at"]),
+            item_type_id=row["item_type_id"] if "item_type_id" in keys else None,
         )
 
     @staticmethod
@@ -1351,10 +1700,102 @@ class ScheduleRepository:
         )
 
     @staticmethod
+    def _ensure_default_item_type(connection: sqlite3.Connection, base_kind: str) -> int:
+        kind = _item_base_kind(base_kind)
+        row = connection.execute(
+            """
+            SELECT id FROM item_types
+            WHERE base_kind = ? AND is_default = 1
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (kind,),
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+        first_row = connection.execute(
+            """
+            SELECT id FROM item_types
+            WHERE base_kind = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (kind,),
+        ).fetchone()
+        if first_row is not None:
+            item_type_id = int(first_row["id"])
+            connection.execute("UPDATE item_types SET is_default = 1 WHERE id = ?", (item_type_id,))
+            return item_type_id
+
+        name = DEFAULT_EVENT_ITEM_TYPE_NAME if kind == "event" else DEFAULT_TASK_ITEM_TYPE_NAME
+        cursor = connection.execute(
+            """
+            INSERT INTO item_types (name, base_kind, created_at, is_default)
+            VALUES (?, ?, ?, 1)
+            """,
+            (name, kind, _dt_exact(datetime.now())),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _item_type_from_row(row: sqlite3.Row) -> ItemType:
+        created_at = _parse_dt(row["created_at"]) or datetime.now()
+        return ItemType(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            base_kind=_item_base_kind(str(row["base_kind"])),
+            created_at=created_at,
+            is_default=bool(row["is_default"]),
+        )
+
+    @staticmethod
+    def _ensure_default_quick_note_folder(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT id FROM quick_note_folders WHERE is_default = 1 ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if row is not None:
+            return int(row["id"])
+
+        named_row = connection.execute(
+            """
+            SELECT id FROM quick_note_folders
+            WHERE name = ?
+            ORDER BY id ASC
+            LIMIT 1
+            """,
+            (DEFAULT_QUICK_NOTE_FOLDER_NAME,),
+        ).fetchone()
+        if named_row is not None:
+            folder_id = int(named_row["id"])
+            connection.execute("UPDATE quick_note_folders SET is_default = 1 WHERE id = ?", (folder_id,))
+            return folder_id
+
+        cursor = connection.execute(
+            """
+            INSERT INTO quick_note_folders (name, created_at, is_default)
+            VALUES (?, ?, 1)
+            """,
+            (DEFAULT_QUICK_NOTE_FOLDER_NAME, _dt_exact(datetime.now())),
+        )
+        return int(cursor.lastrowid)
+
+    @staticmethod
+    def _quick_note_folder_from_row(row: sqlite3.Row) -> QuickNoteFolder:
+        created_at = _parse_dt(row["created_at"]) or datetime.now()
+        return QuickNoteFolder(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            created_at=created_at,
+            is_default=bool(row["is_default"]),
+        )
+
+    @staticmethod
     def _quick_note_from_row(row: sqlite3.Row) -> QuickNote:
         created_at = _parse_dt(row["created_at"])
         if created_at is None:
             raise ValueError("Stored quick note is missing a valid created_at")
+        keys = set(row.keys())
         return QuickNote(
             id=int(row["id"]),
             body=str(row["body"]),
@@ -1362,7 +1803,9 @@ class ScheduleRepository:
             created_at=created_at,
             focus_session_id=row["focus_session_id"],
             task_id=row["task_id"],
+            folder_id=row["folder_id"] if "folder_id" in keys else None,
             process_name=str(row["process_name"]),
+            window_title=str(row["window_title"]) if "window_title" in keys else "",
         )
 
     @staticmethod
