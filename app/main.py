@@ -13,11 +13,9 @@ def main() -> int:
     app.setApplicationName("Schedule Helper")
     repository = ScheduleRepository(default_database_path())
     window = MainWindow(repository)
-    window.resize(1280, 820)
     window.show()
     return app.exec()
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -3,9 +3,13 @@ from __future__ import annotations
 import json
 import os
 import webbrowser
+from html.parser import HTMLParser
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from urllib.error import HTTPError, URLError
+from urllib.parse import urljoin, urlparse
+from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QDate, QMimeData, QPoint, QSize, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import QColor, QDrag, QIcon, QKeySequence, QPixmap, QShortcut, QTextCursor, QTextImageFormat
@@ -60,6 +64,29 @@ FEATURE_MIME_TYPE = "application/x-schedule-helper-feature"
 NOTE_IDS_MIME_TYPE = "application/x-schedule-helper-note-ids"
 
 
+def _start_feature_drag(source: QWidget, feature_key: str) -> None:
+    mime = QMimeData()
+    mime.setData(FEATURE_MIME_TYPE, feature_key.encode("utf-8"))
+    drag = QDrag(source)
+    drag.setMimeData(mime)
+    drag.exec(Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+
+
+def _set_window_always_on_top(window: QWidget, enabled: bool) -> None:
+    was_visible = window.isVisible()
+    window.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+    if was_visible:
+        window.show()
+        window.raise_()
+
+
+def _add_always_on_top_checkbox(window: QWidget, row: QHBoxLayout) -> QCheckBox:
+    checkbox = QCheckBox("항상 위")
+    checkbox.toggled.connect(lambda enabled, target=window: _set_window_always_on_top(target, enabled))
+    row.addWidget(checkbox)
+    return checkbox
+
+
 def _decode_note_ids(mime_data: QMimeData) -> list[int]:
     if not mime_data.hasFormat(NOTE_IDS_MIME_TYPE):
         return []
@@ -79,21 +106,21 @@ def _decode_note_ids(mime_data: QMimeData) -> list[int]:
     return decoded
 
 
-class FeatureDragHandle(QLabel):
+class FeatureMoveBar(QWidget):
     def __init__(self, feature_key: str, parent: QWidget | None = None) -> None:
-        super().__init__("", parent)
+        super().__init__(parent)
         self.feature_key = feature_key
         self.drag_start: QPoint | None = None
-        self.setObjectName("featureDragHandle")
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setFixedSize(QSize(20, 22))
+        self.setObjectName("featureMoveBar")
+        self.setMinimumHeight(30)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
-        self.setToolTip("드래그해서 위치 변경")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_start = event.position().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -103,12 +130,9 @@ class FeatureDragHandle(QLabel):
         distance = (event.position().toPoint() - self.drag_start).manhattanLength()
         if distance < QApplication.startDragDistance():
             return
-
-        mime = QMimeData()
-        mime.setData(FEATURE_MIME_TYPE, self.feature_key.encode("utf-8"))
-        drag = QDrag(self)
-        drag.setMimeData(mime)
-        drag.exec(Qt.DropAction.MoveAction)
+        self.drag_start = None
+        _start_feature_drag(self, self.feature_key)
+        event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
         self.drag_start = None
@@ -218,27 +242,30 @@ class DraggableFeatureBox(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(6)
 
-        bar = QWidget()
-        bar.setObjectName("featureMoveBar")
-        bar.setMinimumHeight(30)
+        bar = FeatureMoveBar(feature_key, self)
         bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         bar.customContextMenuRequested.connect(self.show_feature_context_menu)
         bar_layout = QHBoxLayout(bar)
-        bar_layout.setContentsMargins(4, 3, 6, 3)
+        bar_layout.setContentsMargins(10, 3, 8, 3)
         bar_layout.setSpacing(6)
-        bar_layout.addWidget(FeatureDragHandle(feature_key, bar))
         title_label = QLabel(title)
+        self.title_label = title_label
         title_label.setObjectName("featureMoveTitle")
         title_label.setToolTip(title)
         title_label.setMinimumWidth(min(170, max(72, title_label.fontMetrics().horizontalAdvance(title) + 16)))
         title_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-        title_label.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        title_label.customContextMenuRequested.connect(self.show_feature_context_menu)
+        title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         bar_layout.addWidget(title_label)
         bar_layout.addStretch(1)
         layout.addWidget(bar)
 
         layout.addWidget(content, 1 if expand_content else 0)
+
+    def set_title(self, title: str) -> None:
+        title = title.strip() or "기능"
+        self.title_label.setText(title)
+        self.title_label.setToolTip(title)
+        self.title_label.setMinimumWidth(min(260, max(72, self.title_label.fontMetrics().horizontalAdvance(title) + 16)))
 
     def show_feature_context_menu(self, position: QPoint) -> None:
         if self.widget_callback is None and self.hide_callback is None:
@@ -247,7 +274,7 @@ class DraggableFeatureBox(QWidget):
         source_widget = source if isinstance(source, QWidget) else self
         menu = QMenu(source_widget)
         if self.widget_callback is not None:
-            widget_action = menu.addAction("위젯으로 열기")
+            widget_action = menu.addAction("새창으로 열기")
             widget_action.triggered.connect(lambda _checked=False: self.widget_callback(self.feature_key))
         if self.hide_callback is not None:
             if not menu.isEmpty():
@@ -451,9 +478,13 @@ class MainWindow(QMainWindow):
         self.focus_tick_timer = QTimer(self)
         self.focus_tick_timer.setInterval(1000)
         self.focus_tick_timer.timeout.connect(self.on_focus_tick)
+        self.current_datetime_timer = QTimer(self)
+        self.current_datetime_timer.setInterval(1000)
+        self.current_datetime_timer.timeout.connect(self.update_current_datetime_display)
         self.selected_task_id: int | None = None
         self.compact_auto = False
         self.changing_mode = False
+        self.closing = False
         self.break_until: datetime | None = None
         self.preferences = self.repository.get_preferences()
         if self.preferences.show_today_flow_panel:
@@ -472,14 +503,17 @@ class MainWindow(QMainWindow):
         self.feature_widget_windows: dict[str, QDialog] = {}
         self.quick_note_detail_windows: dict[int, QDialog] = {}
         self.quick_note_folder_notes_window: QDialog | None = None
+        self.compact_widget_window: QDialog | None = None
 
-        self.setWindowTitle("Schedule Helper")
+        self.setWindowTitle(self.preferences.app_title)
         self.setMinimumSize(QSize(430, 320))
         self.setStatusBar(QStatusBar(self))
         self._initialize_focus_timer()
         self._build_ui()
+        self.restore_last_window_size()
         self._apply_style()
         self.apply_preferences()
+        self.restore_last_layout_state()
         self.refresh_all()
 
     def _initialize_focus_timer(self) -> None:
@@ -506,12 +540,9 @@ class MainWindow(QMainWindow):
 
         top_row = QHBoxLayout()
         title_box = QVBoxLayout()
-        self.date_label = QLabel()
-        self.date_label.setObjectName("mutedLabel")
-        title = QLabel("Focus Desk")
-        title.setObjectName("screenTitle")
-        title_box.addWidget(self.date_label)
-        title_box.addWidget(title)
+        self.app_title_label = QLabel(self.preferences.app_title)
+        self.app_title_label.setObjectName("screenTitle")
+        title_box.addWidget(self.app_title_label)
         top_row.addLayout(title_box)
         top_row.addStretch(1)
 
@@ -520,14 +551,24 @@ class MainWindow(QMainWindow):
         date_review_button.clicked.connect(self.show_date_review_window)
         top_row.addWidget(date_review_button)
 
+        task_folder_button = QPushButton("할 일 폴더")
+        _stabilize_control(task_folder_button, 104)
+        task_folder_button.clicked.connect(self.show_task_folder_settings)
+        top_row.addWidget(task_folder_button)
+
         settings_button = QPushButton("설정")
         _stabilize_control(settings_button, 78)
         settings_button.clicked.connect(self.show_settings_window)
         top_row.addWidget(settings_button)
 
-        self.compact_button = QPushButton("위젯 모드")
+        self.main_always_on_top_check = QCheckBox("항상 위")
+        self.main_always_on_top_check.setChecked(self.preferences.main_always_on_top)
+        self.main_always_on_top_check.toggled.connect(lambda enabled: self.set_main_always_on_top(enabled, persist=True))
+        top_row.addWidget(self.main_always_on_top_check)
+
+        self.compact_button = QPushButton("통합 위젯")
         _stabilize_control(self.compact_button, 94)
-        self.compact_button.clicked.connect(lambda: self.set_compact_mode(True))
+        self.compact_button.clicked.connect(self.open_compact_widget)
         top_row.addWidget(self.compact_button)
         layout.addLayout(top_row)
 
@@ -540,11 +581,13 @@ class MainWindow(QMainWindow):
         self.left_splitter = QSplitter(Qt.Orientation.Vertical)
         self.left_splitter.setObjectName("leftFeatureSplitter")
         self.left_splitter.setChildrenCollapsible(False)
+        self.datetime_panel = self._wrap_feature("datetime", "날짜/시간", self._build_datetime_panel())
+        self.left_splitter.addWidget(self.datetime_panel)
         self.focus_panel = self._wrap_feature("focus", "집중", self._build_focus_panel())
         self.left_splitter.addWidget(self.focus_panel)
         self.pomodoro_panel = self._wrap_feature("pomodoro", "뽀모도로", self._build_pomodoro_panel())
         self.left_splitter.addWidget(self.pomodoro_panel)
-        self.today_checklist_widget = TodayChecklistWidget(self.repository, self.refresh_today, self)
+        self.today_checklist_widget = TodayChecklistWidget(self.repository, self.refresh_today, self, show_title=False)
         self.today_checklist_panel = self._wrap_feature("today_checklist", "오늘 체크리스트", self.today_checklist_widget)
         self.left_splitter.addWidget(self.today_checklist_panel)
 
@@ -557,11 +600,12 @@ class MainWindow(QMainWindow):
         self.lower_splitter.setSizes([640])
         self.left_splitter.addWidget(self.lower_splitter)
 
-        self.left_splitter.setStretchFactor(0, 3)
-        self.left_splitter.setStretchFactor(1, 1)
-        self.left_splitter.setStretchFactor(2, 2)
-        self.left_splitter.setStretchFactor(3, 4)
-        self.left_splitter.setSizes([330, 130, 220, 360])
+        self.left_splitter.setStretchFactor(0, 0)
+        self.left_splitter.setStretchFactor(1, 3)
+        self.left_splitter.setStretchFactor(2, 1)
+        self.left_splitter.setStretchFactor(3, 2)
+        self.left_splitter.setStretchFactor(4, 4)
+        self.left_splitter.setSizes([96, 330, 130, 220, 360])
         self.body_splitter.addWidget(self.left_splitter)
 
         self.right_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -571,6 +615,7 @@ class MainWindow(QMainWindow):
         self.inline_timeline_widget = TodayTimelineWidget(
             self.repository,
             self,
+            title_text="",
             on_changed=self.refresh_today,
             on_focus_task=self.load_task_by_id,
             on_delete_focus_session=self.delete_focus_session_by_id,
@@ -600,7 +645,7 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _wrap_feature(self, feature_key: str, title: str, content: QWidget) -> DraggableFeatureBox:
-        expand_content = feature_key not in {"today_checklist"}
+        expand_content = feature_key not in {"datetime", "today_checklist"}
         widget_callback = (
             self.open_feature_widget
             if feature_key in {"focus", "pomodoro", "today_checklist", "quick_memo", "today_timeline", "link_favorites"}
@@ -617,6 +662,31 @@ class MainWindow(QMainWindow):
         )
         self.feature_boxes[feature_key] = box
         return box
+
+    def _build_datetime_panel(self) -> QWidget:
+        panel = QWidget()
+        panel.setObjectName("dateTimePanel")
+        panel.setFixedHeight(0)
+        panel.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.current_date_label = QLabel()
+        self.current_date_label.setObjectName("currentDateLabel")
+        self.current_date_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.current_date_label)
+
+        self.current_time_label = QLabel()
+        self.current_time_label.setObjectName("currentTimeLabel")
+        self.current_time_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        layout.addWidget(self.current_time_label)
+
+        self.current_datetime_empty_label = QLabel("표시할 날짜/시간이 없습니다.")
+        self.current_datetime_empty_label.setObjectName("mutedLabel")
+        self.current_datetime_empty_label.setWordWrap(True)
+        layout.addWidget(self.current_datetime_empty_label)
+        return panel
 
     def swap_feature_panels(self, source_key: str, target_key: str, placement: str = "after") -> None:
         if source_key == target_key:
@@ -662,13 +732,15 @@ class MainWindow(QMainWindow):
     def _build_focus_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("focusPanel")
+        panel.setMinimumHeight(0)
+        panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(20, 18, 20, 18)
-        layout.setSpacing(14)
+        layout.setContentsMargins(14, 10, 14, 10)
+        layout.setSpacing(8)
 
         form = QGridLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(10)
+        form.setHorizontalSpacing(10)
+        form.setVerticalSpacing(6)
         form.setColumnMinimumWidth(0, 78)
         form.setColumnMinimumWidth(1, 170)
         form.setColumnMinimumWidth(2, 150)
@@ -697,23 +769,25 @@ class MainWindow(QMainWindow):
         self.target_refresh_button = QPushButton("목록 갱신")
         _stabilize_control(self.target_refresh_button, 82)
         self.target_refresh_button.clicked.connect(self.refresh_targets)
-        target_action_box = QWidget()
-        target_action_layout = QHBoxLayout(target_action_box)
+        self.target_action_box = QWidget()
+        target_action_layout = QHBoxLayout(self.target_action_box)
         target_action_layout.setContentsMargins(0, 0, 0, 0)
         target_action_layout.setSpacing(6)
         target_action_layout.addWidget(self.add_target_button)
         target_action_layout.addWidget(self.target_refresh_button)
         form.addWidget(self.use_focus_target_check, 1, 0)
         form.addWidget(self.target_combo, 1, 1, 1, 2)
-        form.addWidget(target_action_box, 1, 3)
+        form.addWidget(self.target_action_box, 1, 3)
 
         self.focus_targets_list = QListWidget()
-        self.focus_targets_list.setMaximumHeight(72)
+        self.focus_targets_list.setMinimumHeight(0)
+        self.focus_targets_list.setMaximumHeight(52)
         self.focus_targets_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.remove_target_button = QPushButton("삭제")
         _stabilize_control(self.remove_target_button, 82)
         self.remove_target_button.clicked.connect(self.remove_selected_focus_target)
-        form.addWidget(QLabel("지정 창"), 2, 0)
+        self.focus_targets_label = QLabel("지정 창")
+        form.addWidget(self.focus_targets_label, 2, 0)
         form.addWidget(self.focus_targets_list, 2, 1, 1, 2)
         form.addWidget(self.remove_target_button, 2, 3)
 
@@ -782,9 +856,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(12)
 
         heading_row = QHBoxLayout()
-        heading = QLabel("뽀모도로")
-        heading.setObjectName("sectionTitle")
-        heading_row.addWidget(heading)
         heading_row.addStretch(1)
         self.pomodoro_status_label = QLabel("대기")
         self.pomodoro_status_label.setObjectName("pomodoroStatus")
@@ -941,23 +1012,6 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
 
-        heading_row = QHBoxLayout()
-        heading = QLabel("빠른 메모")
-        heading.setObjectName("sectionTitle")
-        heading_row.addWidget(heading)
-        heading_row.addStretch(1)
-        folder_view_button = QPushButton("폴더 보기")
-        _stabilize_control(folder_view_button, 92)
-        folder_view_button.setMaximumWidth(104)
-        folder_view_button.clicked.connect(lambda: self.open_note_folder_window(self._folder_id_from_combo("note_filter_combo")))
-        heading_row.addWidget(folder_view_button)
-        folder_settings_button = QPushButton("폴더 관리")
-        _stabilize_control(folder_settings_button, 92)
-        folder_settings_button.setMaximumWidth(104)
-        folder_settings_button.clicked.connect(self.show_note_folder_settings)
-        heading_row.addWidget(folder_settings_button)
-        layout.addLayout(heading_row)
-
         note_meta_row = QHBoxLayout()
         note_meta_row.setSpacing(6)
         note_meta_row.addWidget(QLabel("폴더"))
@@ -968,7 +1022,16 @@ class MainWindow(QMainWindow):
             lambda position: self.show_note_folder_combo_context_menu(self.quick_note_folder_combo, position)
         )
         note_meta_row.addWidget(self.quick_note_folder_combo, 1)
-        note_meta_row.addStretch(2)
+        folder_view_button = QPushButton("폴더 보기")
+        _stabilize_control(folder_view_button, 92)
+        folder_view_button.setMaximumWidth(104)
+        folder_view_button.clicked.connect(lambda: self.open_note_folder_window(self._folder_id_from_combo("note_filter_combo")))
+        note_meta_row.addWidget(folder_view_button)
+        folder_settings_button = QPushButton("폴더 관리")
+        _stabilize_control(folder_settings_button, 92)
+        folder_settings_button.setMaximumWidth(104)
+        folder_settings_button.clicked.connect(self.show_note_folder_settings)
+        note_meta_row.addWidget(folder_settings_button)
         layout.addLayout(note_meta_row)
 
         self.memo_splitter = QSplitter(Qt.Orientation.Vertical)
@@ -1049,9 +1112,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(10)
 
         heading_row = QHBoxLayout()
-        heading = QLabel("즐겨찾기")
-        heading.setObjectName("sectionTitle")
-        heading_row.addWidget(heading)
         heading_row.addStretch(1)
         favorites_settings_button = QPushButton("설정")
         _stabilize_control(favorites_settings_button, 68)
@@ -1179,7 +1239,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.compact_favorites_panel)
 
         self.always_on_top_check = QCheckBox("항상 위")
-        self.always_on_top_check.toggled.connect(self.toggle_always_on_top)
+        self.always_on_top_check.setChecked(self.preferences.main_always_on_top)
+        self.always_on_top_check.toggled.connect(lambda enabled: self.set_main_always_on_top(enabled, persist=True))
         layout.addWidget(self.always_on_top_check)
         layout.addStretch(1)
         delete_compact_note_shortcut = QShortcut(QKeySequence("Delete"), self.compact_notes_list)
@@ -1238,7 +1299,22 @@ class MainWindow(QMainWindow):
                 font-size: 20px;
                 font-weight: 800;
             }
+            QLabel#currentDateLabel {
+                color: #506068;
+                font-size: 14px;
+                font-weight: 700;
+            }
+            QLabel#currentTimeLabel {
+                color: #182026;
+                font-size: 24px;
+                font-weight: 800;
+            }
             QWidget#focusPanel, QWidget#pomodoroPanel, QWidget#timelinePanel, QWidget#checklistPanel {
+                background: #ffffff;
+                border: 1px solid #dfe5e2;
+                border-radius: 8px;
+            }
+            QWidget#dateTimePanel {
                 background: #ffffff;
                 border: 1px solid #dfe5e2;
                 border-radius: 8px;
@@ -1254,11 +1330,6 @@ class MainWindow(QMainWindow):
             QLabel#featureMoveTitle {
                 color: #26353a;
                 font-weight: 700;
-            }
-            QLabel#featureDragHandle {
-                background: #d8e2de;
-                border: 1px solid #9fb1ac;
-                border-radius: 4px;
             }
             QWidget#timelineWaitingRail {
                 background: #eef4f1;
@@ -1337,10 +1408,10 @@ class MainWindow(QMainWindow):
                 background: #d7dfdc;
             }
             QSplitter::handle:horizontal {
-                width: 8px;
+                width: 4px;
             }
             QSplitter::handle:vertical {
-                height: 8px;
+                height: 4px;
             }
             QSplitter::handle:hover {
                 background: #9fb1ac;
@@ -1359,7 +1430,7 @@ class MainWindow(QMainWindow):
         )
 
     def refresh_all(self) -> None:
-        self.date_label.setText(datetime.now().strftime("%Y년 %m월 %d일"))
+        self.update_current_datetime_display()
         self.refresh_targets()
         self.refresh_note_folders()
         self.refresh_today()
@@ -1369,6 +1440,74 @@ class MainWindow(QMainWindow):
         self.refresh_compact_favorites()
         self.refresh_history()
         self.update_focus_display()
+
+    def restore_last_window_size(self) -> None:
+        width = min(4000, max(430, int(self.preferences.last_window_width or 1280)))
+        height = min(3000, max(320, int(self.preferences.last_window_height or 820)))
+        self.resize(width, height)
+
+    def save_last_window_size(self) -> None:
+        geometry = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
+        width = geometry.width() if geometry.isValid() else self.width()
+        height = geometry.height() if geometry.isValid() else self.height()
+        width = min(4000, max(430, int(width)))
+        height = min(3000, max(320, int(height)))
+        if width == self.preferences.last_window_width and height == self.preferences.last_window_height:
+            return
+        self.preferences.last_window_width = width
+        self.preferences.last_window_height = height
+        self.preferences = self.repository.save_preferences(self.preferences)
+
+    def restore_last_layout_state(self) -> None:
+        raw_state = self.preferences.last_layout_state.strip()
+        if not raw_state:
+            return
+        try:
+            state = json.loads(raw_state)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(state, dict):
+            return
+        state = dict(state)
+        state.pop("window", None)
+        self.apply_layout_state(state, include_visibility=False)
+
+    def save_last_layout_state(self) -> None:
+        state = self.current_layout_state()
+        state.pop("window", None)
+        data = json.dumps(state, ensure_ascii=False)
+        if data == self.preferences.last_layout_state:
+            return
+        self.preferences.last_layout_state = data
+        self.preferences = self.repository.save_preferences(self.preferences)
+
+    def update_current_datetime_display(self) -> None:
+        if not hasattr(self, "current_date_label"):
+            return
+        now = datetime.now()
+        show_date = self.preferences.show_current_date
+        show_time = self.preferences.show_current_time
+        show_seconds = self.preferences.show_current_seconds
+        self.current_date_label.setText(now.strftime("%Y년 %m월 %d일"))
+        self.current_date_label.setVisible(show_date)
+        self.current_time_label.setText(_format_clock_time(now, self.preferences, show_seconds))
+        self.current_time_label.setVisible(show_time)
+        self.current_datetime_empty_label.setVisible(not show_date and not show_time)
+        self.set_feature_title("datetime", self.current_datetime_title(now))
+
+    def current_datetime_title(self, value: datetime | None = None) -> str:
+        value = value or datetime.now()
+        parts: list[str] = []
+        if self.preferences.show_current_date:
+            parts.append(value.strftime("%Y년 %m월 %d일"))
+        if self.preferences.show_current_time:
+            parts.append(_format_clock_time(value, self.preferences, self.preferences.show_current_seconds))
+        return " ".join(parts) or "날짜/시간"
+
+    def set_feature_title(self, feature_key: str, title: str) -> None:
+        feature_box = getattr(self, "feature_boxes", {}).get(feature_key)
+        if feature_box is not None:
+            feature_box.set_title(title)
 
     def refresh_targets(self) -> None:
         self.target_combo.clear()
@@ -1393,12 +1532,15 @@ class MainWindow(QMainWindow):
             "target_combo",
             "add_target_button",
             "target_refresh_button",
+            "target_action_box",
+            "focus_targets_label",
             "focus_targets_list",
             "remove_target_button",
         ):
             widget = getattr(self, widget_name, None)
             if isinstance(widget, QWidget):
                 widget.setEnabled(enabled)
+                widget.setVisible(enabled)
         if not enabled and hasattr(self, "focus_targets_list"):
             self.focus_targets_list.clear()
 
@@ -1614,12 +1756,14 @@ class MainWindow(QMainWindow):
             empty_label.setWordWrap(True)
             self.link_favorites_layout.addWidget(empty_label)
             self.link_favorites_layout.addStretch(1)
+            self.refresh_compact_widget()
             return
 
         for favorite in favorites:
             button = self._build_favorite_button(favorite)
             self.link_favorites_layout.addWidget(button)
         self.link_favorites_layout.addStretch(1)
+        self.refresh_compact_widget()
 
     def _build_favorite_button(self, favorite: LinkFavorite) -> QWidget:
         mode = self.preferences.favorite_display_mode
@@ -1963,13 +2107,30 @@ class MainWindow(QMainWindow):
         self.apply_preferences()
         self.statusBar().showMessage("설정을 저장했습니다.", 2500)
 
-    def show_item_type_settings(self) -> None:
+    def show_task_folder_settings(self) -> None:
         dialog = ItemTypeSettingsDialog(self.repository, self)
         dialog.exec()
         self.refresh_all()
-        self.statusBar().showMessage("할 일 분류 설정을 반영했습니다.", 2200)
+        self.statusBar().showMessage("할 일 폴더 설정을 반영했습니다.", 2200)
+
+    def show_item_type_settings(self) -> None:
+        self.show_task_folder_settings()
 
     def apply_preferences(self) -> None:
+        if hasattr(self, "app_title_label"):
+            self.app_title_label.setText(self.preferences.app_title)
+        if self.stack.currentWidget() == self.full_page:
+            self.setWindowTitle(self.preferences.app_title)
+        self.set_main_always_on_top(self.preferences.main_always_on_top, persist=False)
+        self._sync_always_on_top_checks()
+        if hasattr(self, "datetime_panel"):
+            self.datetime_panel.setVisible(self.preferences.show_datetime_panel)
+            self.update_current_datetime_display()
+            if self.preferences.show_datetime_panel and (self.preferences.show_current_time or self.preferences.show_current_date):
+                if not self.current_datetime_timer.isActive():
+                    self.current_datetime_timer.start()
+            else:
+                self.current_datetime_timer.stop()
         if hasattr(self, "focus_panel"):
             self.focus_panel.setVisible(self.preferences.show_focus_panel)
         show_pomodoro = self.preferences.show_pomodoro_controls
@@ -2003,6 +2164,29 @@ class MainWindow(QMainWindow):
         else:
             self.update_pomodoro_display()
 
+    def _sync_always_on_top_checks(self) -> None:
+        for widget_name in ("main_always_on_top_check", "always_on_top_check"):
+            widget = getattr(self, widget_name, None)
+            if isinstance(widget, QCheckBox):
+                widget.blockSignals(True)
+                widget.setChecked(self.preferences.main_always_on_top)
+                widget.blockSignals(False)
+
+    def set_main_always_on_top(self, enabled: bool, persist: bool = False) -> None:
+        if self.closing:
+            return
+        if persist and self.preferences.main_always_on_top != enabled:
+            self.preferences.main_always_on_top = enabled
+            self.preferences = self.repository.save_preferences(self.preferences)
+        flags = self.windowFlags()
+        current_enabled = bool(flags & Qt.WindowType.WindowStaysOnTopHint)
+        if current_enabled != enabled:
+            was_visible = self.isVisible()
+            self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+            if was_visible and not self.closing:
+                self.show()
+        self._sync_always_on_top_checks()
+
     def hide_feature_from_main(self, feature_key: str) -> None:
         attribute = self._feature_visibility_attribute(feature_key)
         if attribute is None:
@@ -2016,6 +2200,7 @@ class MainWindow(QMainWindow):
 
     def _feature_visibility_attribute(self, feature_key: str) -> str | None:
         return {
+            "datetime": "show_datetime_panel",
             "focus": "show_focus_panel",
             "pomodoro": "show_pomodoro_controls",
             "today_timeline": "show_today_timeline_inline",
@@ -2029,6 +2214,7 @@ class MainWindow(QMainWindow):
 
     def _feature_display_name(self, feature_key: str) -> str:
         return {
+            "datetime": "날짜/시간",
             "focus": "집중",
             "pomodoro": "뽀모도로",
             "today_checklist": "오늘 체크리스트",
@@ -2155,6 +2341,7 @@ class MainWindow(QMainWindow):
                 "right": self._splitter_child_tokens(self.right_splitter),
             },
             "visible": {
+                "datetime": self.preferences.show_datetime_panel,
                 "focus": self.preferences.show_focus_panel,
                 "pomodoro": self.preferences.show_pomodoro_controls,
                 "today_timeline": self.preferences.show_today_timeline_inline,
@@ -2176,7 +2363,7 @@ class MainWindow(QMainWindow):
             },
             "splitters": {
                 "body": [560, 760],
-                "left": [330, 130, 220, 360],
+                "left": [96, 330, 130, 220, 360],
                 "lower": [640],
                 "right": [620, 220],
                 "memo": [220, 220],
@@ -2219,6 +2406,7 @@ class MainWindow(QMainWindow):
         mapping = {
             key: attribute
             for key in (
+                "datetime",
                 "focus",
                 "pomodoro",
                 "today_timeline",
@@ -2247,7 +2435,7 @@ class MainWindow(QMainWindow):
     def default_feature_layout(self) -> dict[str, list[str]]:
         return {
             "body": ["group:left", "group:right"],
-            "left": ["focus", "pomodoro", "today_checklist", "group:lower"],
+            "left": ["datetime", "focus", "pomodoro", "today_checklist", "group:lower"],
             "lower": ["quick_memo"],
             "right": ["today_timeline", "link_favorites"],
         }
@@ -2578,6 +2766,7 @@ class MainWindow(QMainWindow):
         self.compact_pause_button.setEnabled(controls_enabled)
         self.compact_done_button.setEnabled(controls_enabled)
         self.refresh_feature_widget("focus")
+        self.refresh_compact_widget()
 
     def _display_remaining_seconds(self, session) -> int:
         if session.status == "break" and self.break_until is not None:
@@ -2739,6 +2928,7 @@ class MainWindow(QMainWindow):
         self.refresh_notes()
         self.refresh_compact_notes()
         self.refresh_feature_widget("quick_memo")
+        self.refresh_compact_widget()
         attachment_count = len(attachment_paths or []) - len(failed_paths)
         suffix = f" · 첨부 {attachment_count}개" if attachment_count else ""
         self.statusBar().showMessage(f"메모를 저장했습니다.{suffix}", 2500)
@@ -2828,6 +3018,7 @@ class MainWindow(QMainWindow):
         self.refresh_notes()
         self.refresh_compact_notes()
         self.refresh_feature_widget("quick_memo")
+        self.refresh_compact_widget()
         folder_window = self.quick_note_folder_notes_window
         if folder_window is not None:
             try:
@@ -2977,6 +3168,34 @@ class MainWindow(QMainWindow):
         self.refresh_feature_widget("quick_memo")
         self.statusBar().showMessage("메모를 삭제했습니다.", 2500)
 
+    def open_compact_widget(self) -> None:
+        existing = self.compact_widget_window
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self.compact_widget_window = None
+        dialog = IntegratedWidgetDialog(self)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(lambda _obj=None: setattr(self, "compact_widget_window", None))
+        self.compact_widget_window = dialog
+        dialog.show()
+        dialog.refresh()
+
+    def refresh_compact_widget(self) -> None:
+        widget = self.compact_widget_window
+        if widget is None:
+            return
+        try:
+            refresh = getattr(widget, "refresh", None)
+            if callable(refresh):
+                refresh()
+        except RuntimeError:
+            self.compact_widget_window = None
+
     def open_feature_widget(self, feature_key: str) -> None:
         existing = self.feature_widget_windows.get(feature_key)
         if existing is not None:
@@ -3040,41 +3259,286 @@ class MainWindow(QMainWindow):
                 self.setMinimumSize(QSize(340, 330))
                 self.resize(380, 380 if not self.preferences.show_compact_favorites_panel else 450)
             else:
-                self.setWindowTitle("Schedule Helper")
+                self.setWindowTitle(self.preferences.app_title)
                 self.setMinimumSize(QSize(430, 320))
                 self.resize(1120, 760)
         finally:
             self.changing_mode = False
 
     def toggle_always_on_top(self, enabled: bool) -> None:
-        flags = self.windowFlags()
-        if enabled:
-            self.setWindowFlags(flags | Qt.WindowType.WindowStaysOnTopHint)
-        else:
-            self.setWindowFlags(flags & ~Qt.WindowType.WindowStaysOnTopHint)
-        self.show()
+        self.set_main_always_on_top(enabled, persist=True)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        if self.changing_mode:
-            return
-        if self.stack.currentWidget() == self.full_page and (self.width() < 900 or self.height() < 560):
-            self.set_compact_mode(True, auto=True)
-        elif self.stack.currentWidget() == self.compact_page and self.compact_auto and self.width() > 980 and self.height() > 640:
-            self.set_compact_mode(False, auto=True)
+        return
 
     def closeEvent(self, event) -> None:
+        self.save_last_window_size()
+        self.save_last_layout_state()
+        self.closing = True
+        self.current_datetime_timer.stop()
+        self.focus_tick_timer.stop()
+        self.pomodoro_tick_timer.stop()
+        if self.compact_widget_window is not None:
+            try:
+                self.compact_widget_window.close()
+            except RuntimeError:
+                pass
         if self.focus_timer is not None and self.focus_timer.session is not None:
             if self.focus_timer.session.status in {"running", "paused"}:
                 self.focus_timer.stop(status="interrupted")
+        for dialog in list(self.feature_widget_windows.values()):
+            try:
+                dialog.close()
+            except RuntimeError:
+                pass
+        for dialog in list(self.quick_note_detail_windows.values()):
+            try:
+                dialog.close()
+            except RuntimeError:
+                pass
+        if self.quick_note_folder_notes_window is not None:
+            try:
+                self.quick_note_folder_notes_window.close()
+            except RuntimeError:
+                pass
         super().closeEvent(event)
+        event.accept()
+        app = QApplication.instance()
+        if app is not None:
+            QTimer.singleShot(0, app.quit)
+
+
+class IntegratedWidgetDialog(QDialog):
+    def __init__(self, owner: MainWindow) -> None:
+        super().__init__(owner)
+        self.owner = owner
+        self.setWindowTitle("통합 위젯")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(QSize(300, 300))
+        self.resize(380, 440 if owner.preferences.show_compact_favorites_panel else 360)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(7)
+
+        top = QHBoxLayout()
+        self.title_label = QLabel("집중 대기")
+        self.title_label.setObjectName("compactTitle")
+        top.addWidget(self.title_label, 1)
+        self.always_on_top_check = QCheckBox("항상 위")
+        self.always_on_top_check.toggled.connect(self.toggle_always_on_top)
+        top.addWidget(self.always_on_top_check)
+        close_button = QPushButton("닫기")
+        _stabilize_control(close_button, 62)
+        close_button.clicked.connect(self.close)
+        top.addWidget(close_button)
+        layout.addLayout(top)
+
+        self.time_label = QLabel("25:00")
+        self.time_label.setObjectName("compactTime")
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.time_label)
+
+        self.status_label = QLabel("대기 중")
+        self.status_label.setObjectName("mutedLabel")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 1000)
+        self.progress.setTextVisible(False)
+        layout.addWidget(self.progress)
+
+        controls = QHBoxLayout()
+        self.pause_button = QPushButton("일시정지")
+        self.pause_button.clicked.connect(owner.pause_or_resume_focus)
+        self.done_button = QPushButton("완료")
+        self.done_button.clicked.connect(owner.complete_focus)
+        controls.addWidget(self.pause_button)
+        controls.addWidget(self.done_button)
+        layout.addLayout(controls)
+
+        memo_row = QHBoxLayout()
+        self.note_edit = QLineEdit()
+        self.note_edit.setPlaceholderText("빠른 메모")
+        self.note_edit.returnPressed.connect(self.save_note)
+        memo_button = QPushButton("저장")
+        memo_button.clicked.connect(self.save_note)
+        memo_row.addWidget(self.note_edit, 1)
+        memo_row.addWidget(memo_button)
+        layout.addLayout(memo_row)
+
+        self.content_splitter = QSplitter(Qt.Orientation.Vertical)
+        self.content_splitter.setChildrenCollapsible(False)
+
+        notes_panel = QWidget()
+        notes_layout = QVBoxLayout(notes_panel)
+        notes_layout.setContentsMargins(0, 0, 0, 0)
+        notes_layout.setSpacing(4)
+        notes_header = QLabel("최근 메모")
+        notes_header.setObjectName("mutedLabel")
+        notes_layout.addWidget(notes_header)
+
+        self.notes_list = QListWidget()
+        self.notes_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.notes_list.setMinimumHeight(80)
+        self.notes_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.notes_list.itemDoubleClicked.connect(self.open_note)
+        self.notes_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.notes_list.customContextMenuRequested.connect(self.show_note_context_menu)
+        notes_layout.addWidget(self.notes_list, 1)
+        self.content_splitter.addWidget(notes_panel)
+
+        self.favorites_panel = QWidget()
+        favorites_layout = QVBoxLayout(self.favorites_panel)
+        favorites_layout.setContentsMargins(0, 0, 0, 0)
+        favorites_layout.setSpacing(4)
+        favorites_header = QLabel("즐겨찾기")
+        favorites_header.setObjectName("mutedLabel")
+        favorites_layout.addWidget(favorites_header)
+        self.favorites_area = QScrollArea()
+        self.favorites_area.setWidgetResizable(True)
+        self.favorites_area.setFrameShape(QFrame.Shape.NoFrame)
+        self.favorites_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.favorites_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.favorites_area.setMaximumHeight(72)
+        favorites_widget = QWidget()
+        self.favorites_layout = QHBoxLayout(favorites_widget)
+        self.favorites_layout.setContentsMargins(0, 0, 0, 0)
+        self.favorites_layout.setSpacing(6)
+        self.favorites_area.setWidget(favorites_widget)
+        favorites_layout.addWidget(self.favorites_area)
+        self.content_splitter.addWidget(self.favorites_panel)
+        self.content_splitter.setStretchFactor(0, 3)
+        self.content_splitter.setStretchFactor(1, 1)
+        self.content_splitter.setSizes([190, 82])
+        layout.addWidget(self.content_splitter, 1)
+
+        delete_shortcut = QShortcut(QKeySequence("Delete"), self.notes_list)
+        delete_shortcut.activated.connect(self.delete_selected_note)
+
+    def refresh(self) -> None:
+        self.refresh_focus()
+        self.refresh_notes()
+        self.refresh_favorites()
+
+    def refresh_focus(self) -> None:
+        session = self.owner.focus_timer.session if self.owner.focus_timer else None
+        if session is None:
+            planned = self.owner.planned_minutes_spin.value() * 60
+            remaining = planned
+            status = "대기 중"
+            title = self.owner.focus_title_edit.text().strip() or "집중 대기"
+            ratio = 1.0
+            progress = 0
+            pause_text = "일시정지"
+            controls_enabled = False
+        else:
+            remaining = self.owner._display_remaining_seconds(session)
+            status = _status_label(session.status)
+            title = session.title
+            ratio = self.owner.focus_timer.focus_ratio() if self.owner.focus_timer else 1.0
+            progress = int(1000 * min(1.0, session.focused_seconds / max(1, session.planned_seconds)))
+            pause_text = "재개" if session.status in {"paused", "break"} else "일시정지"
+            controls_enabled = session.status in {"running", "paused", "break"}
+        self.title_label.setText(title)
+        self.time_label.setText(_format_clock(remaining))
+        self.status_label.setText(f"{status} · 유지율 {int(ratio * 100)}%")
+        self.progress.setValue(progress)
+        self.pause_button.setText(pause_text)
+        self.pause_button.setEnabled(controls_enabled)
+        self.done_button.setEnabled(controls_enabled)
+
+    def refresh_notes(self) -> None:
+        self.notes_list.clear()
+        notes = self.owner.repository.list_quick_notes(limit=5)
+        if not notes:
+            empty = QListWidgetItem("저장된 메모가 없습니다.")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.notes_list.addItem(empty)
+            return
+        for note in notes:
+            item = QListWidgetItem(self.owner._note_list_label(note, compact=True))
+            item.setToolTip(self.owner._note_list_label(note, compact=False))
+            item.setData(Qt.ItemDataRole.UserRole, note.id)
+            self.notes_list.addItem(item)
+
+    def refresh_favorites(self) -> None:
+        self.favorites_panel.setVisible(self.owner.preferences.show_compact_favorites_panel)
+        while self.favorites_layout.count():
+            item = self.favorites_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        if not self.owner.preferences.show_compact_favorites_panel:
+            return
+        favorites = self.owner.repository.list_link_favorites()
+        if not favorites:
+            empty = QLabel("없음")
+            empty.setObjectName("mutedLabel")
+            self.favorites_layout.addWidget(empty)
+            self.favorites_layout.addStretch(1)
+            return
+        for favorite in favorites:
+            self.favorites_layout.addWidget(self.owner._build_compact_favorite_button(favorite))
+        self.favorites_layout.addStretch(1)
+
+    def save_note(self) -> None:
+        body = self.note_edit.text().strip()
+        if not body:
+            return
+        self.owner._save_note_body(body)
+        self.note_edit.clear()
+        self.refresh_notes()
+
+    def open_note(self, item: QListWidgetItem) -> None:
+        note_id = item.data(Qt.ItemDataRole.UserRole)
+        if note_id is not None:
+            self.owner.open_quick_note_detail(int(note_id))
+
+    def show_note_context_menu(self, position: QPoint) -> None:
+        item = self.notes_list.itemAt(position)
+        if item is None:
+            return
+        self.notes_list.setCurrentItem(item)
+        note_id = item.data(Qt.ItemDataRole.UserRole)
+        if note_id is None:
+            return
+        menu = QMenu(self.notes_list)
+        open_action = menu.addAction("열기")
+        open_action.triggered.connect(lambda _checked=False, target=item: self.open_note(target))
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(self.delete_selected_note)
+        menu.exec(self.notes_list.mapToGlobal(position))
+
+    def delete_selected_note(self) -> None:
+        item = self.notes_list.currentItem()
+        if item is None:
+            return
+        note_id = item.data(Qt.ItemDataRole.UserRole)
+        if note_id is None:
+            return
+        preview = item.text()
+        answer = QMessageBox.question(self, "빠른 메모 삭제", f"'{_shorten(preview, 40)}' 메모를 삭제할까요?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self.owner.repository.delete_quick_note(int(note_id))
+        self.owner.refresh_quick_note_views()
+        self.refresh_notes()
+
+    def toggle_always_on_top(self, enabled: bool) -> None:
+        was_visible = self.isVisible()
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, enabled)
+        if was_visible:
+            self.show()
 
 
 class FocusWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("집중 위젯")
+        self.setWindowTitle("집중 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(220, 150))
         self.resize(320, 190)
@@ -3083,9 +3547,12 @@ class FocusWidgetDialog(QDialog):
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
 
+        title_row = QHBoxLayout()
         self.title_label = QLabel("집중 대기")
         self.title_label.setObjectName("compactTitle")
-        layout.addWidget(self.title_label)
+        title_row.addWidget(self.title_label, 1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, title_row)
+        layout.addLayout(title_row)
 
         self.time_label = QLabel("25:00")
         self.time_label.setObjectName("compactTime")
@@ -3142,7 +3609,7 @@ class PomodoroWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("뽀모도로 위젯")
+        self.setWindowTitle("뽀모도로 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(220, 150))
         self.resize(300, 180)
@@ -3153,7 +3620,10 @@ class PomodoroWidgetDialog(QDialog):
 
         self.status_label = QLabel("대기")
         self.status_label.setObjectName("mutedLabel")
-        layout.addWidget(self.status_label)
+        status_row = QHBoxLayout()
+        status_row.addWidget(self.status_label, 1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, status_row)
+        layout.addLayout(status_row)
 
         self.time_label = QLabel("25:00")
         self.time_label.setObjectName("compactTime")
@@ -3195,7 +3665,7 @@ class QuickMemoWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("빠른 메모 위젯")
+        self.setWindowTitle("빠른 메모 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(260, 220))
         self.resize(380, 360)
@@ -3203,6 +3673,11 @@ class QuickMemoWidgetDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
         layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, top_row)
+        layout.addLayout(top_row)
 
         meta_row = QHBoxLayout()
         meta_row.addWidget(QLabel("폴더"))
@@ -3328,7 +3803,7 @@ class FavoritesWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("즐겨찾기 위젯")
+        self.setWindowTitle("즐겨찾기 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(220, 160))
         self.resize(340, 260)
@@ -3342,6 +3817,7 @@ class FavoritesWidgetDialog(QDialog):
         title.setObjectName("sectionTitle")
         header.addWidget(title)
         header.addStretch(1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, header)
         settings_button = QPushButton("설정")
         _stabilize_control(settings_button, 68)
         settings_button.clicked.connect(self.show_settings)
@@ -3382,7 +3858,7 @@ class TodayChecklistWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
-        self.setWindowTitle("오늘 체크리스트 위젯")
+        self.setWindowTitle("오늘 체크리스트 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(280, 220))
         self.resize(420, 520)
@@ -3390,6 +3866,11 @@ class TodayChecklistWidgetDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         layout.setSpacing(8)
+
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, top_row)
+        layout.addLayout(top_row)
 
         self.checklist = TodayChecklistWidget(owner.repository, owner.refresh_today, self)
         self.checklist.items_area.setMaximumHeight(16777215)
@@ -4145,6 +4626,8 @@ class FavoritesSettingsDialog(QDialog):
         self.repository = repository
         self.selected_favorite_id: int | None = None
         self.selected_icon_source_path = ""
+        self.selected_site_icon_data: bytes = b""
+        self.selected_site_icon_file_name = ""
         self.setWindowTitle("즐겨찾기 설정")
         self.resize(660, 520)
 
@@ -4190,10 +4673,14 @@ class FavoritesSettingsDialog(QDialog):
         choose_icon_button = QPushButton("선택")
         _stabilize_control(choose_icon_button, 72)
         choose_icon_button.clicked.connect(self.choose_favorite_icon)
+        site_icon_button = QPushButton("사이트 아이콘")
+        _stabilize_control(site_icon_button, 104)
+        site_icon_button.clicked.connect(self.fetch_favorite_site_icon)
         clear_icon_button = QPushButton("비우기")
         _stabilize_control(clear_icon_button, 72)
         clear_icon_button.clicked.connect(self.clear_favorite_icon)
         icon_file_row.addWidget(choose_icon_button)
+        icon_file_row.addWidget(site_icon_button)
         icon_file_row.addWidget(clear_icon_button)
 
         form.addRow("이름", self.favorite_title_edit)
@@ -4269,6 +4756,8 @@ class FavoritesSettingsDialog(QDialog):
             return
         self.selected_favorite_id = favorite.id
         self.selected_icon_source_path = ""
+        self.selected_site_icon_data = b""
+        self.selected_site_icon_file_name = ""
         self.favorite_title_edit.setText(favorite.title)
         self.favorite_target_edit.setText(favorite.target)
         self.favorite_icon_text_edit.setText(favorite.icon_text)
@@ -4277,6 +4766,8 @@ class FavoritesSettingsDialog(QDialog):
     def clear_editor(self) -> None:
         self.selected_favorite_id = None
         self.selected_icon_source_path = ""
+        self.selected_site_icon_data = b""
+        self.selected_site_icon_file_name = ""
         self.favorites_list.setCurrentRow(-1)
         self.favorite_title_edit.clear()
         self.favorite_target_edit.clear()
@@ -4293,10 +4784,32 @@ class FavoritesSettingsDialog(QDialog):
         if not file_path:
             return
         self.selected_icon_source_path = file_path
+        self.selected_site_icon_data = b""
+        self.selected_site_icon_file_name = ""
         self.favorite_icon_path_edit.setText(file_path)
+
+    def fetch_favorite_site_icon(self) -> None:
+        target = self.favorite_target_edit.text().strip()
+        if not target:
+            QMessageBox.information(self, "사이트 아이콘", "먼저 URL을 입력하세요.")
+            return
+        try:
+            file_name, data = _download_site_icon(target)
+        except ValueError as exc:
+            QMessageBox.information(self, "사이트 아이콘", str(exc))
+            return
+        except (HTTPError, URLError, TimeoutError, OSError) as exc:
+            QMessageBox.warning(self, "사이트 아이콘", f"사이트 아이콘을 가져오지 못했습니다.\n{exc}")
+            return
+        self.selected_icon_source_path = ""
+        self.selected_site_icon_file_name = file_name
+        self.selected_site_icon_data = data
+        self.favorite_icon_path_edit.setText(f"사이트 아이콘: {file_name}")
 
     def clear_favorite_icon(self) -> None:
         self.selected_icon_source_path = ""
+        self.selected_site_icon_data = b""
+        self.selected_site_icon_file_name = ""
         self.favorite_icon_path_edit.clear()
 
     def save_favorite(self) -> None:
@@ -4310,12 +4823,22 @@ class FavoritesSettingsDialog(QDialog):
         favorite.title = title
         favorite.target = target
         favorite.icon_text = self.favorite_icon_text_edit.text().strip()
-        favorite.icon_path = self.favorite_icon_path_edit.text().strip() if not self.selected_icon_source_path else favorite.icon_path
+        has_pending_icon = bool(self.selected_icon_source_path or self.selected_site_icon_data)
+        favorite.icon_path = self.favorite_icon_path_edit.text().strip() if not has_pending_icon else favorite.icon_path
         favorite = self.repository.save_link_favorite(favorite)
         if self.selected_icon_source_path and favorite.id is not None:
             favorite.icon_path = self.repository.copy_link_favorite_icon(favorite.id, self.selected_icon_source_path)
             favorite = self.repository.save_link_favorite(favorite)
+        elif self.selected_site_icon_data and favorite.id is not None:
+            favorite.icon_path = self.repository.save_link_favorite_icon_bytes(
+                favorite.id,
+                self.selected_site_icon_file_name,
+                self.selected_site_icon_data,
+            )
+            favorite = self.repository.save_link_favorite(favorite)
         self.selected_icon_source_path = ""
+        self.selected_site_icon_data = b""
+        self.selected_site_icon_file_name = ""
         self.refresh_favorites(favorite.id)
 
     def delete_selected_favorite(self) -> None:
@@ -4385,7 +4908,7 @@ class ChecklistItemEditDialog(QDialog):
         self.minutes_spin.setSuffix("분")
         _stabilize_control(self.minutes_spin, 96)
 
-        form.addRow("종류", self.item_type_combo)
+        form.addRow("폴더", self.item_type_combo)
         form.addRow("제목", self.title_edit)
         if self.use_time_check is not None:
             form.addRow("", self.use_time_check)
@@ -4476,7 +4999,7 @@ class TaskAddDialog(QDialog):
         self.item_type_combo = QComboBox()
         _populate_item_type_combo(self.item_type_combo, repository, "task")
         _stabilize_control(self.item_type_combo, 150)
-        form.addRow("종류", self.item_type_combo)
+        form.addRow("폴더", self.item_type_combo)
         form.addRow("제목", self.title_edit)
 
         duration_row = QHBoxLayout()
@@ -4567,6 +5090,7 @@ class TodayChecklistWidget(QWidget):
         repository: ScheduleRepository,
         on_changed: Callable[[], None] | None = None,
         parent: QWidget | None = None,
+        show_title: bool = True,
     ) -> None:
         super().__init__(parent)
         self.repository = repository
@@ -4580,9 +5104,10 @@ class TodayChecklistWidget(QWidget):
         layout.setSpacing(10)
 
         title_row = QHBoxLayout()
-        title = QLabel("오늘 체크리스트")
-        title.setObjectName("sectionTitle")
-        title_row.addWidget(title)
+        if show_title:
+            title = QLabel("오늘 체크리스트")
+            title.setObjectName("sectionTitle")
+            title_row.addWidget(title)
         title_row.addStretch(1)
         self.summary_label = QLabel()
         self.summary_label.setObjectName("mutedLabel")
@@ -4948,9 +5473,10 @@ class TodayTimelineWidget(QWidget):
         layout.setSpacing(10)
 
         title_row = QHBoxLayout()
-        title = QLabel(title_text)
-        title.setObjectName("sectionTitle")
-        title_row.addWidget(title)
+        if title_text:
+            title = QLabel(title_text)
+            title.setObjectName("sectionTitle")
+            title_row.addWidget(title)
         title_row.addStretch(1)
         self.date_label = QLabel()
         self.date_label.setObjectName("mutedLabel")
@@ -5029,14 +5555,6 @@ class TodayTimelineWidget(QWidget):
         self.timeline_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.timeline_list.customContextMenuRequested.connect(self.show_timeline_context_menu)
         self.timeline_list.hide()
-
-        button_row = QHBoxLayout()
-        refresh_button = QPushButton("새로고침")
-        _stabilize_control(refresh_button, 92)
-        refresh_button.clicked.connect(self.refresh_timeline)
-        button_row.addWidget(refresh_button)
-        button_row.addStretch(1)
-        time_layout.addLayout(button_row)
 
         self.content_splitter.addWidget(time_panel)
         self.waiting_rail = self._build_waiting_rail()
@@ -5237,16 +5755,15 @@ class TodayTimelineWidget(QWidget):
 
     def _time_for_block_position(self, position: QPoint, source: QWidget | None = None) -> datetime | None:
         source_widget = source or self.block_table.viewport()
-        viewport_position = (
-            position
-            if source_widget is self.block_table.viewport()
-            else self.block_table.viewport().mapFromGlobal(source_widget.mapToGlobal(position))
-        )
+        if source_widget is self.block_table or source_widget is self.block_table.viewport():
+            viewport_position = position
+        else:
+            viewport_position = self.block_table.viewport().mapFromGlobal(source_widget.mapToGlobal(position))
         row = self.block_table.rowAt(viewport_position.y())
         column = self.block_table.columnAt(viewport_position.x())
-        if row < 0 or column < 1:
+        if row < 0 or column < 0:
             return None
-        minute = (column - 1) * 10
+        minute = max(0, column - 1) * 10
         return datetime.combine(self.selected_date, time(row, minute))
 
     def add_timeline_item_from_block(
@@ -5530,7 +6047,7 @@ class TodayTimelineDialog(QDialog):
         on_delete_focus_session: Callable[[int], bool] | None = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("오늘 시간표")
+        self.setWindowTitle("오늘 시간표 새창")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(560, 420))
         self.resize(920, 760)
@@ -5539,6 +6056,11 @@ class TodayTimelineDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(10)
+
+        top_row = QHBoxLayout()
+        top_row.addStretch(1)
+        self.always_on_top_check = _add_always_on_top_checkbox(self, top_row)
+        layout.addLayout(top_row)
 
         self.timeline_widget = TodayTimelineWidget(
             repository,
@@ -5763,7 +6285,7 @@ class DateItemDialog(QDialog):
         self.minutes_spin.setValue(25 if item_type == "task" else 30)
         self.minutes_spin.setSuffix("분")
         _stabilize_control(self.minutes_spin, 96)
-        form.addRow("종류", self.item_type_combo)
+        form.addRow("폴더", self.item_type_combo)
         form.addRow("제목", self.title_edit)
         form.addRow("시간", self.time_edit)
         form.addRow("소요", self.minutes_spin)
@@ -6135,7 +6657,7 @@ class ItemTypeSettingsDialog(QDialog):
         super().__init__(parent)
         self.repository = repository
         self.selected_type_id: int | None = None
-        self.setWindowTitle("할 일 분류 설정")
+        self.setWindowTitle("할 일 폴더 관리")
         self.setSizeGripEnabled(True)
         self.setMinimumSize(QSize(520, 420))
         self.resize(620, 480)
@@ -6144,15 +6666,23 @@ class ItemTypeSettingsDialog(QDialog):
         layout.setContentsMargins(18, 16, 18, 16)
         layout.setSpacing(12)
 
-        heading = QLabel("할 일 분류")
+        heading = QLabel("할 일 폴더")
         heading.setObjectName("sectionTitle")
         layout.addWidget(heading)
 
         body = QHBoxLayout()
+        list_panel = QWidget()
+        list_layout = QVBoxLayout(list_panel)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+        list_layout.setSpacing(6)
+        list_title = QLabel("폴더 목록")
+        list_title.setObjectName("mutedLabel")
+        list_layout.addWidget(list_title)
         self.type_list = QListWidget()
         self.type_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.type_list.currentItemChanged.connect(self.load_selected_type)
-        body.addWidget(self.type_list, 1)
+        list_layout.addWidget(self.type_list, 1)
+        body.addWidget(list_panel, 1)
 
         form_panel = QWidget()
         form_layout = QVBoxLayout(form_panel)
@@ -6163,20 +6693,20 @@ class ItemTypeSettingsDialog(QDialog):
         self.type_name_edit = QLineEdit()
         self.type_name_edit.setPlaceholderText("예: 업무, 개인, 공부")
         _stabilize_control(self.type_name_edit, 220)
-        form.addRow("이름", self.type_name_edit)
+        form.addRow("폴더 이름", self.type_name_edit)
 
-        self.default_check = QCheckBox("기본 종류로 사용")
+        self.default_check = QCheckBox("기본 폴더로 사용")
         form.addRow("", self.default_check)
         form_layout.addLayout(form)
 
-        hint = QLabel("할 일은 시간 없이 대기함에 둘 수도 있고, 날짜와 시간을 지정해 오늘 시간표에 올릴 수도 있습니다.")
+        hint = QLabel("할 일 폴더는 오늘 체크리스트, 대기함, 날짜별 보기에서 같은 묶음으로 사용됩니다. 폴더를 삭제하면 그 안의 할 일은 기본 폴더로 옮겨집니다.")
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
         form_layout.addWidget(hint)
 
         action_row = QHBoxLayout()
-        new_button = QPushButton("새 종류")
-        _stabilize_control(new_button, 84)
+        new_button = QPushButton("새 폴더")
+        _stabilize_control(new_button, 88)
         new_button.clicked.connect(self.clear_form)
         save_button = QPushButton("저장")
         _stabilize_control(save_button, 84)
@@ -6205,8 +6735,9 @@ class ItemTypeSettingsDialog(QDialog):
     def refresh_types(self, selected_type_id: int | None = None) -> None:
         self.type_list.clear()
         selected_row = 0
+        task_counts = self._task_counts_by_type()
         for row_index, item_type in enumerate(self.repository.list_item_types("task")):
-            item = QListWidgetItem(self._item_type_label(item_type))
+            item = QListWidgetItem(self._item_type_label(item_type, task_counts.get(item_type.id or -1, 0)))
             item.setData(Qt.ItemDataRole.UserRole, item_type.id)
             self.type_list.addItem(item)
             if selected_type_id is not None and item_type.id == selected_type_id:
@@ -6239,7 +6770,7 @@ class ItemTypeSettingsDialog(QDialog):
     def save_current_type(self) -> None:
         name = self.type_name_edit.text().strip()
         if not name:
-            QMessageBox.information(self, "할 일 분류 설정", "분류 이름을 입력하세요.")
+            QMessageBox.information(self, "할 일 폴더 관리", "폴더 이름을 입력하세요.")
             return
         if self.selected_type_id is None:
             item_type = ItemType(
@@ -6257,7 +6788,7 @@ class ItemTypeSettingsDialog(QDialog):
         try:
             saved = self.repository.save_item_type(item_type)
         except ValueError as exc:
-            QMessageBox.warning(self, "할 일 분류 설정", str(exc))
+            QMessageBox.warning(self, "할 일 폴더 관리", str(exc))
             return
         self.refresh_types(saved.id)
 
@@ -6268,24 +6799,34 @@ class ItemTypeSettingsDialog(QDialog):
         if item_type is None:
             self.refresh_types()
             return
-        answer = QMessageBox.question(self, "할 일 분류 삭제", f"'{item_type.name}' 분류를 삭제할까요?")
+        answer = QMessageBox.question(self, "할 일 폴더 삭제", f"'{item_type.name}' 폴더를 삭제할까요?")
         if answer != QMessageBox.StandardButton.Yes:
             return
         if not self.repository.delete_item_type(self.selected_type_id):
-            QMessageBox.information(self, "할 일 분류 삭제", "기본 분류는 삭제할 수 없습니다. 이름을 바꾸거나 다른 분류를 기본으로 지정하세요.")
+            QMessageBox.information(self, "할 일 폴더 삭제", "기본 폴더는 삭제할 수 없습니다. 이름을 바꾸거나 다른 폴더를 기본으로 지정하세요.")
             return
         self.refresh_types()
 
-    def _item_type_label(self, item_type: ItemType) -> str:
+    def _task_counts_by_type(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        default_id = self.repository.default_item_type("task").id
+        for task in self.repository.list_tasks(include_completed=True):
+            item_type_id = task.item_type_id or default_id
+            if item_type_id is None:
+                continue
+            counts[item_type_id] = counts.get(item_type_id, 0) + 1
+        return counts
+
+    def _item_type_label(self, item_type: ItemType, task_count: int = 0) -> str:
         default = " · 기본" if item_type.is_default else ""
-        return f"{item_type.name}{default}"
+        return f"{item_type.name} · {task_count}개{default}"
 
 
 class SettingsDialog(QDialog):
     def __init__(self, preferences: Preference, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.resize(500, 500)
+        self.resize(560, 640)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 16, 18, 16)
@@ -6299,6 +6840,11 @@ class SettingsDialog(QDialog):
         self.week_start_combo.setCurrentIndex(max(0, index))
         form.addRow("한 주의 시작", self.week_start_combo)
 
+        self.app_title_edit = QLineEdit()
+        self.app_title_edit.setText(preferences.app_title)
+        self.app_title_edit.setPlaceholderText("예: Focus Desk")
+        form.addRow("화면 제목", self.app_title_edit)
+
         self.time_format_combo = QComboBox()
         self.time_format_combo.addItem("24시간 (13:30)", "24h")
         self.time_format_combo.addItem("12시간 (PM 1:30)", "12h")
@@ -6306,12 +6852,27 @@ class SettingsDialog(QDialog):
         self.time_format_combo.setCurrentIndex(max(0, time_index))
         form.addRow("시간 표시", self.time_format_combo)
 
-        self.show_pomodoro_check = QCheckBox("표시")
-        item_type_button = QPushButton("관리")
-        _stabilize_control(item_type_button, 84)
-        item_type_button.clicked.connect(lambda: self.run_parent_layout_action("show_item_type_settings"))
-        form.addRow("할 일 분류", item_type_button)
+        self.show_datetime_panel_check = QCheckBox("메인 화면에 표시")
+        self.show_datetime_panel_check.setChecked(preferences.show_datetime_panel)
+        form.addRow("날짜/시간 패널", self.show_datetime_panel_check)
 
+        self.main_always_on_top_check = QCheckBox("메인창 항상 위")
+        self.main_always_on_top_check.setChecked(preferences.main_always_on_top)
+        form.addRow("메인창 표시", self.main_always_on_top_check)
+
+        self.show_current_date_check = QCheckBox("날짜 표시")
+        self.show_current_date_check.setChecked(preferences.show_current_date)
+        form.addRow("현재 날짜", self.show_current_date_check)
+
+        self.show_current_time_check = QCheckBox("시간 표시")
+        self.show_current_time_check.setChecked(preferences.show_current_time)
+        form.addRow("현재 시간", self.show_current_time_check)
+
+        self.show_current_seconds_check = QCheckBox("초 표시")
+        self.show_current_seconds_check.setChecked(preferences.show_current_seconds)
+        form.addRow("현재 초", self.show_current_seconds_check)
+
+        self.show_pomodoro_check = QCheckBox("표시")
         self.show_focus_panel_check = QCheckBox("메인 화면에 표시")
         self.show_focus_panel_check.setChecked(preferences.show_focus_panel)
         form.addRow("집중", self.show_focus_panel_check)
@@ -6344,7 +6905,7 @@ class SettingsDialog(QDialog):
         self.show_link_favorites_panel_check.setChecked(preferences.show_link_favorites_panel)
         form.addRow("즐겨찾기", self.show_link_favorites_panel_check)
 
-        self.show_compact_favorites_panel_check = QCheckBox("위젯 모드에 표시")
+        self.show_compact_favorites_panel_check = QCheckBox("통합 위젯에 표시")
         self.show_compact_favorites_panel_check.setChecked(preferences.show_compact_favorites_panel)
         form.addRow("위젯 즐겨찾기", self.show_compact_favorites_panel_check)
 
@@ -6388,8 +6949,14 @@ class SettingsDialog(QDialog):
         self.sync_from_preferences(preferences)
 
     def sync_from_preferences(self, preferences: Preference) -> None:
+        self.app_title_edit.setText(preferences.app_title)
         time_index = self.time_format_combo.findData(preferences.time_format)
         self.time_format_combo.setCurrentIndex(max(0, time_index))
+        self.main_always_on_top_check.setChecked(preferences.main_always_on_top)
+        self.show_datetime_panel_check.setChecked(preferences.show_datetime_panel)
+        self.show_current_date_check.setChecked(preferences.show_current_date)
+        self.show_current_time_check.setChecked(preferences.show_current_time)
+        self.show_current_seconds_check.setChecked(preferences.show_current_seconds)
         self.show_focus_panel_check.setChecked(preferences.show_focus_panel)
         self.show_pomodoro_check.setChecked(preferences.show_pomodoro_controls)
         self.show_today_timeline_inline_check.setChecked(preferences.show_today_timeline_inline)
@@ -6407,7 +6974,13 @@ class SettingsDialog(QDialog):
             break_minutes=self._source.break_minutes,
             strategy=self._source.strategy,
             week_start_day=int(self.week_start_combo.currentData()),
+            app_title=self.app_title_edit.text().strip() or "Focus Desk",
+            main_always_on_top=self.main_always_on_top_check.isChecked(),
             time_format=str(self.time_format_combo.currentData()),
+            show_datetime_panel=self.show_datetime_panel_check.isChecked(),
+            show_current_date=self.show_current_date_check.isChecked(),
+            show_current_time=self.show_current_time_check.isChecked(),
+            show_current_seconds=self.show_current_seconds_check.isChecked(),
             show_focus_panel=self.show_focus_panel_check.isChecked(),
             show_pomodoro_controls=self.show_pomodoro_check.isChecked(),
             show_today_timeline_inline=self.show_today_timeline_inline_check.isChecked(),
@@ -6419,6 +6992,9 @@ class SettingsDialog(QDialog):
             show_link_favorites_panel=self.show_link_favorites_panel_check.isChecked(),
             show_compact_favorites_panel=self.show_compact_favorites_panel_check.isChecked(),
             favorite_display_mode=self._source.favorite_display_mode,
+            last_window_width=self._source.last_window_width,
+            last_window_height=self._source.last_window_height,
+            last_layout_state=self._source.last_layout_state,
             id=self._source.id,
         )
 
@@ -6912,6 +7488,23 @@ def _format_time(value: datetime | time, preferences: Preference | None = None) 
     return f"{meridiem} {hour_12}:{minute:02d}"
 
 
+def _format_clock_time(
+    value: datetime | time,
+    preferences: Preference | None = None,
+    show_seconds: bool = False,
+) -> str:
+    hour = value.hour
+    minute = value.minute
+    second = value.second
+    if not _uses_12_hour_clock(preferences):
+        suffix = f":{second:02d}" if show_seconds else ""
+        return f"{hour:02d}:{minute:02d}{suffix}"
+    meridiem = "AM" if hour < 12 else "PM"
+    hour_12 = hour % 12 or 12
+    suffix = f":{second:02d}" if show_seconds else ""
+    return f"{meridiem} {hour_12}:{minute:02d}{suffix}"
+
+
 def _format_datetime(
     value: datetime,
     preferences: Preference | None = None,
@@ -7098,6 +7691,125 @@ def _favorite_qicon(favorite: LinkFavorite) -> QIcon | None:
     if not path.exists():
         return None
     return QIcon(str(path))
+
+
+class _SiteIconParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.icon_hrefs: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.casefold() != "link":
+            return
+        values = {name.casefold(): (value or "") for name, value in attrs}
+        rel_values = {part.casefold() for part in values.get("rel", "").replace(",", " ").split()}
+        href = values.get("href", "").strip()
+        if href and "icon" in rel_values:
+            self.icon_hrefs.append(href)
+
+
+def _download_site_icon(target: str) -> tuple[str, bytes]:
+    site_url = _favorite_target_site_url(target)
+    if site_url is None:
+        raise ValueError("URL 즐겨찾기에서만 사이트 아이콘을 가져올 수 있습니다.")
+
+    candidates = _site_icon_candidates(site_url)
+    errors: list[Exception] = []
+    for icon_url in candidates:
+        try:
+            data, content_type = _download_binary(icon_url, limit=5 * 1024 * 1024)
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            errors.append(exc)
+            continue
+        if not data:
+            continue
+        return _icon_file_name_from_url(icon_url, content_type), data
+    if errors:
+        raise errors[-1]
+    raise ValueError("사이트에서 사용할 수 있는 아이콘을 찾지 못했습니다.")
+
+
+def _site_icon_candidates(site_url: str) -> list[str]:
+    parsed = urlparse(site_url)
+    root_url = f"{parsed.scheme}://{parsed.netloc}/"
+    candidates: list[str] = []
+    try:
+        html_data, content_type = _download_binary(site_url, limit=1024 * 1024)
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        html_data = b""
+        content_type = ""
+    if html_data and ("html" in content_type.casefold() or site_url.rstrip("/").endswith(parsed.netloc)):
+        parser = _SiteIconParser()
+        parser.feed(html_data.decode(_charset_from_content_type(content_type), errors="ignore"))
+        candidates.extend(urljoin(site_url, href) for href in parser.icon_hrefs)
+    candidates.append(urljoin(root_url, "favicon.ico"))
+
+    unique_candidates: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        normalized = candidate.strip()
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            unique_candidates.append(normalized)
+    return unique_candidates
+
+
+def _download_binary(url: str, limit: int = 1024 * 1024) -> tuple[bytes, str]:
+    request = Request(
+        url,
+        headers={
+            "User-Agent": "ScheduleHelper/1.0",
+            "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
+        },
+    )
+    with urlopen(request, timeout=8) as response:
+        data = response.read(limit + 1)
+        if len(data) > limit:
+            raise ValueError(f"아이콘 파일이 너무 큽니다. 최대 {max(1, limit // (1024 * 1024))}MB까지 사용할 수 있습니다.")
+        content_type = response.headers.get("Content-Type", "")
+    return data, content_type
+
+
+def _favorite_target_site_url(target: str) -> str | None:
+    value = target.strip()
+    if not value:
+        return None
+    lower = value.casefold()
+    if lower.startswith(("http://", "https://")):
+        return value
+    if "://" in value or "\\" in value or value[:2].endswith(":") or " " in value:
+        return None
+    if "." not in value:
+        return None
+    return f"https://{value}"
+
+
+def _icon_file_name_from_url(icon_url: str, content_type: str) -> str:
+    path_name = Path(urlparse(icon_url).path).name
+    if path_name and "." in path_name:
+        return path_name[:120]
+    return f"site-icon{_icon_suffix_from_content_type(content_type)}"
+
+
+def _icon_suffix_from_content_type(content_type: str) -> str:
+    lowered = content_type.casefold()
+    if "png" in lowered:
+        return ".png"
+    if "jpeg" in lowered or "jpg" in lowered:
+        return ".jpg"
+    if "webp" in lowered:
+        return ".webp"
+    if "svg" in lowered:
+        return ".svg"
+    return ".ico"
+
+
+def _charset_from_content_type(content_type: str) -> str:
+    for part in content_type.split(";"):
+        key, separator, value = part.strip().partition("=")
+        if separator and key.casefold() == "charset" and value.strip():
+            return value.strip()
+    return "utf-8"
 
 
 def _normalized_url(target: str) -> str:

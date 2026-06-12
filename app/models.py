@@ -50,7 +50,13 @@ class Preference:
     break_minutes: int = 10
     strategy: str = "deadline_priority"
     week_start_day: int = 0
+    app_title: str = "Focus Desk"
+    main_always_on_top: bool = False
     show_focus_panel: bool = True
+    show_datetime_panel: bool = True
+    show_current_date: bool = True
+    show_current_time: bool = True
+    show_current_seconds: bool = False
     show_pomodoro_controls: bool = True
     show_today_timeline_inline: bool = True
     show_today_timeline_waiting_panel: bool = True
@@ -62,6 +68,9 @@ class Preference:
     show_compact_favorites_panel: bool = False
     favorite_display_mode: str = "text"
     time_format: str = "24h"
+    last_window_width: int = 1280
+    last_window_height: int = 820
+    last_layout_state: str = ""
     id: int = 1
 
 

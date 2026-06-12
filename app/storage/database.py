@@ -78,6 +78,14 @@ def _time_format(value: str) -> str:
     return value if value in {"24h", "12h"} else "24h"
 
 
+def _window_dimension(value: object, default: int, minimum: int, maximum: int) -> int:
+    try:
+        dimension = int(value)
+    except (TypeError, ValueError):
+        return default
+    return min(maximum, max(minimum, dimension))
+
+
 DEFAULT_TASK_ITEM_TYPE_NAME = "할 일"
 DEFAULT_EVENT_ITEM_TYPE_NAME = "일정"
 
@@ -167,7 +175,13 @@ class ScheduleRepository:
                     break_minutes INTEGER NOT NULL,
                     strategy TEXT NOT NULL,
                     week_start_day INTEGER NOT NULL DEFAULT 0,
+                    app_title TEXT NOT NULL DEFAULT 'Focus Desk',
+                    main_always_on_top INTEGER NOT NULL DEFAULT 0,
                     show_focus_panel INTEGER NOT NULL DEFAULT 1,
+                    show_datetime_panel INTEGER NOT NULL DEFAULT 1,
+                    show_current_date INTEGER NOT NULL DEFAULT 1,
+                    show_current_time INTEGER NOT NULL DEFAULT 1,
+                    show_current_seconds INTEGER NOT NULL DEFAULT 0,
                     show_pomodoro_controls INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_inline INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_waiting_panel INTEGER NOT NULL DEFAULT 1,
@@ -178,7 +192,10 @@ class ScheduleRepository:
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
                     show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
                     favorite_display_mode TEXT NOT NULL DEFAULT 'text',
-                    time_format TEXT NOT NULL DEFAULT '24h'
+                    time_format TEXT NOT NULL DEFAULT '24h',
+                    last_window_width INTEGER NOT NULL DEFAULT 1280,
+                    last_window_height INTEGER NOT NULL DEFAULT 820,
+                    last_layout_state TEXT NOT NULL DEFAULT ''
                 );
 
                 CREATE TABLE IF NOT EXISTS layout_profiles (
@@ -316,8 +333,20 @@ class ScheduleRepository:
             preference_columns = {row["name"] for row in connection.execute("PRAGMA table_info(preferences)")}
             if "week_start_day" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN week_start_day INTEGER NOT NULL DEFAULT 0")
+            if "app_title" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN app_title TEXT NOT NULL DEFAULT 'Focus Desk'")
+            if "main_always_on_top" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN main_always_on_top INTEGER NOT NULL DEFAULT 0")
             if "show_focus_panel" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_panel INTEGER NOT NULL DEFAULT 1")
+            if "show_datetime_panel" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_datetime_panel INTEGER NOT NULL DEFAULT 1")
+            if "show_current_date" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_current_date INTEGER NOT NULL DEFAULT 1")
+            if "show_current_time" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_current_time INTEGER NOT NULL DEFAULT 1")
+            if "show_current_seconds" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_current_seconds INTEGER NOT NULL DEFAULT 0")
             if "show_pomodoro_controls" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_pomodoro_controls INTEGER NOT NULL DEFAULT 1"
@@ -360,6 +389,16 @@ class ScheduleRepository:
                 )
             if "time_format" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN time_format TEXT NOT NULL DEFAULT '24h'")
+            if "last_window_width" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN last_window_width INTEGER NOT NULL DEFAULT 1280"
+                )
+            if "last_window_height" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN last_window_height INTEGER NOT NULL DEFAULT 820"
+                )
+            if "last_layout_state" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN last_layout_state TEXT NOT NULL DEFAULT ''")
 
             favorite_columns = {row["name"] for row in connection.execute("PRAGMA table_info(link_favorites)")}
             if "icon_text" not in favorite_columns:
@@ -415,13 +454,15 @@ class ScheduleRepository:
                     """
                     INSERT INTO preferences
                       (id, day_max_minutes, break_minutes, strategy, week_start_day,
+                       app_title, main_always_on_top,
                        show_focus_panel,
+                       show_datetime_panel, show_current_date, show_current_time, show_current_seconds,
                        show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
                        show_today_timeline_waiting_pinned,
                        show_today_checklist_inline,
                        show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
                        show_compact_favorites_panel, favorite_display_mode, time_format)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 1, 1, 1, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
                     """
                 )
 
@@ -821,7 +862,13 @@ class ScheduleRepository:
             break_minutes=int(row["break_minutes"]),
             strategy=str(row["strategy"]),
             week_start_day=int(row["week_start_day"]),
+            app_title=str(row["app_title"]).strip() or "Focus Desk",
+            main_always_on_top=bool(row["main_always_on_top"]),
             show_focus_panel=bool(row["show_focus_panel"]),
+            show_datetime_panel=bool(row["show_datetime_panel"]),
+            show_current_date=bool(row["show_current_date"]),
+            show_current_time=bool(row["show_current_time"]),
+            show_current_seconds=bool(row["show_current_seconds"]),
             show_pomodoro_controls=bool(row["show_pomodoro_controls"]),
             show_today_timeline_inline=bool(row["show_today_timeline_inline"]),
             show_today_timeline_waiting_panel=bool(row["show_today_timeline_waiting_panel"]),
@@ -833,27 +880,42 @@ class ScheduleRepository:
             show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
             favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
             time_format=_time_format(str(row["time_format"])),
+            last_window_width=_window_dimension(row["last_window_width"], 1280, 430, 4000),
+            last_window_height=_window_dimension(row["last_window_height"], 820, 320, 3000),
+            last_layout_state=str(row["last_layout_state"]),
         )
 
     def save_preferences(self, preferences: Preference) -> Preference:
         preferences.week_start_day = 6 if preferences.week_start_day == 6 else 0
         preferences.time_format = _time_format(preferences.time_format)
+        preferences.app_title = preferences.app_title.strip() or "Focus Desk"
+        preferences.last_window_width = _window_dimension(preferences.last_window_width, 1280, 430, 4000)
+        preferences.last_window_height = _window_dimension(preferences.last_window_height, 820, 320, 3000)
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO preferences
                   (id, day_max_minutes, break_minutes, strategy, week_start_day,
-                   show_focus_panel, show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
+                   app_title, main_always_on_top,
+                   show_focus_panel, show_datetime_panel, show_current_date, show_current_time, show_current_seconds,
+                   show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
                    show_today_timeline_waiting_pinned, show_today_checklist_inline,
                    show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                   show_compact_favorites_panel, favorite_display_mode, time_format)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   show_compact_favorites_panel, favorite_display_mode, time_format,
+                   last_window_width, last_window_height, last_layout_state)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
                     strategy = excluded.strategy,
                     week_start_day = excluded.week_start_day,
+                    app_title = excluded.app_title,
+                    main_always_on_top = excluded.main_always_on_top,
                     show_focus_panel = excluded.show_focus_panel,
+                    show_datetime_panel = excluded.show_datetime_panel,
+                    show_current_date = excluded.show_current_date,
+                    show_current_time = excluded.show_current_time,
+                    show_current_seconds = excluded.show_current_seconds,
                     show_pomodoro_controls = excluded.show_pomodoro_controls,
                     show_today_timeline_inline = excluded.show_today_timeline_inline,
                     show_today_timeline_waiting_panel = excluded.show_today_timeline_waiting_panel,
@@ -864,14 +926,23 @@ class ScheduleRepository:
                     show_link_favorites_panel = excluded.show_link_favorites_panel,
                     show_compact_favorites_panel = excluded.show_compact_favorites_panel,
                     favorite_display_mode = excluded.favorite_display_mode,
-                    time_format = excluded.time_format
+                    time_format = excluded.time_format,
+                    last_window_width = excluded.last_window_width,
+                    last_window_height = excluded.last_window_height,
+                    last_layout_state = excluded.last_layout_state
                 """,
                 (
                     preferences.day_max_minutes,
                     preferences.break_minutes,
                     preferences.strategy,
                     preferences.week_start_day,
+                    preferences.app_title,
+                    int(preferences.main_always_on_top),
                     int(preferences.show_focus_panel),
+                    int(preferences.show_datetime_panel),
+                    int(preferences.show_current_date),
+                    int(preferences.show_current_time),
+                    int(preferences.show_current_seconds),
                     int(preferences.show_pomodoro_controls),
                     int(preferences.show_today_timeline_inline),
                     int(preferences.show_today_timeline_waiting_panel),
@@ -883,6 +954,9 @@ class ScheduleRepository:
                     int(preferences.show_compact_favorites_panel),
                     _favorite_display_mode(preferences.favorite_display_mode),
                     _time_format(preferences.time_format),
+                    preferences.last_window_width,
+                    preferences.last_window_height,
+                    preferences.last_layout_state,
                 ),
             )
         return preferences
@@ -1569,6 +1643,21 @@ class ScheduleRepository:
         suffix = source.suffix[:20]
         target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
         shutil.copy2(source, target)
+        return str(target)
+
+    def save_link_favorite_icon_bytes(self, favorite_id: int, file_name: str, data: bytes) -> str:
+        if self.get_link_favorite(favorite_id) is None:
+            raise ValueError("Link favorite does not exist")
+        if not data:
+            raise ValueError("Icon data is empty")
+
+        directory = self.db_path.parent / "favorite_icons" / str(favorite_id)
+        directory.mkdir(parents=True, exist_ok=True)
+        source_name = Path(file_name or "site-icon.ico")
+        safe_stem = _safe_file_stem(source_name.stem)
+        suffix = source_name.suffix[:20] or ".ico"
+        target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
+        target.write_bytes(data)
         return str(target)
 
     def list_link_favorites(self) -> list[LinkFavorite]:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime, time
+from pathlib import Path
 
 from app.models import (
     AppUsageSession,
@@ -182,7 +183,13 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences = repository.get_preferences()
     preferences.break_minutes = 20
     preferences.week_start_day = 6
+    preferences.app_title = "My Desk"
+    preferences.main_always_on_top = True
     preferences.show_focus_panel = False
+    preferences.show_datetime_panel = False
+    preferences.show_current_date = False
+    preferences.show_current_time = True
+    preferences.show_current_seconds = True
     preferences.show_pomodoro_controls = False
     preferences.show_today_timeline_inline = True
     preferences.show_today_timeline_waiting_panel = False
@@ -194,12 +201,21 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_compact_favorites_panel = True
     preferences.favorite_display_mode = "icon_only"
     preferences.time_format = "12h"
+    preferences.last_window_width = 1440
+    preferences.last_window_height = 900
+    preferences.last_layout_state = '{"splitters":{"body":[300,700]}}'
     repository.save_preferences(preferences)
 
     reloaded_preferences = repository.get_preferences()
     assert reloaded_preferences.break_minutes == 20
     assert reloaded_preferences.week_start_day == 6
+    assert reloaded_preferences.app_title == "My Desk"
+    assert reloaded_preferences.main_always_on_top
     assert not reloaded_preferences.show_focus_panel
+    assert not reloaded_preferences.show_datetime_panel
+    assert not reloaded_preferences.show_current_date
+    assert reloaded_preferences.show_current_time
+    assert reloaded_preferences.show_current_seconds
     assert not reloaded_preferences.show_pomodoro_controls
     assert reloaded_preferences.show_today_timeline_inline
     assert not reloaded_preferences.show_today_timeline_waiting_panel
@@ -211,6 +227,9 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.show_compact_favorites_panel
     assert reloaded_preferences.favorite_display_mode == "icon_only"
     assert reloaded_preferences.time_format == "12h"
+    assert reloaded_preferences.last_window_width == 1440
+    assert reloaded_preferences.last_window_height == 900
+    assert reloaded_preferences.last_layout_state == '{"splitters":{"body":[300,700]}}'
 
 
 def test_repository_saves_named_layout_profiles(tmp_path) -> None:
@@ -469,6 +488,12 @@ def test_repository_manages_link_favorites(tmp_path) -> None:
     assert reloaded.target == "C:\\Tools\\editor.exe"
     assert reloaded.icon_path
     assert (tmp_path / "favorite_icons" / str(favorite.id)).exists()
+
+    favorite.icon_path = repository.save_link_favorite_icon_bytes(favorite.id, "site-icon.png", b"site icon")
+    repository.save_link_favorite(favorite)
+    site_icon_path = tmp_path / "favorite_icons" / str(favorite.id)
+    assert Path(favorite.icon_path).read_bytes() == b"site icon"
+    assert any(path.name.endswith("_site-icon.png") for path in site_icon_path.iterdir())
 
     repository.delete_link_favorite(favorite.id)
 
