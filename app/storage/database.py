@@ -78,12 +78,55 @@ def _time_format(value: str) -> str:
     return value if value in {"24h", "12h"} else "24h"
 
 
+def _appearance_theme(value: str) -> str:
+    return value if value in {"light", "dark"} else "light"
+
+
+def _focus_rate_display(value: str) -> str:
+    return value if value in {"ring", "bar"} else "ring"
+
+
+def _header_banner_position(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"left", "center", "right"}:
+        return normalized
+    if normalized in {"top", "bottom"}:
+        return "center"
+    return "center"
+
+
+def _accent_color(value: object) -> str:
+    color = str(value or "").strip()
+    if len(color) == 7 and color.startswith("#") and all(
+        character in "0123456789abcdefABCDEF" for character in color[1:]
+    ):
+        return color.lower()
+    return "#4f8c6b"
+
+
+def _optional_color(value: object) -> str:
+    color = str(value or "").strip()
+    if len(color) == 7 and color.startswith("#") and all(
+        character in "0123456789abcdefABCDEF" for character in color[1:]
+    ):
+        return color.lower()
+    return ""
+
+
 def _window_dimension(value: object, default: int, minimum: int, maximum: int) -> int:
     try:
         dimension = int(value)
     except (TypeError, ValueError):
         return default
     return min(maximum, max(minimum, dimension))
+
+
+def _header_banner_height(value: object) -> int:
+    return _window_dimension(value, 132, 72, 360)
+
+
+def _header_banner_span(value: object) -> int:
+    return _window_dimension(value, 1, 1, 3)
 
 
 DEFAULT_TASK_ITEM_TYPE_NAME = "할 일"
@@ -190,9 +233,25 @@ class ScheduleRepository:
                     show_today_flow_panel INTEGER NOT NULL DEFAULT 0,
                     show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
+                    show_media_panel INTEGER NOT NULL DEFAULT 1,
+                    media_panel_file_path TEXT NOT NULL DEFAULT '',
                     show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
                     favorite_display_mode TEXT NOT NULL DEFAULT 'text',
                     time_format TEXT NOT NULL DEFAULT '24h',
+                    appearance_theme TEXT NOT NULL DEFAULT 'light',
+                    accent_color TEXT NOT NULL DEFAULT '#4f8c6b',
+                    button_color TEXT NOT NULL DEFAULT '#4f8c6b',
+                    background_color TEXT NOT NULL DEFAULT '',
+                    inner_background_color TEXT NOT NULL DEFAULT '',
+                    panel_color TEXT NOT NULL DEFAULT '',
+                    table_color TEXT NOT NULL DEFAULT '',
+                    text_color TEXT NOT NULL DEFAULT '',
+                    show_header_banner INTEGER NOT NULL DEFAULT 0,
+                    header_banner_image_path TEXT NOT NULL DEFAULT '',
+                    header_banner_height INTEGER NOT NULL DEFAULT 132,
+                    header_banner_position TEXT NOT NULL DEFAULT 'center',
+                    header_banner_span INTEGER NOT NULL DEFAULT 1,
+                    focus_rate_display TEXT NOT NULL DEFAULT 'ring',
                     last_window_width INTEGER NOT NULL DEFAULT 1280,
                     last_window_height INTEGER NOT NULL DEFAULT 820,
                     last_layout_state TEXT NOT NULL DEFAULT ''
@@ -379,6 +438,10 @@ class ScheduleRepository:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_link_favorites_panel INTEGER NOT NULL DEFAULT 1"
                 )
+            if "show_media_panel" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_media_panel INTEGER NOT NULL DEFAULT 1")
+            if "media_panel_file_path" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN media_panel_file_path TEXT NOT NULL DEFAULT ''")
             if "show_compact_favorites_panel" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0"
@@ -389,6 +452,40 @@ class ScheduleRepository:
                 )
             if "time_format" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN time_format TEXT NOT NULL DEFAULT '24h'")
+            needs_palette_migration = "appearance_theme" not in preference_columns
+            if needs_palette_migration:
+                connection.execute("ALTER TABLE preferences ADD COLUMN appearance_theme TEXT NOT NULL DEFAULT 'light'")
+            if "accent_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN accent_color TEXT NOT NULL DEFAULT '#4f8c6b'")
+            elif needs_palette_migration:
+                connection.execute(
+                    "UPDATE preferences SET accent_color = '#4f8c6b' WHERE lower(accent_color) = '#5a5ad6'"
+                )
+            if "button_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN button_color TEXT NOT NULL DEFAULT '#4f8c6b'")
+                connection.execute("UPDATE preferences SET button_color = accent_color")
+            if "focus_rate_display" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN focus_rate_display TEXT NOT NULL DEFAULT 'ring'")
+            if "background_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN background_color TEXT NOT NULL DEFAULT ''")
+            if "inner_background_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN inner_background_color TEXT NOT NULL DEFAULT ''")
+            if "panel_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN panel_color TEXT NOT NULL DEFAULT ''")
+            if "table_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN table_color TEXT NOT NULL DEFAULT ''")
+            if "text_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN text_color TEXT NOT NULL DEFAULT ''")
+            if "show_header_banner" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_header_banner INTEGER NOT NULL DEFAULT 0")
+            if "header_banner_image_path" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_image_path TEXT NOT NULL DEFAULT ''")
+            if "header_banner_height" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_height INTEGER NOT NULL DEFAULT 132")
+            if "header_banner_position" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_position TEXT NOT NULL DEFAULT 'center'")
+            if "header_banner_span" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_span INTEGER NOT NULL DEFAULT 1")
             if "last_window_width" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN last_window_width INTEGER NOT NULL DEFAULT 1280"
@@ -461,8 +558,13 @@ class ScheduleRepository:
                        show_today_timeline_waiting_pinned,
                        show_today_checklist_inline,
                        show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                       show_compact_favorites_panel, favorite_display_mode, time_format)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 0, 'text', '24h')
+                       show_media_panel, media_panel_file_path,
+                       show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color, button_color,
+                       background_color, inner_background_color, panel_color, table_color, text_color,
+                       show_header_banner, header_banner_image_path,
+                       header_banner_height, header_banner_position, header_banner_span,
+                       focus_rate_display)
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', 0, '', 132, 'center', 1, 'ring')
                     """
                 )
 
@@ -877,9 +979,25 @@ class ScheduleRepository:
             show_today_flow_panel=bool(row["show_today_flow_panel"]),
             show_quick_memo_panel=bool(row["show_quick_memo_panel"]),
             show_link_favorites_panel=bool(row["show_link_favorites_panel"]),
+            show_media_panel=bool(row["show_media_panel"]),
+            media_panel_file_path=str(row["media_panel_file_path"] or "").strip(),
             show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
             favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
             time_format=_time_format(str(row["time_format"])),
+            appearance_theme=_appearance_theme(str(row["appearance_theme"])),
+            accent_color=_accent_color(row["accent_color"]),
+            button_color=_accent_color(row["button_color"]),
+            background_color=_optional_color(row["background_color"]),
+            inner_background_color=_optional_color(row["inner_background_color"]),
+            panel_color=_optional_color(row["panel_color"]),
+            table_color=_optional_color(row["table_color"]),
+            text_color=_optional_color(row["text_color"]),
+            show_header_banner=bool(row["show_header_banner"]),
+            header_banner_image_path=str(row["header_banner_image_path"] or "").strip(),
+            header_banner_height=_header_banner_height(row["header_banner_height"]),
+            header_banner_position=_header_banner_position(str(row["header_banner_position"])),
+            header_banner_span=_header_banner_span(row["header_banner_span"]),
+            focus_rate_display=_focus_rate_display(str(row["focus_rate_display"])),
             last_window_width=_window_dimension(row["last_window_width"], 1280, 430, 4000),
             last_window_height=_window_dimension(row["last_window_height"], 820, 320, 3000),
             last_layout_state=str(row["last_layout_state"]),
@@ -888,6 +1006,20 @@ class ScheduleRepository:
     def save_preferences(self, preferences: Preference) -> Preference:
         preferences.week_start_day = 6 if preferences.week_start_day == 6 else 0
         preferences.time_format = _time_format(preferences.time_format)
+        preferences.appearance_theme = _appearance_theme(preferences.appearance_theme)
+        preferences.accent_color = _accent_color(preferences.accent_color)
+        preferences.button_color = _accent_color(preferences.button_color)
+        preferences.background_color = _optional_color(preferences.background_color)
+        preferences.inner_background_color = _optional_color(preferences.inner_background_color)
+        preferences.panel_color = _optional_color(preferences.panel_color)
+        preferences.table_color = _optional_color(preferences.table_color)
+        preferences.text_color = _optional_color(preferences.text_color)
+        preferences.media_panel_file_path = preferences.media_panel_file_path.strip()
+        preferences.header_banner_image_path = preferences.header_banner_image_path.strip()
+        preferences.header_banner_height = _header_banner_height(preferences.header_banner_height)
+        preferences.header_banner_position = _header_banner_position(preferences.header_banner_position)
+        preferences.header_banner_span = _header_banner_span(preferences.header_banner_span)
+        preferences.focus_rate_display = _focus_rate_display(preferences.focus_rate_display)
         preferences.app_title = preferences.app_title.strip() or "Focus Desk"
         preferences.last_window_width = _window_dimension(preferences.last_window_width, 1280, 430, 4000)
         preferences.last_window_height = _window_dimension(preferences.last_window_height, 820, 320, 3000)
@@ -901,9 +1033,13 @@ class ScheduleRepository:
                    show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
                    show_today_timeline_waiting_pinned, show_today_checklist_inline,
                    show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                   show_compact_favorites_panel, favorite_display_mode, time_format,
+                   show_media_panel, media_panel_file_path,
+                   show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color,
+                   button_color, background_color, inner_background_color, panel_color, table_color, text_color,
+                   show_header_banner, header_banner_image_path, header_banner_height, header_banner_position, header_banner_span,
+                   focus_rate_display,
                    last_window_width, last_window_height, last_layout_state)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -924,9 +1060,25 @@ class ScheduleRepository:
                     show_today_flow_panel = excluded.show_today_flow_panel,
                     show_quick_memo_panel = excluded.show_quick_memo_panel,
                     show_link_favorites_panel = excluded.show_link_favorites_panel,
+                    show_media_panel = excluded.show_media_panel,
+                    media_panel_file_path = excluded.media_panel_file_path,
                     show_compact_favorites_panel = excluded.show_compact_favorites_panel,
                     favorite_display_mode = excluded.favorite_display_mode,
                     time_format = excluded.time_format,
+                    appearance_theme = excluded.appearance_theme,
+                    accent_color = excluded.accent_color,
+                    button_color = excluded.button_color,
+                    background_color = excluded.background_color,
+                    inner_background_color = excluded.inner_background_color,
+                    panel_color = excluded.panel_color,
+                    table_color = excluded.table_color,
+                    text_color = excluded.text_color,
+                    show_header_banner = excluded.show_header_banner,
+                    header_banner_image_path = excluded.header_banner_image_path,
+                    header_banner_height = excluded.header_banner_height,
+                    header_banner_position = excluded.header_banner_position,
+                    header_banner_span = excluded.header_banner_span,
+                    focus_rate_display = excluded.focus_rate_display,
                     last_window_width = excluded.last_window_width,
                     last_window_height = excluded.last_window_height,
                     last_layout_state = excluded.last_layout_state
@@ -951,9 +1103,25 @@ class ScheduleRepository:
                     int(preferences.show_today_flow_panel),
                     int(preferences.show_quick_memo_panel),
                     int(preferences.show_link_favorites_panel),
+                    int(preferences.show_media_panel),
+                    preferences.media_panel_file_path,
                     int(preferences.show_compact_favorites_panel),
                     _favorite_display_mode(preferences.favorite_display_mode),
                     _time_format(preferences.time_format),
+                    _appearance_theme(preferences.appearance_theme),
+                    preferences.accent_color,
+                    preferences.button_color,
+                    preferences.background_color,
+                    preferences.inner_background_color,
+                    preferences.panel_color,
+                    preferences.table_color,
+                    preferences.text_color,
+                    int(preferences.show_header_banner),
+                    preferences.header_banner_image_path,
+                    preferences.header_banner_height,
+                    _header_banner_position(preferences.header_banner_position),
+                    preferences.header_banner_span,
+                    _focus_rate_display(preferences.focus_rate_display),
                     preferences.last_window_width,
                     preferences.last_window_height,
                     preferences.last_layout_state,

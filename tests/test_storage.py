@@ -198,9 +198,25 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_today_flow_panel = False
     preferences.show_quick_memo_panel = False
     preferences.show_link_favorites_panel = False
+    preferences.show_media_panel = False
+    preferences.media_panel_file_path = "C:/Images/reference.gif"
     preferences.show_compact_favorites_panel = True
     preferences.favorite_display_mode = "icon_only"
     preferences.time_format = "12h"
+    preferences.appearance_theme = "dark"
+    preferences.accent_color = "#ff3366"
+    preferences.button_color = "#33aa77"
+    preferences.background_color = "#112233"
+    preferences.inner_background_color = "#223344"
+    preferences.panel_color = "#334455"
+    preferences.table_color = "#445566"
+    preferences.text_color = "#f8f9fa"
+    preferences.show_header_banner = True
+    preferences.header_banner_image_path = "C:/Images/banner.png"
+    preferences.header_banner_height = 220
+    preferences.header_banner_position = "right"
+    preferences.header_banner_span = 3
+    preferences.focus_rate_display = "bar"
     preferences.last_window_width = 1440
     preferences.last_window_height = 900
     preferences.last_layout_state = '{"splitters":{"body":[300,700]}}'
@@ -224,9 +240,25 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert not reloaded_preferences.show_today_flow_panel
     assert not reloaded_preferences.show_quick_memo_panel
     assert not reloaded_preferences.show_link_favorites_panel
+    assert not reloaded_preferences.show_media_panel
+    assert reloaded_preferences.media_panel_file_path == "C:/Images/reference.gif"
     assert reloaded_preferences.show_compact_favorites_panel
     assert reloaded_preferences.favorite_display_mode == "icon_only"
     assert reloaded_preferences.time_format == "12h"
+    assert reloaded_preferences.appearance_theme == "dark"
+    assert reloaded_preferences.accent_color == "#ff3366"
+    assert reloaded_preferences.button_color == "#33aa77"
+    assert reloaded_preferences.background_color == "#112233"
+    assert reloaded_preferences.inner_background_color == "#223344"
+    assert reloaded_preferences.panel_color == "#334455"
+    assert reloaded_preferences.table_color == "#445566"
+    assert reloaded_preferences.text_color == "#f8f9fa"
+    assert reloaded_preferences.show_header_banner
+    assert reloaded_preferences.header_banner_image_path == "C:/Images/banner.png"
+    assert reloaded_preferences.header_banner_height == 220
+    assert reloaded_preferences.header_banner_position == "right"
+    assert reloaded_preferences.header_banner_span == 3
+    assert reloaded_preferences.focus_rate_display == "bar"
     assert reloaded_preferences.last_window_width == 1440
     assert reloaded_preferences.last_window_height == 900
     assert reloaded_preferences.last_layout_state == '{"splitters":{"body":[300,700]}}'
