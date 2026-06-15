@@ -191,22 +191,12 @@ class FocusTimerService:
         else:
             segment_type = self._current_segment_type()
             if segment_type == "focused":
-                remaining = self.session.remaining_seconds
-                added = min(delta, remaining)
-                self.session.focused_seconds += added
-                if added < delta:
-                    now = self.last_tick_at + timedelta(seconds=added)
-                    self._switch_segment("focused", self.last_tick_at)
-                    self.last_tick_at = now
-                    self.repository.save_focus_session(self.session)
-                    return self._finish(now, "completed")
+                self.session.focused_seconds += delta
             else:
                 self.session.away_seconds += delta
             self._switch_segment(segment_type, self.last_tick_at)
 
         self.last_tick_at = now
-        if self.session.focused_seconds >= self.session.planned_seconds:
-            return self._finish(now, "completed")
         return self.repository.save_focus_session(self.session)
 
     def focus_ratio(self) -> float:

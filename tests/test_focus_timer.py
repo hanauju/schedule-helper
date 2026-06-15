@@ -114,3 +114,18 @@ def test_focus_timer_tracks_break_time_as_break_event(tmp_path) -> None:
     assert saved.focused_seconds == 10
     assert saved.paused_seconds == 30
     assert any(event.event_type == "break" and event.duration_seconds == 30 for event in events)
+
+
+def test_focus_timer_keeps_counting_after_planned_time(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    service = FocusTimerService(repository)
+    start = datetime(2026, 6, 8, 12, 0, 0)
+
+    session = service.start("Deep work", 60, now=start)
+    service.tick(start + timedelta(seconds=90))
+
+    saved = repository.get_focus_session(session.id)
+    assert saved is not None
+    assert saved.status == "running"
+    assert saved.focused_seconds == 90
+    assert saved.remaining_seconds == 0

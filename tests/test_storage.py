@@ -145,6 +145,12 @@ def test_repository_tracks_completed_tasks(tmp_path) -> None:
     assert repository.list_completed_tasks() == []
     assert repository.get_task(task.id).completed_at is None
 
+    completed_at = datetime(2026, 6, 10, 8, 45)
+    repository.update_task_completed_at(task.id, completed_at)
+    updated = repository.get_task(task.id)
+    assert updated.completed
+    assert updated.completed_at == completed_at
+
 
 def test_repository_tracks_completed_events(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -170,6 +176,12 @@ def test_repository_tracks_completed_events(tmp_path) -> None:
     assert repository.list_completed_events() == []
     assert len(repository.list_events()) == 1
     assert repository.get_event(event.id).completed_at is None
+
+    completed_at = datetime(2026, 6, 11, 19, 30)
+    repository.update_event_completed_at(event.id, completed_at)
+    updated = repository.get_event(event.id)
+    assert updated.completed
+    assert updated.completed_at == completed_at
 
 
 def test_repository_manages_availability_and_preferences(tmp_path) -> None:
@@ -211,6 +223,8 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.panel_color = "#334455"
     preferences.table_color = "#445566"
     preferences.text_color = "#f8f9fa"
+    preferences.main_font_family = "Arial"
+    preferences.main_font_size = 16
     preferences.show_header_banner = True
     preferences.header_banner_image_path = "C:/Images/banner.png"
     preferences.header_banner_height = 220
@@ -253,6 +267,8 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.panel_color == "#334455"
     assert reloaded_preferences.table_color == "#445566"
     assert reloaded_preferences.text_color == "#f8f9fa"
+    assert reloaded_preferences.main_font_family == "Arial"
+    assert reloaded_preferences.main_font_size == 16
     assert reloaded_preferences.show_header_banner
     assert reloaded_preferences.header_banner_image_path == "C:/Images/banner.png"
     assert reloaded_preferences.header_banner_height == 220
@@ -521,6 +537,12 @@ def test_repository_manages_link_favorites(tmp_path) -> None:
     assert reloaded.icon_path
     assert (tmp_path / "favorite_icons" / str(favorite.id)).exists()
 
+    second = repository.save_link_favorite(LinkFavorite(title="Second", target="https://second.example"))
+    third = repository.save_link_favorite(LinkFavorite(title="Third", target="https://third.example"))
+    assert [item.title for item in repository.list_link_favorites()] == ["Reference", "Second", "Third"]
+    repository.reorder_link_favorites([int(third.id), int(favorite.id), int(second.id)])
+    assert [item.title for item in repository.list_link_favorites()] == ["Third", "Reference", "Second"]
+
     favorite.icon_path = repository.save_link_favorite_icon_bytes(favorite.id, "site-icon.png", b"site icon")
     repository.save_link_favorite(favorite)
     site_icon_path = tmp_path / "favorite_icons" / str(favorite.id)
@@ -528,5 +550,7 @@ def test_repository_manages_link_favorites(tmp_path) -> None:
     assert any(path.name.endswith("_site-icon.png") for path in site_icon_path.iterdir())
 
     repository.delete_link_favorite(favorite.id)
+    repository.delete_link_favorite(second.id)
+    repository.delete_link_favorite(third.id)
 
     assert repository.list_link_favorites() == []

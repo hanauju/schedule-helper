@@ -121,6 +121,10 @@ def _window_dimension(value: object, default: int, minimum: int, maximum: int) -
     return min(maximum, max(minimum, dimension))
 
 
+def _main_font_size(value: object) -> int:
+    return _window_dimension(value, 13, 10, 22)
+
+
 def _header_banner_height(value: object) -> int:
     return _window_dimension(value, 132, 72, 360)
 
@@ -246,6 +250,8 @@ class ScheduleRepository:
                     panel_color TEXT NOT NULL DEFAULT '',
                     table_color TEXT NOT NULL DEFAULT '',
                     text_color TEXT NOT NULL DEFAULT '',
+                    main_font_family TEXT NOT NULL DEFAULT '',
+                    main_font_size INTEGER NOT NULL DEFAULT 13,
                     show_header_banner INTEGER NOT NULL DEFAULT 0,
                     header_banner_image_path TEXT NOT NULL DEFAULT '',
                     header_banner_height INTEGER NOT NULL DEFAULT 132,
@@ -344,6 +350,7 @@ class ScheduleRepository:
                     target TEXT NOT NULL,
                     icon_text TEXT NOT NULL DEFAULT '',
                     icon_path TEXT NOT NULL DEFAULT '',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL
                 );
 
@@ -476,6 +483,10 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN table_color TEXT NOT NULL DEFAULT ''")
             if "text_color" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN text_color TEXT NOT NULL DEFAULT ''")
+            if "main_font_family" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN main_font_family TEXT NOT NULL DEFAULT ''")
+            if "main_font_size" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN main_font_size INTEGER NOT NULL DEFAULT 13")
             if "show_header_banner" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_header_banner INTEGER NOT NULL DEFAULT 0")
             if "header_banner_image_path" not in preference_columns:
@@ -502,6 +513,9 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE link_favorites ADD COLUMN icon_text TEXT NOT NULL DEFAULT ''")
             if "icon_path" not in favorite_columns:
                 connection.execute("ALTER TABLE link_favorites ADD COLUMN icon_path TEXT NOT NULL DEFAULT ''")
+            if "sort_order" not in favorite_columns:
+                connection.execute("ALTER TABLE link_favorites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+                connection.execute("UPDATE link_favorites SET sort_order = id WHERE sort_order = 0")
 
             quick_note_columns = {row["name"] for row in connection.execute("PRAGMA table_info(quick_notes)")}
             if "content_html" not in quick_note_columns:
@@ -561,10 +575,11 @@ class ScheduleRepository:
                        show_media_panel, media_panel_file_path,
                        show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color, button_color,
                        background_color, inner_background_color, panel_color, table_color, text_color,
+                       main_font_family, main_font_size,
                        show_header_banner, header_banner_image_path,
                        header_banner_height, header_banner_position, header_banner_span,
                        focus_rate_display)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', 0, '', 132, 'center', 1, 'ring')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 0, '', 132, 'center', 1, 'ring')
                     """
                 )
 
@@ -790,6 +805,13 @@ class ScheduleRepository:
                 (int(completed), completed_at, task_id),
             )
 
+    def update_task_completed_at(self, task_id: int, completed_at: datetime) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE tasks SET completed = 1, completed_at = ? WHERE id = ?",
+                (_dt_exact(completed_at), task_id),
+            )
+
     def save_event(self, event: Event) -> Event:
         if event.completed and event.completed_at is None:
             event.completed_at = datetime.now()
@@ -902,6 +924,13 @@ class ScheduleRepository:
                 (int(completed), completed_at, event_id),
             )
 
+    def update_event_completed_at(self, event_id: int, completed_at: datetime) -> None:
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE events SET completed = 1, completed_at = ? WHERE id = ?",
+                (_dt_exact(completed_at), event_id),
+            )
+
     def delete_generated_events_between(self, start_at: datetime, end_at: datetime) -> None:
         with self.connect() as connection:
             connection.execute(
@@ -992,6 +1021,8 @@ class ScheduleRepository:
             panel_color=_optional_color(row["panel_color"]),
             table_color=_optional_color(row["table_color"]),
             text_color=_optional_color(row["text_color"]),
+            main_font_family=str(row["main_font_family"] or "").strip(),
+            main_font_size=_main_font_size(row["main_font_size"]),
             show_header_banner=bool(row["show_header_banner"]),
             header_banner_image_path=str(row["header_banner_image_path"] or "").strip(),
             header_banner_height=_header_banner_height(row["header_banner_height"]),
@@ -1014,6 +1045,8 @@ class ScheduleRepository:
         preferences.panel_color = _optional_color(preferences.panel_color)
         preferences.table_color = _optional_color(preferences.table_color)
         preferences.text_color = _optional_color(preferences.text_color)
+        preferences.main_font_family = preferences.main_font_family.strip()
+        preferences.main_font_size = _main_font_size(preferences.main_font_size)
         preferences.media_panel_file_path = preferences.media_panel_file_path.strip()
         preferences.header_banner_image_path = preferences.header_banner_image_path.strip()
         preferences.header_banner_height = _header_banner_height(preferences.header_banner_height)
@@ -1036,10 +1069,11 @@ class ScheduleRepository:
                    show_media_panel, media_panel_file_path,
                    show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color,
                    button_color, background_color, inner_background_color, panel_color, table_color, text_color,
+                   main_font_family, main_font_size,
                    show_header_banner, header_banner_image_path, header_banner_height, header_banner_position, header_banner_span,
                    focus_rate_display,
                    last_window_width, last_window_height, last_layout_state)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -1073,6 +1107,8 @@ class ScheduleRepository:
                     panel_color = excluded.panel_color,
                     table_color = excluded.table_color,
                     text_color = excluded.text_color,
+                    main_font_family = excluded.main_font_family,
+                    main_font_size = excluded.main_font_size,
                     show_header_banner = excluded.show_header_banner,
                     header_banner_image_path = excluded.header_banner_image_path,
                     header_banner_height = excluded.header_banner_height,
@@ -1116,6 +1152,8 @@ class ScheduleRepository:
                     preferences.panel_color,
                     preferences.table_color,
                     preferences.text_color,
+                    preferences.main_font_family,
+                    preferences.main_font_size,
                     int(preferences.show_header_banner),
                     preferences.header_banner_image_path,
                     preferences.header_banner_height,
@@ -1771,14 +1809,18 @@ class ScheduleRepository:
 
         with self.connect() as connection:
             if favorite.id is None:
+                sort_order = int(
+                    connection.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM link_favorites").fetchone()[0]
+                )
                 cursor = connection.execute(
                     """
-                    INSERT INTO link_favorites (title, target, icon_text, icon_path, created_at)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT INTO link_favorites (title, target, icon_text, icon_path, sort_order, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (title, target, icon_text, icon_path, _dt_exact(favorite.created_at)),
+                    (title, target, icon_text, icon_path, sort_order, _dt_exact(favorite.created_at)),
                 )
                 favorite.id = int(cursor.lastrowid)
+                favorite.sort_order = sort_order
             else:
                 connection.execute(
                     """
@@ -1786,10 +1828,11 @@ class ScheduleRepository:
                     SET title = ?,
                         target = ?,
                         icon_text = ?,
-                        icon_path = ?
+                        icon_path = ?,
+                        sort_order = ?
                     WHERE id = ?
                     """,
-                    (title, target, icon_text, icon_path, favorite.id),
+                    (title, target, icon_text, icon_path, int(favorite.sort_order), favorite.id),
                 )
         favorite.title = title
         favorite.target = target
@@ -1833,10 +1876,25 @@ class ScheduleRepository:
             rows = connection.execute(
                 """
                 SELECT * FROM link_favorites
-                ORDER BY title COLLATE NOCASE ASC, id ASC
+                ORDER BY sort_order ASC, id ASC
                 """
             ).fetchall()
         return [self._link_favorite_from_row(row) for row in rows]
+
+    def reorder_link_favorites(self, ordered_ids: list[int]) -> None:
+        normalized_ids = [int(favorite_id) for favorite_id in ordered_ids]
+        if not normalized_ids:
+            return
+        with self.connect() as connection:
+            existing_rows = connection.execute("SELECT id FROM link_favorites ORDER BY sort_order ASC, id ASC").fetchall()
+            existing_ids = [int(row["id"]) for row in existing_rows]
+            ordered_existing_ids = [favorite_id for favorite_id in normalized_ids if favorite_id in existing_ids]
+            ordered_existing_ids.extend(favorite_id for favorite_id in existing_ids if favorite_id not in ordered_existing_ids)
+            for sort_order, favorite_id in enumerate(ordered_existing_ids, start=1):
+                connection.execute(
+                    "UPDATE link_favorites SET sort_order = ? WHERE id = ?",
+                    (sort_order, favorite_id),
+                )
 
     def get_link_favorite(self, favorite_id: int) -> LinkFavorite | None:
         with self.connect() as connection:
@@ -2089,6 +2147,7 @@ class ScheduleRepository:
             target=str(row["target"]),
             icon_text=str(row["icon_text"]),
             icon_path=str(row["icon_path"]),
+            sort_order=int(row["sort_order"]) if "sort_order" in row.keys() else int(row["id"]),
             created_at=created_at,
         )
 

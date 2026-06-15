@@ -78,6 +78,8 @@ class Preference:
     panel_color: str = ""
     table_color: str = ""
     text_color: str = ""
+    main_font_family: str = ""
+    main_font_size: int = 13
     show_header_banner: bool = False
     header_banner_image_path: str = ""
     header_banner_height: int = 132
@@ -212,5 +214,6 @@ class LinkFavorite:
     target: str
     icon_text: str = ""
     icon_path: str = ""
+    sort_order: int = 0
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None

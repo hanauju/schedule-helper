@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import webbrowser
 from html.parser import HTMLParser
 from collections.abc import Callable
@@ -16,6 +17,7 @@ from PySide6.QtGui import (
     QColor,
     QCursor,
     QDrag,
+    QFont,
     QGuiApplication,
     QIcon,
     QKeySequence,
@@ -34,6 +36,7 @@ from PySide6.QtWidgets import (
     QAbstractSpinBox,
     QApplication,
     QBoxLayout,
+    QButtonGroup,
     QCalendarWidget,
     QCheckBox,
     QComboBox,
@@ -56,6 +59,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QDateEdit,
     QScrollArea,
     QSizePolicy,
     QSplitter,
@@ -81,11 +85,239 @@ from app.storage.database import ScheduleRepository
 FEATURE_MIME_TYPE = "application/x-schedule-helper-feature"
 NOTE_IDS_MIME_TYPE = "application/x-schedule-helper-note-ids"
 FEATURE_ROW_MAX_COLUMNS = 6
-DASHBOARD_GRID_COLUMNS = 6
-DASHBOARD_GRID_ROW_HEIGHT = 58
-DASHBOARD_GRID_GAP = 16
+DASHBOARD_LEGACY_GRID_COLUMNS = 6
+DASHBOARD_LEGACY_ROW_HEIGHT = 58
+DASHBOARD_LEGACY_GAP = 16
+DASHBOARD_GRID_COLUMNS = 12
+DASHBOARD_GRID_ROW_HEIGHT = 42
+PANEL_CONTROL_HEIGHT = 40
+PANEL_MOVE_BAR_HEIGHT = 10
+PANEL_TITLE_HEIGHT = 18
+PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT + PANEL_TITLE_HEIGHT
+DASHBOARD_GRID_GAP = 12
+
+
+TimelineBlock = tuple[datetime, datetime, str, str, dict[str, object]]
+
+
+def _style_popup_menu(menu: QMenu, source: QWidget | None = None) -> QMenu:
+    style_source: QWidget | None = None
+    if isinstance(source, QWidget):
+        window = source.window()
+        if isinstance(window, QWidget) and window.styleSheet():
+            style_source = window
+        elif source.styleSheet():
+            style_source = source
+    if style_source is not None:
+        menu.setStyleSheet(style_source.styleSheet())
+    else:
+        app = QApplication.instance()
+        if app is not None and app.styleSheet():
+            menu.setStyleSheet(app.styleSheet())
+    palette = menu.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#1b1b20"))
+    palette.setColor(QPalette.ColorRole.WindowText, QColor("#1b1b20"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1b1b20"))
+    palette.setColor(QPalette.ColorRole.Highlight, QColor("#e6f0eb"))
+    palette.setColor(QPalette.ColorRole.HighlightedText, QColor("#18201b"))
+    menu.setPalette(palette)
+    menu.setAutoFillBackground(True)
+    menu.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    menu.setStyleSheet(
+        menu.styleSheet()
+        + """
+        QMenu {
+            background-color: #ffffff;
+            color: #1b1b20;
+            border: 1px solid #d7dfdc;
+            border-radius: 10px;
+            padding: 6px;
+        }
+        QMenu::item {
+            background: transparent;
+            color: #1b1b20;
+            border-radius: 7px;
+            padding: 7px 24px 7px 12px;
+        }
+        QMenu::item:selected {
+            background-color: #e6f0eb;
+            color: #18201b;
+        }
+        QMenu::item:disabled {
+            color: #8c9791;
+        }
+        QMenu::separator {
+            height: 1px;
+            background: #e4e9e6;
+            margin: 5px 8px;
+        }
+        """
+    )
+    return menu
+
+
+def _show_light_action_popup(
+    source: QWidget,
+    position: QPoint,
+    actions: list[tuple[str, Callable[[], None], bool]],
+) -> None:
+    if not actions:
+        return
+    app = QApplication.instance()
+    owner = source.window() if isinstance(source.window(), QWidget) else source
+    existing_popups = [getattr(owner, "_active_light_action_popup", None)]
+    if app is not None:
+        existing_popups.append(getattr(app, "_active_light_action_popup", None))
+    for existing in existing_popups:
+        if isinstance(existing, QWidget):
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+
+    popup = QFrame(owner)
+    popup.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+    popup.setObjectName("lightActionPopup")
+    popup.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+    popup.setAutoFillBackground(True)
+    popup.setBackgroundRole(QPalette.ColorRole.Window)
+    popup.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+    palette = popup.palette()
+    palette.setColor(QPalette.ColorRole.Window, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Base, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.Button, QColor("#ffffff"))
+    palette.setColor(QPalette.ColorRole.ButtonText, QColor("#1b1b20"))
+    palette.setColor(QPalette.ColorRole.Text, QColor("#1b1b20"))
+    popup.setPalette(palette)
+    popup.setMinimumWidth(164)
+    popup.setStyleSheet(
+        """
+        QFrame#lightActionPopup {
+            background: #ffffff;
+            background-color: #ffffff;
+            border: 1px solid #d7dfdc;
+            border-radius: 10px;
+        }
+        QPushButton#lightActionPopupItem {
+            background: transparent;
+            border: none;
+            border-radius: 7px;
+            color: #1b1b20;
+            font-size: 13px;
+            min-height: 30px;
+            padding: 7px 24px 7px 12px;
+            text-align: left;
+        }
+        QPushButton#lightActionPopupItem:hover {
+            background: #e6f0eb;
+            color: #18201b;
+        }
+        QPushButton#lightActionPopupItem:disabled {
+            color: #9aa49f;
+        }
+        """
+    )
+    layout = QVBoxLayout(popup)
+    layout.setContentsMargins(6, 6, 6, 6)
+    layout.setSpacing(2)
+    for text, callback, enabled in actions:
+        button = QPushButton(text)
+        button.setObjectName("lightActionPopupItem")
+        button.setCursor(Qt.CursorShape.PointingHandCursor)
+        button.setEnabled(enabled)
+        button.clicked.connect(
+            lambda _checked=False, cb=callback, popup_widget=popup: (
+                popup_widget.close(),
+                cb(),
+            )
+        )
+        layout.addWidget(button)
+
+    popup.adjustSize()
+    popup.move(source.mapToGlobal(position))
+    setattr(owner, "_active_light_action_popup", popup)
+    if app is not None:
+        setattr(app, "_active_light_action_popup", popup)
+    popup.show()
+    popup.raise_()
 PASTEL_COLOR_PRESETS = ("#f3d9dc", "#f6e6c8", "#dcebd7", "#d9e7f5", "#e7def5")
 MONOTONE_COLOR_PRESETS = ("#fafafa", "#e9ecef", "#adb5bd", "#495057", "#111315")
+PANEL_RHYTHM_MARGIN = (16, 14, 16, 14)
+PANEL_RHYTHM_COMPACT_MARGIN = (12, 10, 12, 10)
+PANEL_RHYTHM_TINY_MARGIN = (10, 8, 10, 8)
+PANEL_RHYTHM_SPACING = 10
+PANEL_RHYTHM_COMPACT_SPACING = 8
+PANEL_RHYTHM_TINY_SPACING = 7
+_EYEDROPPER_CURSOR: QCursor | None = None
+
+
+def _apply_panel_rhythm(layout, mode: str = "normal") -> None:
+    if mode == "tiny":
+        margins = PANEL_RHYTHM_TINY_MARGIN
+        spacing = PANEL_RHYTHM_TINY_SPACING
+    elif mode == "compact":
+        margins = PANEL_RHYTHM_COMPACT_MARGIN
+        spacing = PANEL_RHYTHM_COMPACT_SPACING
+    else:
+        margins = PANEL_RHYTHM_MARGIN
+        spacing = PANEL_RHYTHM_SPACING
+    layout.setContentsMargins(*margins)
+    layout.setSpacing(spacing)
+
+
+def _spin_arrow_asset_urls(palette: dict[str, str]) -> tuple[str, str]:
+    arrow_color = QColor(palette.get("muted", "#5c5c66")).name().lstrip("#")
+    asset_dir = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "ScheduleHelper" / "ui-assets"
+    asset_dir.mkdir(parents=True, exist_ok=True)
+
+    def build_arrow(name: str, points: tuple[tuple[float, float], tuple[float, float], tuple[float, float]]) -> str:
+        path = asset_dir / f"{name}_{arrow_color}.png"
+        if not path.exists():
+            pixmap = QPixmap(10, 10)
+            pixmap.fill(Qt.GlobalColor.transparent)
+            painter = QPainter(pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            arrow = QPainterPath()
+            arrow.moveTo(*points[0])
+            arrow.lineTo(*points[1])
+            arrow.lineTo(*points[2])
+            arrow.closeSubpath()
+            painter.fillPath(arrow, QColor(f"#{arrow_color}"))
+            painter.end()
+            pixmap.save(str(path), "PNG")
+        return path.as_posix()
+
+    return (
+        build_arrow("spin_up", ((5, 2.5), (8, 6.5), (2, 6.5))),
+        build_arrow("spin_down", ((2, 3.5), (8, 3.5), (5, 7.5))),
+    )
+
+
+def _eyedropper_cursor() -> QCursor:
+    global _EYEDROPPER_CURSOR
+    if _EYEDROPPER_CURSOR is not None:
+        return _EYEDROPPER_CURSOR
+
+    pixmap = QPixmap(32, 32)
+    pixmap.fill(Qt.GlobalColor.transparent)
+    painter = QPainter(pixmap)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    painter.setPen(QPen(QColor("#ffffff"), 6, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.drawLine(9, 23, 23, 9)
+    painter.setPen(QPen(QColor("#18201b"), 3, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+    painter.drawLine(9, 23, 23, 9)
+    painter.setPen(QPen(QColor("#18201b"), 2))
+    painter.setBrush(QColor("#ffffff"))
+    painter.drawEllipse(QPoint(22, 6), 5, 5)
+    painter.setBrush(QColor("#4f8c6b"))
+    painter.drawEllipse(QPoint(7, 22), 4, 4)
+    painter.end()
+
+    _EYEDROPPER_CURSOR = QCursor(pixmap, 7, 22)
+    return _EYEDROPPER_CURSOR
 
 
 def _start_feature_drag(source: QWidget, feature_key: str) -> None:
@@ -154,14 +386,49 @@ class FeatureMoveBar(QWidget):
         self.feature_key = feature_key
         self.drag_start: QPoint | None = None
         self.setObjectName("featureMoveBar")
-        self.setMinimumHeight(30)
+        self.setMinimumHeight(PANEL_MOVE_BAR_HEIGHT)
+        self.setMaximumHeight(PANEL_MOVE_BAR_HEIGHT)
+        self.setAttribute(Qt.WidgetAttribute.WA_Hover, True)
+        self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.OpenHandCursor)
+
+    def _refresh_state(self) -> None:
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
+
+    def set_hovering(self, hovering: bool) -> None:
+        self.setProperty("hovering", hovering)
+        self._refresh_state()
+
+    def set_dragging(self, dragging: bool) -> None:
+        self.setProperty("dragging", dragging)
+        self._refresh_state()
+
+    def reset_interaction_state(self) -> None:
+        self.drag_start = None
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.set_hovering(False)
+        self.set_dragging(False)
+
+    def _gesture_target(self) -> QWidget | None:
+        parent = self.parentWidget()
+        while parent is not None:
+            if callable(getattr(parent, "begin_feature_reposition_gesture", None)):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def enterEvent(self, event) -> None:
+        self.set_hovering(True)
+        super().enterEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             self.drag_start = event.globalPosition().toPoint()
             self.setCursor(Qt.CursorShape.ClosedHandCursor)
-            parent = self.parentWidget()
+            self.set_dragging(True)
+            parent = self._gesture_target()
             begin = getattr(parent, "begin_feature_reposition_gesture", None)
             if callable(begin):
                 begin(event.globalPosition().toPoint(), self)
@@ -173,7 +440,7 @@ class FeatureMoveBar(QWidget):
         if not (event.buttons() & Qt.MouseButton.LeftButton) or self.drag_start is None:
             super().mouseMoveEvent(event)
             return
-        parent = self.parentWidget()
+        parent = self._gesture_target()
         update = getattr(parent, "update_feature_reposition_gesture", None)
         if callable(update) and update(event.globalPosition().toPoint(), self):
             event.accept()
@@ -181,14 +448,39 @@ class FeatureMoveBar(QWidget):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
-        self.drag_start = None
-        self.setCursor(Qt.CursorShape.OpenHandCursor)
-        parent = self.parentWidget()
+        parent = self._gesture_target()
         finish = getattr(parent, "finish_feature_reposition_gesture", None)
-        if callable(finish) and finish(event.globalPosition().toPoint(), self):
+        handled = callable(finish) and finish(event.globalPosition().toPoint(), self)
+        self.reset_interaction_state()
+        if handled:
             event.accept()
             return
         super().mouseReleaseEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.set_hovering(False)
+        if self.drag_start is None:
+            self.set_dragging(False)
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.property("hovering") and not self.property("dragging"):
+            return
+        accent = "#4f8c6b"
+        window = self.window()
+        preferences = getattr(window, "preferences", None)
+        if isinstance(preferences, Preference):
+            accent = _normalize_accent_color(preferences.accent_color)
+        red, green, blue = _accent_rgb(accent)
+        color = QColor(red, green, blue)
+        color.setAlpha(255 if self.property("dragging") else 70)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(color)
+        painter.drawRoundedRect(self.rect().adjusted(0, 1, 0, -1), 5, 5)
+        painter.end()
 
 
 class QuickNoteDragList(QListWidget):
@@ -267,6 +559,103 @@ class QuickNoteFolderDropList(QListWidget):
         super().dropEvent(event)
 
 
+class FavoriteDragPushButton(QPushButton):
+    def __init__(
+        self,
+        favorite_id: int | None,
+        drop_callback: Callable[[int, QPoint], None],
+        text: str = "",
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(text, parent)
+        self.favorite_id = favorite_id
+        self.drop_callback = drop_callback
+        self.drag_start: QPoint | None = None
+        self.dragging_reorder = False
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = event.globalPosition().toPoint()
+            self.dragging_reorder = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self.favorite_id is not None
+            and self.drag_start is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and (event.globalPosition().toPoint() - self.drag_start).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            self.dragging_reorder = True
+            self.setDown(False)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.dragging_reorder and self.favorite_id is not None:
+            self.drag_start = None
+            self.dragging_reorder = False
+            self.setDown(False)
+            self.unsetCursor()
+            self.drop_callback(int(self.favorite_id), event.globalPosition().toPoint())
+            event.accept()
+            return
+        self.drag_start = None
+        self.dragging_reorder = False
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+
+class FavoriteDragToolButton(QToolButton):
+    def __init__(
+        self,
+        favorite_id: int | None,
+        drop_callback: Callable[[int, QPoint], None],
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.favorite_id = favorite_id
+        self.drop_callback = drop_callback
+        self.drag_start: QPoint | None = None
+        self.dragging_reorder = False
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_start = event.globalPosition().toPoint()
+            self.dragging_reorder = False
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if (
+            self.favorite_id is not None
+            and self.drag_start is not None
+            and event.buttons() & Qt.MouseButton.LeftButton
+            and (event.globalPosition().toPoint() - self.drag_start).manhattanLength() >= QApplication.startDragDistance()
+        ):
+            self.dragging_reorder = True
+            self.setDown(False)
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self.dragging_reorder and self.favorite_id is not None:
+            self.drag_start = None
+            self.dragging_reorder = False
+            self.setDown(False)
+            self.unsetCursor()
+            self.drop_callback(int(self.favorite_id), event.globalPosition().toPoint())
+            event.accept()
+            return
+        self.drag_start = None
+        self.dragging_reorder = False
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+
 class ResizeAwareWidget(QWidget):
     def __init__(self, resize_callback: Callable[[], None], parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -332,18 +721,34 @@ class HeaderBannerWidget(QWidget):
         super().__init__(parent)
         self.image_path = ""
         self.pixmap = QPixmap()
+        self.movie: QMovie | None = None
+        self.select_callback: Callable[[], None] | None = None
+        self.context_callback: Callable[[QWidget, QPoint], None] | None = None
         self.accent_color = "#4f8c6b"
         self.border_color = "#dbe5df"
         self.surface_color = "#f3f6f4"
         self.set_banner_height(132)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
 
     def set_banner_image(self, image_path: str) -> None:
         normalized_path = image_path.strip()
         if normalized_path == self.image_path:
             return
+        self._stop_movie()
         self.image_path = normalized_path
-        self.pixmap = QPixmap(normalized_path) if normalized_path and Path(normalized_path).exists() else QPixmap()
+        self.pixmap = QPixmap()
+        path = Path(normalized_path)
+        if normalized_path and path.exists():
+            if path.suffix.lower() == ".gif":
+                movie = QMovie(str(path))
+                movie.setCacheMode(QMovie.CacheMode.CacheAll)
+                if movie.isValid():
+                    self.movie = movie
+                    movie.frameChanged.connect(lambda _frame=0: self.update())
+                    movie.start()
+            else:
+                self.pixmap = QPixmap(normalized_path)
         self.update()
 
     def set_theme(self, accent: str, border: str, surface: str) -> None:
@@ -357,6 +762,23 @@ class HeaderBannerWidget(QWidget):
         self.setMinimumHeight(normalized_height)
         self.setMaximumHeight(16777215)
 
+    def _stop_movie(self) -> None:
+        if self.movie is not None:
+            self.movie.stop()
+            self.movie.deleteLater()
+            self.movie = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.RightButton and self.context_callback is not None:
+            self.context_callback(self, event.position().toPoint())
+            event.accept()
+            return
+        if event.button() == Qt.MouseButton.LeftButton and not self.image_path and self.select_callback is not None:
+            self.select_callback()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         painter = QPainter(self)
@@ -366,13 +788,14 @@ class HeaderBannerWidget(QWidget):
         path.addRoundedRect(rect, 18, 18)
 
         painter.fillPath(path, QColor(self.surface_color))
-        if self.pixmap.isNull():
+        source_pixmap = self.movie.currentPixmap() if self.movie is not None else self.pixmap
+        if source_pixmap.isNull():
             accent = QColor(self.accent_color)
             accent.setAlpha(30)
             painter.fillPath(path, accent)
         else:
             target = rect.toRect()
-            scaled = self.pixmap.scaled(
+            scaled = source_pixmap.scaled(
                 target.size(),
                 Qt.AspectRatioMode.KeepAspectRatioByExpanding,
                 Qt.TransformationMode.SmoothTransformation,
@@ -540,12 +963,14 @@ class DashboardGridGuideOverlay(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.preview_rect = QRectF()
+        self.impact_rects: list[QRectF] = []
         self.setObjectName("dashboardGridGuideOverlay")
         self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         self.hide()
 
-    def set_preview_rect(self, rect: QRectF) -> None:
+    def set_preview_rect(self, rect: QRectF, impact_rects: list[QRectF] | None = None) -> None:
         self.preview_rect = rect
+        self.impact_rects = impact_rects or []
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -584,12 +1009,33 @@ class DashboardGridGuideOverlay(QWidget):
             painter.drawLine(0, int(y), width, int(y))
             y += row_step
 
+        for rect in self.impact_rects:
+            if not rect.isValid() or rect.isNull():
+                continue
+            impact_fill = QColor(palette["surface_2"])
+            impact_fill.setAlpha(92)
+            impact_border = QColor(palette["border"])
+            impact_border.setAlpha(170)
+            impact_pen = QPen(impact_border, 1)
+            impact_pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setBrush(impact_fill)
+            painter.setPen(impact_pen)
+            painter.drawRoundedRect(rect.adjusted(1.5, 1.5, -1.5, -1.5), 12, 12)
+
         if self.preview_rect.isValid() and not self.preview_rect.isNull():
             highlight = QColor(accent)
-            highlight.setAlpha(34)
+            highlight.setAlpha(46)
             painter.setBrush(highlight)
-            painter.setPen(QPen(QColor(accent), 2))
-            painter.drawRoundedRect(self.preview_rect.adjusted(1, 1, -1, -1), 14, 14)
+            preview_pen = QPen(QColor(accent), 2)
+            painter.setPen(preview_pen)
+            painter.drawRoundedRect(self.preview_rect.adjusted(2, 2, -2, -2), 14, 14)
+            inner = QColor(accent)
+            inner.setAlpha(105)
+            inner_pen = QPen(inner, 1)
+            inner_pen.setStyle(Qt.PenStyle.DotLine)
+            painter.setPen(inner_pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(self.preview_rect.adjusted(8, 8, -8, -8), 10, 10)
 
 
 class DraggableFeatureBox(QWidget):
@@ -613,16 +1059,21 @@ class DraggableFeatureBox(QWidget):
         self.hide_callback = hide_callback
         self.content_drag_enabled = content_drag_enabled
         self.resize_callback: Callable[[str, int], None] | None = None
+        self.resize_edge_callback: Callable[[str, int, str], None] | None = None
+        self.pin_callback: Callable[[str, bool], None] | None = None
+        self.pinned_provider: Callable[[str], bool] | None = None
         self.span_provider: Callable[[str], int] | None = None
         self.height_callback: Callable[[str, int], None] | None = None
         self.height_provider: Callable[[str], int] | None = None
         self.panel_drag_start: QPoint | None = None
+        self.panel_drag_offset = QPoint(0, 0)
         self.panel_drag_active = False
         self.panel_drag_source: QWidget | None = None
         self.resizing_span = False
         self.resizing_height = False
         self.resize_start_x = 0
         self.resize_start_width = 0
+        self.resize_edge = "right"
         self.resize_start_y = 0
         self.resize_start_height = 0
         self.setObjectName("featureBox")
@@ -633,32 +1084,55 @@ class DraggableFeatureBox(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(6 if show_title_bar else 0)
+        layout.setSpacing(4 if show_title_bar else 0)
 
+        self.move_bar: FeatureMoveBar | None = None
         self.title_label: QLabel | None = None
+        self.header_band: QWidget | None = None
         if show_title_bar:
-            bar = FeatureMoveBar(feature_key, self)
+            header_band = QWidget(self)
+            self.header_band = header_band
+            header_band.setObjectName("featureHeaderBand")
+            header_band.setFixedHeight(PANEL_HEADER_HEIGHT)
+            header_band.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            header_layout = QVBoxLayout(header_band)
+            header_layout.setContentsMargins(0, 0, 0, 0)
+            header_layout.setSpacing(0)
+
+            bar = FeatureMoveBar(feature_key, header_band)
+            self.move_bar = bar
+            bar.setToolTip(title)
+            bar.setAccessibleName(title)
             bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             bar.customContextMenuRequested.connect(self.show_feature_context_menu)
             bar.installEventFilter(self)
             bar_layout = QHBoxLayout(bar)
-            bar_layout.setContentsMargins(8, 0, 8, 2)
-            bar_layout.setSpacing(6)
-            title_label = QLabel(title)
+            bar_layout.setContentsMargins(0, 0, 0, 0)
+            bar_layout.setSpacing(0)
+            bar_layout.addStretch(1)
+            header_layout.addWidget(bar)
+
+            title_label = QLabel(title, header_band)
             self.title_label = title_label
             title_label.setObjectName("featureMoveTitle")
             title_label.setToolTip(title)
-            title_label.setMinimumWidth(min(170, max(72, title_label.fontMetrics().horizontalAdvance(title) + 16)))
-            title_label.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
-            title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            bar_layout.addWidget(title_label)
-            bar_layout.addStretch(1)
-            layout.addWidget(bar)
+            title_label.setContentsMargins(8, 0, 8, 0)
+            title_label.setFixedHeight(PANEL_TITLE_HEIGHT)
+            title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            title_label.setMinimumWidth(0)
+            title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+            header_layout.addWidget(title_label)
+            layout.addWidget(header_band)
 
         self._relax_horizontal_minimums(content)
         content.setAcceptDrops(True)
         self._install_panel_event_filters(content)
         layout.addWidget(content, 1 if expand_content else 0)
+        self.resize_grip = QWidget(self)
+        self.resize_grip.setObjectName("featureResizeGrip")
+        self.resize_grip.setFixedSize(1, 1)
+        self.resize_grip.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        self.resize_grip.hide()
 
     def set_title(self, title: str) -> None:
         if self.title_label is None:
@@ -666,7 +1140,11 @@ class DraggableFeatureBox(QWidget):
         title = title.strip() or "기능"
         self.title_label.setText(title)
         self.title_label.setToolTip(title)
-        self.title_label.setMinimumWidth(min(260, max(72, self.title_label.fontMetrics().horizontalAdvance(title) + 16)))
+        self.title_label.setMinimumWidth(0)
+        self.title_label.setVisible(True)
+        if self.move_bar is not None:
+            self.move_bar.setToolTip(title)
+            self.move_bar.setAccessibleName(title)
 
     def _install_panel_event_filters(self, root: QWidget) -> None:
         root.setMouseTracking(True)
@@ -700,7 +1178,7 @@ class DraggableFeatureBox(QWidget):
 
     def _handle_filtered_drop_event(self, watched: QWidget, event) -> bool:
         source_key = self._source_key(event)
-        if not source_key or source_key == self.feature_key:
+        if not source_key or source_key == self.feature_key or self.is_pinned():
             return False
         if event.type() in {QEvent.Type.DragEnter, QEvent.Type.DragMove}:
             event.acceptProposedAction()
@@ -714,17 +1192,23 @@ class DraggableFeatureBox(QWidget):
     def _handle_filtered_mouse_press(self, watched: QWidget, event) -> bool:
         if event.button() != Qt.MouseButton.LeftButton:
             return False
+        if self.is_pinned():
+            if self._is_interactive_child(watched):
+                return False
+            event.accept()
+            return True
         box_position = self._map_event_position(watched, event)
         if self._is_height_resize_edge(box_position) and self.height_callback is not None:
             self._begin_height_resize(event.globalPosition().toPoint().y())
             event.accept()
             return True
-        if isinstance(watched, FeatureMoveBar) or self._is_interactive_child(watched):
-            return False
-        if self._is_resize_edge(box_position) and self.resize_callback is not None:
-            self._begin_span_resize(event.globalPosition().toPoint().x())
+        resize_edge = self._resize_edge_at(box_position)
+        if resize_edge and self._can_resize_width() and not self._is_interactive_child(watched):
+            self._begin_span_resize(event.globalPosition().toPoint().x(), resize_edge)
             event.accept()
             return True
+        if isinstance(watched, FeatureMoveBar) or self._is_interactive_child(watched):
+            return False
         if not self.content_drag_enabled:
             return False
         self.begin_feature_reposition_gesture(event.globalPosition().toPoint(), watched)
@@ -751,7 +1235,7 @@ class DraggableFeatureBox(QWidget):
             return True
         if self._is_height_resize_edge(box_position) and self.height_callback is not None:
             watched.setCursor(Qt.CursorShape.SizeVerCursor)
-        elif self._is_resize_edge(box_position) and self.resize_callback is not None:
+        elif self._resize_edge_at(box_position) and self._can_resize_width():
             watched.setCursor(Qt.CursorShape.SizeHorCursor)
         elif self._should_reset_cursor(watched):
             watched.unsetCursor()
@@ -761,6 +1245,7 @@ class DraggableFeatureBox(QWidget):
         if self.finish_feature_reposition_gesture(event.globalPosition().toPoint(), watched):
             event.accept()
             return True
+        self._reset_move_bar_state()
         self.panel_drag_start = None
         if self.resizing_span:
             self.resizing_span = False
@@ -777,6 +1262,9 @@ class DraggableFeatureBox(QWidget):
         return False
 
     def mousePressEvent(self, event) -> None:
+        if self.is_pinned():
+            super().mousePressEvent(event)
+            return
         if (
             event.button() == Qt.MouseButton.LeftButton
             and self.height_callback is not None
@@ -787,10 +1275,10 @@ class DraggableFeatureBox(QWidget):
             return
         if (
             event.button() == Qt.MouseButton.LeftButton
-            and self.resize_callback is not None
-            and self._is_resize_edge(event.position().toPoint())
+            and self._can_resize_width()
+            and self._resize_edge_at(event.position().toPoint())
         ):
-            self._begin_span_resize(event.globalPosition().toPoint().x())
+            self._begin_span_resize(event.globalPosition().toPoint().x(), self._resize_edge_at(event.position().toPoint()) or "right")
             event.accept()
             return
         if self.content_drag_enabled:
@@ -816,7 +1304,7 @@ class DraggableFeatureBox(QWidget):
             return
         if self._is_height_resize_edge(event.position().toPoint()) and self.height_callback is not None:
             self.setCursor(Qt.CursorShape.SizeVerCursor)
-        elif self._is_resize_edge(event.position().toPoint()) and self.resize_callback is not None:
+        elif self._resize_edge_at(event.position().toPoint()) and self._can_resize_width():
             self.setCursor(Qt.CursorShape.SizeHorCursor)
         else:
             self.unsetCursor()
@@ -826,6 +1314,7 @@ class DraggableFeatureBox(QWidget):
         if self.finish_feature_reposition_gesture(event.globalPosition().toPoint(), self):
             event.accept()
             return
+        self._reset_move_bar_state()
         self.panel_drag_start = None
         if self.resizing_span:
             self.resizing_span = False
@@ -854,24 +1343,46 @@ class DraggableFeatureBox(QWidget):
             return "right"
         return "before" if y_ratio < 0.45 else "after"
 
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        grip = getattr(self, "resize_grip", None)
+        if isinstance(grip, QWidget) and grip.isVisible():
+            grip.move(max(0, self.width() - grip.width() - 3), max(0, self.height() - grip.height() - 3))
+            grip.raise_()
+
     def _is_resize_edge(self, point: QPoint) -> bool:
-        return self.width() >= 160 and point.x() >= self.width() - 12
+        return bool(self._resize_edge_at(point))
+
+    def _resize_edge_at(self, point: QPoint) -> str:
+        if self.width() < 120:
+            return ""
+        if point.x() <= 22:
+            return "left"
+        if point.x() >= self.width() - 22:
+            return "right"
+        return ""
 
     def _is_height_resize_edge(self, point: QPoint) -> bool:
-        return self.height() >= 96 and point.y() >= self.height() - 20
+        return self.height() >= 80 and point.y() >= self.height() - 24
 
-    def _begin_span_resize(self, global_x: int) -> None:
+    def _can_resize_width(self) -> bool:
+        return self.resize_callback is not None or self.resize_edge_callback is not None
+
+    def _begin_span_resize(self, global_x: int, edge: str = "right") -> None:
         self.resizing_span = True
         self.panel_drag_start = None
+        self.panel_drag_offset = QPoint(0, 0)
         self.panel_drag_active = False
         self.panel_drag_source = None
         self.resize_start_x = global_x
         self.resize_start_width = self._current_width()
+        self.resize_edge = "left" if edge == "left" else "right"
         self.setCursor(Qt.CursorShape.SizeHorCursor)
 
     def _begin_height_resize(self, global_y: int) -> None:
         self.resizing_height = True
         self.panel_drag_start = None
+        self.panel_drag_offset = QPoint(0, 0)
         self.panel_drag_active = False
         self.panel_drag_source = None
         self.resize_start_y = global_y
@@ -880,6 +1391,11 @@ class DraggableFeatureBox(QWidget):
 
     def begin_feature_reposition_gesture(self, global_position: QPoint, source: QWidget | None = None) -> None:
         self.panel_drag_start = global_position
+        local_position = self.mapFromGlobal(global_position)
+        self.panel_drag_offset = QPoint(
+            min(max(local_position.x(), 0), max(0, self.width())),
+            min(max(local_position.y(), 0), max(0, self.height())),
+        )
         self.panel_drag_active = False
         self.panel_drag_source = source or self
 
@@ -898,35 +1414,49 @@ class DraggableFeatureBox(QWidget):
         controller = self._feature_drag_controller()
         preview = getattr(controller, "preview_feature_reposition", None)
         if callable(preview):
-            preview(self.feature_key, global_position)
+            preview(self.feature_key, global_position, self.panel_drag_offset)
         return True
 
     def finish_feature_reposition_gesture(self, global_position: QPoint, source: QWidget | None = None) -> bool:
         was_active = self.panel_drag_active
+        drag_offset = QPoint(self.panel_drag_offset)
         self.panel_drag_start = None
+        self.panel_drag_offset = QPoint(0, 0)
         self.panel_drag_active = False
         drag_source = source or self.panel_drag_source
         self.panel_drag_source = None
         if isinstance(drag_source, QWidget):
             drag_source.unsetCursor()
+        self._reset_move_bar_state()
         if not was_active:
             return False
         controller = self._feature_drag_controller()
         finish = getattr(controller, "finish_feature_reposition", None)
         if callable(finish):
-            finish(self.feature_key, global_position)
+            finish(self.feature_key, global_position, drag_offset)
         return True
+
+    def _reset_move_bar_state(self) -> None:
+        if isinstance(self.move_bar, FeatureMoveBar):
+            self.move_bar.reset_interaction_state()
 
     def _feature_drag_controller(self) -> QWidget | None:
         window = self.window()
         return window if isinstance(window, QWidget) else None
 
     def _resize_span_from_global_x(self, global_x: int) -> None:
-        if self.resize_callback is None:
+        if not self._can_resize_width():
             return
-        new_width = max(120, self.resize_start_width + (global_x - self.resize_start_x))
+        delta = global_x - self.resize_start_x
+        if self.resize_edge == "left":
+            new_width = max(120, self.resize_start_width - delta)
+        else:
+            new_width = max(120, self.resize_start_width + delta)
         if abs(new_width - self._current_width()) >= 2:
-            self.resize_callback(self.feature_key, int(new_width))
+            if self.resize_edge_callback is not None:
+                self.resize_edge_callback(self.feature_key, int(new_width), self.resize_edge)
+            elif self.resize_callback is not None:
+                self.resize_callback(self.feature_key, int(new_width))
 
     def _resize_height_from_global_y(self, global_y: int) -> None:
         if self.height_callback is None:
@@ -984,12 +1514,20 @@ class DraggableFeatureBox(QWidget):
         return not isinstance(widget, FeatureMoveBar) and not self._is_interactive_child(widget)
 
     def show_feature_context_menu(self, position: QPoint) -> None:
-        if self.widget_callback is None and self.hide_callback is None:
+        if self.widget_callback is None and self.hide_callback is None and self.pin_callback is None:
             return
         source = self.sender()
         source_widget = source if isinstance(source, QWidget) else self
-        menu = QMenu(source_widget)
+        menu = _style_popup_menu(QMenu(source_widget), source_widget)
+        if self.pin_callback is not None:
+            pinned = self.is_pinned()
+            pin_action = menu.addAction("패널 고정 해제" if pinned else "패널 고정")
+            pin_action.triggered.connect(
+                lambda _checked=False, next_pinned=not pinned: self.pin_callback(self.feature_key, next_pinned)
+            )
         if self.widget_callback is not None:
+            if not menu.isEmpty():
+                menu.addSeparator()
             widget_action = menu.addAction("새창으로 열기")
             widget_action.triggered.connect(lambda _checked=False: self.widget_callback(self.feature_key))
         if self.hide_callback is not None:
@@ -1001,17 +1539,17 @@ class DraggableFeatureBox(QWidget):
 
     def dragEnterEvent(self, event) -> None:
         source_key = self._source_key(event)
-        if source_key and source_key != self.feature_key:
+        if source_key and source_key != self.feature_key and not self.is_pinned():
             event.acceptProposedAction()
 
     def dragMoveEvent(self, event) -> None:
         source_key = self._source_key(event)
-        if source_key and source_key != self.feature_key:
+        if source_key and source_key != self.feature_key and not self.is_pinned():
             event.acceptProposedAction()
 
     def dropEvent(self, event) -> None:
         source_key = self._source_key(event)
-        if not source_key or source_key == self.feature_key:
+        if not source_key or source_key == self.feature_key or self.is_pinned():
             return
         drop_position = event.position().toPoint()
         placement = self._drop_placement(drop_position)
@@ -1023,6 +1561,11 @@ class DraggableFeatureBox(QWidget):
         if not mime.hasFormat(FEATURE_MIME_TYPE):
             return ""
         return bytes(mime.data(FEATURE_MIME_TYPE)).decode("utf-8")
+
+    def is_pinned(self) -> bool:
+        if self.pinned_provider is None:
+            return False
+        return bool(self.pinned_provider(self.feature_key))
 
 
 class FeatureCell(QWidget):
@@ -1434,7 +1977,7 @@ class MainWindow(QMainWindow):
     def _build_full_page(self) -> QWidget:
         page = QWidget()
         page.setObjectName("appShell")
-        page.setMinimumWidth(1080)
+        page.setMinimumWidth(640)
         layout = QVBoxLayout(page)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
@@ -1462,6 +2005,8 @@ class MainWindow(QMainWindow):
         self.feature_row_splitters: list[QSplitter] = []
         self.feature_cells: dict[str, FeatureCell] = {}
         self.header_banner_widget = HeaderBannerWidget()
+        self.header_banner_widget.select_callback = self.choose_header_banner_file
+        self.header_banner_widget.context_callback = self.show_header_banner_context_menu
         self.header_banner_panel = self._wrap_feature("header_banner", "배너", self.header_banner_widget)
 
         self.body_splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -1547,7 +2092,7 @@ class MainWindow(QMainWindow):
         self.feature_dashboard_layout.setVerticalSpacing(DASHBOARD_GRID_GAP)
         for column in range(DASHBOARD_GRID_COLUMNS):
             self.feature_dashboard_layout.setColumnStretch(column, 1)
-            self.feature_dashboard_layout.setColumnMinimumWidth(column, 52)
+            self.feature_dashboard_layout.setColumnMinimumWidth(column, 28)
         self.dashboard_guide_overlay = DashboardGridGuideOverlay(self.feature_grid_container)
         workspace_layout.addWidget(self.feature_grid_container, 1)
         self._apply_feature_layout(self.default_layout_state().get("layout"))
@@ -1588,26 +2133,8 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.chrome_title_label)
         self.header_focus_card = self._build_header_focus_card()
         layout.addWidget(self.header_focus_card)
+        self.header_focus_card.hide()
         layout.addStretch(1)
-
-        theme_segment = QWidget()
-        theme_segment.setObjectName("themeSegment")
-        theme_layout = QHBoxLayout(theme_segment)
-        theme_layout.setContentsMargins(3, 3, 3, 3)
-        theme_layout.setSpacing(3)
-        self.light_theme_button = QPushButton("라이트")
-        self.light_theme_button.setObjectName("segmentButton")
-        self.light_theme_button.setCheckable(True)
-        _stabilize_control(self.light_theme_button, 58)
-        self.light_theme_button.clicked.connect(lambda _checked=False: self.set_appearance_theme("light"))
-        self.dark_theme_button = QPushButton("다크")
-        self.dark_theme_button.setObjectName("segmentButton")
-        self.dark_theme_button.setCheckable(True)
-        _stabilize_control(self.dark_theme_button, 50)
-        self.dark_theme_button.clicked.connect(lambda _checked=False: self.set_appearance_theme("dark"))
-        theme_layout.addWidget(self.light_theme_button)
-        theme_layout.addWidget(self.dark_theme_button)
-        layout.addWidget(theme_segment)
 
         date_review_button = QPushButton("날짜별 보기")
         date_review_button.setObjectName("topBarButton")
@@ -1692,6 +2219,9 @@ class MainWindow(QMainWindow):
             content_drag_enabled=feature_key in {"header_banner", "media_panel"},
         )
         box.resize_callback = self.resize_feature_panel_width
+        box.resize_edge_callback = self.resize_feature_panel_width_from_edge
+        box.pin_callback = self.set_feature_panel_pinned
+        box.pinned_provider = self.feature_panel_pinned
         box.height_callback = self.resize_feature_panel_height
         box.height_provider = self.feature_panel_height
         self.feature_boxes[feature_key] = box
@@ -1788,6 +2318,9 @@ class MainWindow(QMainWindow):
         body_splitter.setSizes([max(1, size) for size in sizes])
 
     def move_feature_to_column(self, source_key: str, column_key: str) -> None:
+        if self.feature_panel_pinned(source_key):
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
+            return
         source = self.feature_boxes.get(source_key)
         target_splitter = self._column_splitter(column_key)
         if source is None or target_splitter is None:
@@ -1813,6 +2346,9 @@ class MainWindow(QMainWindow):
 
     def swap_feature_panels(self, source_key: str, target_key: str, placement: str = "after") -> None:
         if source_key == target_key:
+            return
+        if self.feature_panel_pinned(source_key) or self.feature_panel_pinned(target_key):
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
             return
         source = self.feature_boxes.get(source_key)
         target = self.feature_boxes.get(target_key)
@@ -1852,19 +2388,46 @@ class MainWindow(QMainWindow):
 
         self.statusBar().showMessage("패널 위치를 바꿨습니다.", 1800)
 
-    def preview_feature_reposition(self, source_key: str, global_position: QPoint) -> None:
+    def preview_feature_reposition(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> None:
+        if self.feature_panel_pinned(source_key):
+            return
         if hasattr(self, "feature_dashboard_layout"):
-            self._show_dashboard_drag_guides(source_key, global_position)
+            self._show_dashboard_drag_guides(source_key, global_position, drag_offset)
             return
         return
 
-    def finish_feature_reposition(self, source_key: str, global_position: QPoint) -> None:
+    def finish_feature_reposition(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> None:
+        if self.feature_panel_pinned(source_key):
+            self._hide_dashboard_drag_guides()
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
+            return
         if hasattr(self, "feature_dashboard_layout"):
             self._hide_dashboard_drag_guides()
+            dashboard_items = [dict(item) for item in self._current_feature_dashboard_layout()]
+            dashboard_source = next((item for item in dashboard_items if str(item.get("key", "")) == source_key), None)
+            if dashboard_source is not None:
+                dashboard_position = self._dashboard_grid_position_from_global(
+                    global_position,
+                    self._normalized_dashboard_width(dashboard_source.get("w")),
+                    drag_offset,
+                )
+                if dashboard_position is not None:
+                    self._move_feature_to_dashboard_position(source_key, global_position, drag_offset)
+                    return
         target = self._feature_drop_target_at(global_position, source_key)
         if target is None:
             if hasattr(self, "feature_dashboard_layout"):
-                if self._move_feature_to_dashboard_position(source_key, global_position):
+                if self._move_feature_to_dashboard_position(source_key, global_position, drag_offset):
                     return
                 self.statusBar().showMessage("옮길 위치를 찾지 못했습니다.", 1400)
                 return
@@ -1883,7 +2446,7 @@ class MainWindow(QMainWindow):
             return target
 
         for key, box in self.feature_boxes.items():
-            if key == source_key or not box.isVisible():
+            if key == source_key or not box.isVisible() or self.feature_panel_pinned(key):
                 continue
             local_position = box.mapFromGlobal(global_position)
             if box.rect().contains(local_position):
@@ -1906,16 +2469,23 @@ class MainWindow(QMainWindow):
         cursor = widget
         while cursor is not None:
             if isinstance(cursor, DraggableFeatureBox):
-                if cursor.feature_key != source_key:
+                if cursor.feature_key != source_key and not self.feature_panel_pinned(cursor.feature_key):
                     local_position = cursor.mapFromGlobal(global_position)
                     return ("feature", cursor.feature_key, cursor._drop_placement(local_position))
             elif isinstance(cursor, FeatureCell):
-                if cursor.feature_key != source_key:
+                if cursor.feature_key != source_key and not self.feature_panel_pinned(cursor.feature_key):
                     box = cursor.feature_box
                     local_position = box.mapFromGlobal(global_position)
                     return ("feature", cursor.feature_key, box._drop_placement(local_position))
             elif isinstance(cursor, FeatureColumn):
-                fallback_key = next((str(key) for key in reversed(cursor.items) if str(key) != source_key), "")
+                fallback_key = next(
+                    (
+                        str(key)
+                        for key in reversed(cursor.items)
+                        if str(key) != source_key and not self.feature_panel_pinned(str(key))
+                    ),
+                    "",
+                )
                 if fallback_key:
                     return ("feature", fallback_key, "after")
             elif isinstance(cursor, FeatureColumnDropZone):
@@ -2062,11 +2632,15 @@ class MainWindow(QMainWindow):
         panel.setMinimumHeight(0)
         panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        self.focus_panel_layout = layout
+        _apply_panel_rhythm(layout)
 
         focus_header = QLabel("현재 집중")
         focus_header.setObjectName("eyebrowLabel")
+        focus_header.setText("")
+        focus_header.setFixedHeight(0)
+        focus_header.hide()
+        self.focus_header_label = focus_header
         layout.addWidget(focus_header)
 
         form_panel = QWidget()
@@ -2095,17 +2669,22 @@ class MainWindow(QMainWindow):
         self.focus_title_label = form.itemAtPosition(0, 0).widget()
 
         self.target_combo = QComboBox()
+        self.target_combo.setObjectName("focusTargetCombo")
         self.target_combo.setMinimumContentsLength(12)
         self.target_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
         _stabilize_control(self.target_combo, 120)
         self.target_combo.setMinimumWidth(0)
+        self.target_combo.view().setObjectName("focusTargetComboView")
+        self.target_combo.view().setSpacing(0)
+        self.target_combo.activated.connect(lambda _index: self.add_focus_target_from_combo())
+        self.target_combo.view().pressed.connect(self.add_focus_target_from_combo_index)
         self.use_focus_target_check = QCheckBox("화면 지정 사용")
         self.use_focus_target_check.setChecked(False)
         self.use_focus_target_check.toggled.connect(self.toggle_focus_target_controls)
         self.add_target_button = QPushButton("추가")
         self.add_target_button.setObjectName("softButton")
         _stabilize_control(self.add_target_button, 62)
-        self.add_target_button.clicked.connect(self.add_focus_target)
+        self.add_target_button.clicked.connect(lambda _checked=False: self.add_focus_target())
         self.target_refresh_button = QPushButton("목록 갱신")
         self.target_refresh_button.setObjectName("ghostButton")
         _stabilize_control(self.target_refresh_button, 64)
@@ -2122,17 +2701,21 @@ class MainWindow(QMainWindow):
         form.addWidget(self.target_action_box, 1, 3)
 
         self.focus_targets_list = QListWidget()
-        self.focus_targets_list.setMinimumHeight(0)
-        self.focus_targets_list.setMaximumHeight(52)
+        self.focus_targets_list.setObjectName("focusTargetsList")
+        self.focus_targets_list.setMinimumHeight(82)
+        self.focus_targets_list.setMaximumHeight(104)
+        self.focus_targets_list.setSpacing(1)
         self.focus_targets_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.focus_targets_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.focus_targets_list.customContextMenuRequested.connect(self.show_focus_target_context_menu)
         self.remove_target_button = QPushButton("삭제")
         self.remove_target_button.setObjectName("ghostButton")
         _stabilize_control(self.remove_target_button, 64)
         self.remove_target_button.clicked.connect(self.remove_selected_focus_target)
+        self.remove_target_button.hide()
         self.focus_targets_label = QLabel("지정 창")
         form.addWidget(self.focus_targets_label, 2, 0)
-        form.addWidget(self.focus_targets_list, 2, 1, 1, 2)
-        form.addWidget(self.remove_target_button, 2, 3)
+        form.addWidget(self.focus_targets_list, 2, 1, 1, 3)
 
         self.planned_minutes_spin = QSpinBox()
         self.planned_minutes_spin.setRange(1, 240)
@@ -2148,10 +2731,10 @@ class MainWindow(QMainWindow):
         self.idle_cutoff_spin.setMinimumWidth(72)
         form.addWidget(QLabel("목표 시간"), 3, 0)
         form.addWidget(self.planned_minutes_spin, 3, 1)
-        form.addWidget(QLabel("자리 비움"), 4, 0)
-        form.addWidget(self.idle_cutoff_spin, 4, 1)
+        form.addWidget(QLabel("자리 비움"), 3, 2)
+        form.addWidget(self.idle_cutoff_spin, 3, 3)
         self.planned_minutes_label = form.itemAtPosition(3, 0).widget()
-        self.idle_cutoff_label = form.itemAtPosition(4, 0).widget()
+        self.idle_cutoff_label = form.itemAtPosition(3, 2).widget()
         layout.addWidget(form_panel)
 
         focus_dashboard = QWidget()
@@ -2169,6 +2752,12 @@ class MainWindow(QMainWindow):
         meter_box.setSpacing(6)
         self.focus_status_label = QLabel("대기 중")
         self.focus_status_label.setObjectName("statusLabel")
+        self.focus_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.focus_status_label.setWordWrap(False)
+        self.focus_status_label.setMinimumWidth(0)
+        self.focus_status_label.setMinimumHeight(30)
+        self.focus_status_label.setMaximumHeight(34)
+        self.focus_status_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.remaining_time_label = QLabel("25:00")
         self.remaining_time_label.setObjectName("timeLabel")
         self.remaining_time_label.setMinimumWidth(0)
@@ -2185,11 +2774,18 @@ class MainWindow(QMainWindow):
         ratio_card = QWidget()
         ratio_card.setObjectName("focusRateCard")
         self.focus_ratio_card = ratio_card
+        ratio_card.setMinimumWidth(0)
+        ratio_card.setMinimumHeight(84)
+        ratio_card.setMaximumHeight(126)
+        ratio_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         ratio_layout = QVBoxLayout(ratio_card)
         ratio_layout.setContentsMargins(16, 14, 16, 14)
         ratio_layout.setSpacing(8)
+        self.focus_ratio_layout = ratio_layout
 
         self.focus_ratio_stack = QStackedWidget()
+        self.focus_ratio_stack.setMinimumHeight(42)
+        self.focus_ratio_stack.setMaximumHeight(76)
         ring_page = QWidget()
         ring_layout = QVBoxLayout(ring_page)
         ring_layout.setContentsMargins(0, 0, 0, 0)
@@ -2233,9 +2829,13 @@ class MainWindow(QMainWindow):
         self.focus_focused_metric_label = QLabel("0초")
         self.focus_away_metric_label = QLabel("0초")
         self.focus_paused_metric_label = QLabel("0초")
-        focus_metrics.addWidget(self._build_metric_card("집중", self.focus_focused_metric_label))
-        focus_metrics.addWidget(self._build_metric_card("이탈", self.focus_away_metric_label))
-        focus_metrics.addWidget(self._build_metric_card("일시정지", self.focus_paused_metric_label))
+        self.focus_metric_cards = [
+            self._build_metric_card("집중", self.focus_focused_metric_label),
+            self._build_metric_card("이탈", self.focus_away_metric_label),
+            self._build_metric_card("일시정지", self.focus_paused_metric_label),
+        ]
+        for card in self.focus_metric_cards:
+            focus_metrics.addWidget(card)
         focus_dashboard_layout.addLayout(focus_metrics)
 
         button_row = QHBoxLayout()
@@ -2267,6 +2867,9 @@ class MainWindow(QMainWindow):
     def update_focus_panel_responsive_layout(self) -> None:
         required = (
             "focus_content_panel",
+            "focus_panel_layout",
+            "focus_header_label",
+            "focus_form_panel",
             "focus_form",
             "focus_title_label",
             "focus_title_edit",
@@ -2275,12 +2878,16 @@ class MainWindow(QMainWindow):
             "target_action_box",
             "focus_targets_label",
             "focus_targets_list",
-            "remove_target_button",
             "planned_minutes_label",
             "planned_minutes_spin",
             "idle_cutoff_label",
             "idle_cutoff_spin",
             "focus_meter_row",
+            "focus_detail_label",
+            "focus_ratio_card",
+            "focus_ratio_stack",
+            "focus_progress",
+            "focus_metric_cards",
             "focus_metrics_layout",
             "focus_button_row",
         )
@@ -2289,31 +2896,54 @@ class MainWindow(QMainWindow):
 
         panel = self.focus_content_panel
         width = panel.width() if isinstance(panel, QWidget) else 0
+        height = panel.height() if isinstance(panel, QWidget) else 0
         if width <= 0:
             width = self.focus_form_panel.width() if hasattr(self, "focus_form_panel") else 0
-        compact = width > 0 and width < 520
-        dense = width > 0 and width < 360
+        if height <= 0:
+            height = panel.sizeHint().height() if isinstance(panel, QWidget) else 0
+        compact = width > 0 and width < 680
+        dense = width > 0 and width < 420
+        tiny = (width > 0 and width < 340) or (height > 0 and height < 300)
+        micro = (width > 0 and width < 280) or (height > 0 and height < 260)
+        mode = "micro" if micro else "tiny" if tiny else "compact" if compact else "wide"
 
         form = self.focus_form
-        if getattr(self, "_focus_responsive_compact", None) != compact:
+        if getattr(self, "_focus_responsive_mode", None) != mode:
+            form.removeWidget(self.remove_target_button)
+            self.remove_target_button.hide()
             for column in range(4):
                 form.setColumnMinimumWidth(column, 0)
                 form.setColumnStretch(column, 0)
-            if compact:
+            if micro:
+                form.setColumnStretch(0, 1)
+                form.addWidget(self.focus_title_edit, 0, 0, 1, 2)
+                form.addWidget(self.planned_minutes_spin, 1, 0, 1, 2)
+            elif tiny:
                 form.setColumnStretch(0, 0)
                 form.setColumnStretch(1, 1)
-                form.addWidget(self.focus_title_label, 0, 0, 1, 2)
-                form.addWidget(self.focus_title_edit, 1, 0, 1, 2)
-                form.addWidget(self.use_focus_target_check, 2, 0, 1, 2)
-                form.addWidget(self.target_combo, 3, 0, 1, 2)
-                form.addWidget(self.target_action_box, 4, 0, 1, 2)
-                form.addWidget(self.focus_targets_label, 5, 0, 1, 2)
-                form.addWidget(self.focus_targets_list, 6, 0, 1, 2)
-                form.addWidget(self.remove_target_button, 7, 0, 1, 2)
-                form.addWidget(self.planned_minutes_label, 8, 0)
-                form.addWidget(self.planned_minutes_spin, 8, 1)
-                form.addWidget(self.idle_cutoff_label, 9, 0)
-                form.addWidget(self.idle_cutoff_spin, 9, 1)
+                form.addWidget(self.focus_title_edit, 0, 0, 1, 2)
+                form.addWidget(self.planned_minutes_spin, 1, 0, 1, 2)
+                form.addWidget(self.idle_cutoff_spin, 2, 0, 1, 2)
+            elif compact:
+                form.setColumnMinimumWidth(0, 54)
+                form.setColumnMinimumWidth(1, 70)
+                form.setColumnMinimumWidth(2, 54)
+                form.setColumnMinimumWidth(3, 70)
+                form.setColumnStretch(0, 1)
+                form.setColumnStretch(1, 1)
+                form.setColumnStretch(2, 1)
+                form.setColumnStretch(3, 1)
+                form.addWidget(self.focus_title_label, 0, 0, 1, 4)
+                form.addWidget(self.focus_title_edit, 1, 0, 1, 4)
+                form.addWidget(self.use_focus_target_check, 2, 0, 1, 4)
+                form.addWidget(self.target_combo, 3, 0, 1, 4)
+                form.addWidget(self.target_action_box, 4, 0, 1, 4)
+                form.addWidget(self.focus_targets_label, 5, 0, 1, 4)
+                form.addWidget(self.focus_targets_list, 6, 0, 1, 4)
+                form.addWidget(self.planned_minutes_label, 7, 0)
+                form.addWidget(self.planned_minutes_spin, 7, 1)
+                form.addWidget(self.idle_cutoff_label, 7, 2)
+                form.addWidget(self.idle_cutoff_spin, 7, 3)
             else:
                 form.setColumnMinimumWidth(0, 58)
                 form.setColumnMinimumWidth(1, 90)
@@ -2329,27 +2959,27 @@ class MainWindow(QMainWindow):
                 form.addWidget(self.target_combo, 1, 1, 1, 2)
                 form.addWidget(self.target_action_box, 1, 3)
                 form.addWidget(self.focus_targets_label, 2, 0)
-                form.addWidget(self.focus_targets_list, 2, 1, 1, 2)
-                form.addWidget(self.remove_target_button, 2, 3)
+                form.addWidget(self.focus_targets_list, 2, 1, 1, 3)
                 form.addWidget(self.planned_minutes_label, 3, 0)
                 form.addWidget(self.planned_minutes_spin, 3, 1)
-                form.addWidget(self.idle_cutoff_label, 4, 0)
-                form.addWidget(self.idle_cutoff_spin, 4, 1)
-            self._focus_responsive_compact = compact
+                form.addWidget(self.idle_cutoff_label, 3, 2)
+                form.addWidget(self.idle_cutoff_spin, 3, 3)
+            self._focus_responsive_mode = mode
 
-        if compact:
+        if tiny:
+            form.setContentsMargins(8, 8, 8, 8)
+        elif compact:
             form.setContentsMargins(10, 10, 10, 10)
         else:
             form.setContentsMargins(14, 12, 14, 12)
-        form.setHorizontalSpacing(8 if compact else 10)
-        form.setVerticalSpacing(7 if compact else 6)
+        form.setHorizontalSpacing(6 if tiny else 8 if compact else 10)
+        form.setVerticalSpacing(5 if tiny else 7 if compact else 6)
+
+        compact_rhythm = width > 0 and width < 560
+        _apply_panel_rhythm(self.focus_panel_layout, "tiny" if tiny else "compact" if compact_rhythm else "normal")
 
         if hasattr(self, "focus_dashboard_layout"):
-            if compact:
-                self.focus_dashboard_layout.setContentsMargins(12, 12, 12, 12)
-            else:
-                self.focus_dashboard_layout.setContentsMargins(18, 16, 18, 16)
-            self.focus_dashboard_layout.setSpacing(10 if compact else 12)
+            _apply_panel_rhythm(self.focus_dashboard_layout, "tiny" if tiny else "compact" if compact_rhythm else "normal")
 
         for label in (
             self.focus_title_label,
@@ -2358,18 +2988,79 @@ class MainWindow(QMainWindow):
             self.idle_cutoff_label,
         ):
             if isinstance(label, QLabel):
-                label.setWordWrap(True)
+                label.setWordWrap(False)
                 label.setMinimumWidth(0)
+                label.setMinimumHeight(0 if tiny else PANEL_CONTROL_HEIGHT)
+                label.setMaximumHeight(PANEL_CONTROL_HEIGHT)
+                label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
 
-        main_direction = QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
-        for layout in (self.focus_meter_row, self.focus_metrics_layout, self.focus_button_row):
-            layout.setDirection(main_direction)
+        target_controls_visible = self.use_focus_target_check.isChecked() and not dense
+        self._focus_responsive_tiny = tiny
+        self._focus_responsive_dense = dense
+        self.focus_header_label.setVisible(False)
+        self.focus_form_panel.setVisible(not micro)
+        self.focus_title_label.setVisible(not tiny)
+        self.focus_title_edit.setVisible(not micro)
+        self.use_focus_target_check.setVisible(not dense)
+        for widget in (
+            self.target_combo,
+            self.add_target_button,
+            self.target_refresh_button,
+            self.target_action_box,
+            self.focus_targets_label,
+            self.focus_targets_list,
+        ):
+            widget.setVisible(target_controls_visible)
+            widget.setEnabled(self.use_focus_target_check.isChecked())
+        self.remove_target_button.hide()
+        self.planned_minutes_label.setVisible(not tiny)
+        self.planned_minutes_spin.setVisible(not micro)
+        self.idle_cutoff_label.setVisible(not tiny)
+        self.idle_cutoff_spin.setVisible(not micro)
+        self.focus_detail_label.setVisible(False)
+        self.focus_ratio_card.setVisible(not dense)
+        self._focus_force_rate_bar = compact
+        if compact:
+            self.focus_ratio_card.setMinimumHeight(72)
+            self.focus_ratio_card.setMaximumHeight(86)
+            self.focus_ratio_stack.setMinimumHeight(30)
+            self.focus_ratio_stack.setMaximumHeight(44)
+            if hasattr(self, "focus_ratio_layout"):
+                self.focus_ratio_layout.setContentsMargins(12, 9, 12, 9)
+                self.focus_ratio_layout.setSpacing(5)
+        else:
+            self.focus_ratio_card.setMinimumHeight(92)
+            self.focus_ratio_card.setMaximumHeight(126)
+            self.focus_ratio_stack.setMinimumHeight(42)
+            self.focus_ratio_stack.setMaximumHeight(76)
+            if hasattr(self, "focus_ratio_layout"):
+                self.focus_ratio_layout.setContentsMargins(16, 14, 16, 14)
+                self.focus_ratio_layout.setSpacing(8)
+        self.update_focus_rate_display_mode()
+        for card in self.focus_metric_cards:
+            card.setVisible(not compact)
+
+        meter_direction = QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
+        metrics_direction = QBoxLayout.Direction.TopToBottom if compact else QBoxLayout.Direction.LeftToRight
+        button_direction = QBoxLayout.Direction.TopToBottom if dense else QBoxLayout.Direction.LeftToRight
+        self.focus_meter_row.setDirection(meter_direction)
+        self.focus_metrics_layout.setDirection(metrics_direction)
+        self.focus_button_row.setDirection(button_direction)
         if hasattr(self, "target_action_layout"):
             self.target_action_layout.setDirection(
-                QBoxLayout.Direction.TopToBottom if dense else QBoxLayout.Direction.LeftToRight
+                QBoxLayout.Direction.LeftToRight
             )
 
-        self.remaining_time_label.setStyleSheet("font-size: 32px;" if dense else "font-size: 40px;" if compact else "")
+        if micro:
+            self.remaining_time_label.setStyleSheet("font-size: 26px;")
+        elif tiny:
+            self.remaining_time_label.setStyleSheet("font-size: 30px;")
+        elif dense:
+            self.remaining_time_label.setStyleSheet("font-size: 32px;")
+        elif compact:
+            self.remaining_time_label.setStyleSheet("font-size: 34px;")
+        else:
+            self.remaining_time_label.setStyleSheet("")
         if hasattr(self, "focus_ratio_ring"):
             self.focus_ratio_ring.setMinimumSize(64 if dense else 72, 64 if dense else 72)
 
@@ -2391,12 +3082,12 @@ class MainWindow(QMainWindow):
         return card
 
     def _build_pomodoro_panel(self) -> QWidget:
-        panel = QWidget()
+        panel = ResizeAwareWidget(self.update_pomodoro_panel_responsive_layout)
         panel.setObjectName("pomodoroPanel")
         self.pomodoro_panel = panel
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(20, 16, 20, 16)
-        layout.setSpacing(12)
+        self.pomodoro_panel_layout = layout
+        _apply_panel_rhythm(layout)
 
         heading_row = QHBoxLayout()
         heading_row.setSpacing(8)
@@ -2426,8 +3117,15 @@ class MainWindow(QMainWindow):
         self.pomodoro_detail_label.setWordWrap(True)
         layout.addWidget(self.pomodoro_detail_label)
 
-        control_row = QHBoxLayout()
-        control_row.setSpacing(8)
+        controls_panel = QWidget()
+        controls_panel.setObjectName("pomodoroControlsPanel")
+        controls_layout = QVBoxLayout(controls_panel)
+        self.pomodoro_controls_layout = controls_layout
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(8)
+        input_row = QHBoxLayout()
+        self.pomodoro_input_row = input_row
+        input_row.setSpacing(8)
         self.pomodoro_minutes_spin = QSpinBox()
         self.pomodoro_minutes_spin.setRange(5, 90)
         self.pomodoro_minutes_spin.setValue(25)
@@ -2440,6 +3138,13 @@ class MainWindow(QMainWindow):
         self.break_minutes_spin.setSuffix("분 휴식")
         _stabilize_control(self.break_minutes_spin, 120)
         self.break_minutes_spin.valueChanged.connect(lambda _value: self.update_pomodoro_display())
+        input_row.addWidget(self.pomodoro_minutes_spin)
+        input_row.addWidget(self.break_minutes_spin)
+        controls_layout.addLayout(input_row)
+
+        button_row = QHBoxLayout()
+        self.pomodoro_button_row = button_row
+        button_row.setSpacing(8)
         self.start_pomodoro_button = QPushButton("시작")
         self.start_pomodoro_button.setObjectName("primaryButton")
         _stabilize_control(self.start_pomodoro_button, 68)
@@ -2453,16 +3158,48 @@ class MainWindow(QMainWindow):
         _stabilize_control(self.reset_pomodoro_button, 72)
         self.reset_pomodoro_button.clicked.connect(self.reset_pomodoro)
 
-        control_row.addWidget(self.pomodoro_minutes_spin)
-        control_row.addWidget(self.break_minutes_spin)
-        control_row.addStretch(1)
-        control_row.addWidget(self.start_pomodoro_button)
-        control_row.addWidget(self.pause_pomodoro_button)
-        control_row.addWidget(self.reset_pomodoro_button)
-        layout.addLayout(control_row)
+        for control in (
+            self.pomodoro_minutes_spin,
+            self.break_minutes_spin,
+            self.start_pomodoro_button,
+            self.pause_pomodoro_button,
+            self.reset_pomodoro_button,
+        ):
+            control.setMinimumWidth(0)
+            control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        button_row.addWidget(self.start_pomodoro_button)
+        button_row.addWidget(self.pause_pomodoro_button)
+        button_row.addWidget(self.reset_pomodoro_button)
+        controls_layout.addLayout(button_row)
+        layout.addWidget(controls_panel)
 
         self.update_pomodoro_display()
+        self.update_pomodoro_panel_responsive_layout()
         return panel
+
+    def update_pomodoro_panel_responsive_layout(self) -> None:
+        required = (
+            "pomodoro_panel",
+            "pomodoro_panel_layout",
+            "pomodoro_input_row",
+            "pomodoro_button_row",
+            "pomodoro_status_label",
+            "pomodoro_time_label",
+            "pomodoro_detail_label",
+        )
+        if any(not hasattr(self, name) for name in required):
+            return
+        width = self.pomodoro_panel.width()
+        height = self.pomodoro_panel.height()
+        compact = (width > 0 and width < 380) or (height > 0 and height < 190)
+        tiny = width > 0 and width < 260
+        _apply_panel_rhythm(self.pomodoro_panel_layout, "tiny" if tiny else "compact" if compact else "normal")
+        direction = QBoxLayout.Direction.TopToBottom if tiny else QBoxLayout.Direction.LeftToRight
+        self.pomodoro_input_row.setDirection(direction)
+        self.pomodoro_button_row.setDirection(direction)
+        self.pomodoro_detail_label.setVisible(not tiny)
+        self.pomodoro_status_label.setVisible(not tiny)
+        self.pomodoro_time_label.setStyleSheet("font-size: 20px;" if tiny else "")
 
     def _build_today_panel(self) -> QWidget:
         panel = QWidget()
@@ -2569,40 +3306,12 @@ class MainWindow(QMainWindow):
         return panel
 
     def _build_memo_panel(self) -> QWidget:
-        panel = QWidget()
+        panel = ResizeAwareWidget(self.update_memo_panel_responsive_layout)
         panel.setObjectName("plainPanel")
+        self.memo_content_panel = panel
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
-
-        folder_strip = QWidget()
-        folder_strip.setObjectName("memoFolderStrip")
-        note_meta_row = QHBoxLayout(folder_strip)
-        note_meta_row.setContentsMargins(10, 8, 10, 8)
-        note_meta_row.setSpacing(8)
-        folder_label = QLabel("폴더")
-        folder_label.setObjectName("eyebrowLabel")
-        note_meta_row.addWidget(folder_label)
-        self.quick_note_folder_combo = QComboBox()
-        _stabilize_control(self.quick_note_folder_combo, 150)
-        self.quick_note_folder_combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.quick_note_folder_combo.customContextMenuRequested.connect(
-            lambda position: self.show_note_folder_combo_context_menu(self.quick_note_folder_combo, position)
-        )
-        note_meta_row.addWidget(self.quick_note_folder_combo, 1)
-        folder_view_button = QPushButton("폴더 보기")
-        folder_view_button.setObjectName("ghostButton")
-        _stabilize_control(folder_view_button, 92)
-        folder_view_button.setMaximumWidth(104)
-        folder_view_button.clicked.connect(lambda: self.open_note_folder_window(self._folder_id_from_combo("note_filter_combo")))
-        note_meta_row.addWidget(folder_view_button)
-        folder_settings_button = QPushButton("폴더 관리")
-        folder_settings_button.setObjectName("ghostButton")
-        _stabilize_control(folder_settings_button, 92)
-        folder_settings_button.setMaximumWidth(104)
-        folder_settings_button.clicked.connect(self.show_note_folder_settings)
-        note_meta_row.addWidget(folder_settings_button)
-        layout.addWidget(folder_strip)
+        self.memo_panel_layout = layout
+        _apply_panel_rhythm(layout)
 
         self.memo_splitter = QSplitter(Qt.Orientation.Vertical)
         self.memo_splitter.setObjectName("memoSplitter")
@@ -2610,7 +3319,9 @@ class MainWindow(QMainWindow):
 
         memo_editor = QWidget()
         memo_editor.setObjectName("memoEditorCard")
+        self.memo_editor_card = memo_editor
         memo_editor_layout = QVBoxLayout(memo_editor)
+        self.memo_editor_layout = memo_editor_layout
         memo_editor_layout.setContentsMargins(12, 11, 12, 11)
         memo_editor_layout.setSpacing(9)
 
@@ -2621,10 +3332,22 @@ class MainWindow(QMainWindow):
         memo_editor_header.setSpacing(6)
         memo_editor_title = QLabel("메모 작성")
         memo_editor_title.setObjectName("eyebrowLabel")
+        _stabilize_panel_caption(memo_editor_title)
+        self.memo_editor_title = memo_editor_title
         memo_editor_header.addWidget(memo_editor_title)
+        self.quick_note_folder_combo = QComboBox()
+        self.quick_note_folder_combo.setObjectName("quickNoteFolderCombo")
+        _stabilize_control(self.quick_note_folder_combo, 118)
+        self.quick_note_folder_combo.setMaximumWidth(172)
+        self.quick_note_folder_combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.quick_note_folder_combo.customContextMenuRequested.connect(
+            lambda position: self.show_note_folder_combo_context_menu(self.quick_note_folder_combo, position)
+        )
+        memo_editor_header.addWidget(self.quick_note_folder_combo, 1)
         memo_editor_header.addStretch(1)
         memo_shortcut_label = QLabel("Ctrl + Enter")
         memo_shortcut_label.setObjectName("memoHintLabel")
+        self.memo_shortcut_label = memo_shortcut_label
         memo_editor_header.addWidget(memo_shortcut_label)
         attach_note_button = QPushButton("첨부")
         attach_note_button.setObjectName("memoAttachButton")
@@ -2646,7 +3369,7 @@ class MainWindow(QMainWindow):
         self.quick_note_editor = QPlainTextEdit()
         self.quick_note_editor.setObjectName("memoInput")
         self.quick_note_editor.setPlaceholderText("생각나는 것을 적고 Ctrl+Enter로 저장")
-        self.quick_note_editor.setMinimumHeight(72)
+        self.quick_note_editor.setMinimumHeight(56)
         memo_editor_layout.addWidget(self.quick_note_editor, 1)
 
         self.pending_attachments_label = QLabel("")
@@ -2663,17 +3386,36 @@ class MainWindow(QMainWindow):
 
         notes_container = QWidget()
         notes_container.setObjectName("memoHistoryCard")
+        self.memo_history_card = notes_container
         notes_layout = QVBoxLayout(notes_container)
+        self.memo_history_layout = notes_layout
         notes_layout.setContentsMargins(12, 11, 12, 11)
         notes_layout.setSpacing(10)
         notes_filter_row = QHBoxLayout()
+        self.memo_history_filter_row = notes_filter_row
         saved_notes_label = QLabel("저장된 메모")
         saved_notes_label.setObjectName("eyebrowLabel")
+        _stabilize_panel_caption(saved_notes_label)
+        self.memo_saved_notes_label = saved_notes_label
         notes_filter_row.addWidget(saved_notes_label)
         notes_filter_row.addStretch(1)
         self.note_filter_combo = QComboBox()
         _stabilize_control(self.note_filter_combo, 150)
         self.note_filter_combo.currentIndexChanged.connect(lambda _index: self.refresh_notes())
+        folder_view_button = QPushButton("폴더 보기")
+        folder_view_button.setObjectName("ghostButton")
+        _stabilize_control(folder_view_button, 76)
+        folder_view_button.setMaximumWidth(86)
+        folder_view_button.clicked.connect(lambda: self.open_note_folder_window(self._folder_id_from_combo("note_filter_combo")))
+        self.memo_folder_view_button = folder_view_button
+        notes_filter_row.addWidget(folder_view_button)
+        folder_settings_button = QPushButton("폴더 관리")
+        folder_settings_button.setObjectName("ghostButton")
+        _stabilize_control(folder_settings_button, 76)
+        folder_settings_button.setMaximumWidth(86)
+        folder_settings_button.clicked.connect(self.show_note_folder_settings)
+        self.memo_folder_settings_button = folder_settings_button
+        notes_filter_row.addWidget(folder_settings_button)
         notes_filter_row.addWidget(self.note_filter_combo)
         notes_layout.addLayout(notes_filter_row)
 
@@ -2686,27 +3428,80 @@ class MainWindow(QMainWindow):
         self.notes_list.customContextMenuRequested.connect(self.show_note_context_menu)
         notes_layout.addWidget(self.notes_list, 1)
         self.memo_splitter.addWidget(notes_container)
-        self.memo_splitter.setStretchFactor(0, 1)
+        self.memo_splitter.setStretchFactor(0, 0)
         self.memo_splitter.setStretchFactor(1, 1)
-        self.memo_splitter.setSizes([220, 220])
+        self.memo_splitter.setSizes([150, 300])
         layout.addWidget(self.memo_splitter, 1)
         delete_note_shortcut = QShortcut(QKeySequence("Delete"), self.notes_list)
         delete_note_shortcut.activated.connect(self.delete_selected_quick_note)
+        self.update_memo_panel_responsive_layout()
         return panel
 
+    def update_memo_panel_responsive_layout(self) -> None:
+        required = (
+            "memo_content_panel",
+            "memo_panel_layout",
+            "quick_note_folder_combo",
+            "memo_folder_view_button",
+            "memo_folder_settings_button",
+            "memo_editor_layout",
+            "memo_editor_title",
+            "memo_shortcut_label",
+            "quick_note_editor",
+            "memo_history_card",
+            "memo_history_layout",
+            "memo_saved_notes_label",
+            "note_filter_combo",
+            "memo_splitter",
+        )
+        if any(not hasattr(self, name) for name in required):
+            return
+        panel = self.memo_content_panel
+        width = panel.width() if isinstance(panel, QWidget) else 0
+        height = panel.height() if isinstance(panel, QWidget) else 0
+        compact = (width > 0 and width < 430) or (height > 0 and height < 420)
+        tiny = (width > 0 and width < 300) or (height > 0 and height < 320)
+        mode = "tiny" if tiny else "compact" if compact else "wide"
+        previous_mode = getattr(self, "_memo_responsive_mode", None)
+
+        _apply_panel_rhythm(self.memo_panel_layout, "tiny" if tiny else "compact" if compact else "normal")
+        self.memo_editor_layout.setContentsMargins(10 if compact else 12, 9 if compact else 11, 10 if compact else 12, 9 if compact else 11)
+        self.memo_editor_layout.setSpacing(6 if compact else 9)
+        self.memo_history_layout.setContentsMargins(10 if compact else 12, 9 if compact else 11, 10 if compact else 12, 9 if compact else 11)
+        self.memo_history_layout.setSpacing(6 if compact else 10)
+
+        self.quick_note_folder_combo.setVisible(not tiny)
+        self.memo_folder_view_button.setVisible(not tiny)
+        self.memo_folder_settings_button.setVisible(not tiny)
+        self.memo_editor_title.setVisible(not tiny)
+        self.memo_shortcut_label.setVisible(not compact)
+        self.memo_saved_notes_label.setVisible(not tiny)
+        self.note_filter_combo.setVisible(not tiny)
+        self.memo_history_card.setVisible(not tiny)
+        self.quick_note_editor.setMinimumHeight(40 if tiny else 48 if compact else 56)
+        if mode != previous_mode and tiny:
+            self.memo_splitter.setSizes([1, 0])
+        elif previous_mode == "tiny" and compact:
+            self.memo_splitter.setSizes([120, 220])
+        elif previous_mode == "tiny":
+            self.memo_splitter.setSizes([150, 300])
+        self._memo_responsive_mode = mode
+
     def _build_link_favorites_panel(self) -> QWidget:
-        panel = QWidget()
+        panel = ResizeAwareWidget(self.update_link_favorites_responsive_layout)
+        self.link_favorites_content_panel = panel
+        self.link_favorites_columns = 1
+        self.link_favorite_buttons_by_id: dict[int, QWidget] = {}
+        self._link_favorites_stretch_rows = 0
         panel.setObjectName("plainPanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(14, 12, 14, 12)
-        layout.setSpacing(10)
+        self.link_favorites_panel_layout = layout
+        _apply_panel_rhythm(layout)
 
         heading_row = QHBoxLayout()
-        title = QLabel("바로가기")
-        title.setObjectName("eyebrowLabel")
-        heading_row.addWidget(title)
         heading_row.addStretch(1)
         favorites_settings_button = QPushButton("설정")
+        self.favorites_settings_button = favorites_settings_button
         favorites_settings_button.setObjectName("softButton")
         _stabilize_control(favorites_settings_button, 68)
         favorites_settings_button.setMaximumWidth(78)
@@ -2723,13 +3518,41 @@ class MainWindow(QMainWindow):
         favorites_widget = QWidget()
         favorites_widget.setObjectName("favoritesShelf")
         favorites_widget.setMinimumWidth(0)
-        self.link_favorites_layout = QVBoxLayout(favorites_widget)
+        self.link_favorites_layout = QGridLayout(favorites_widget)
         self.link_favorites_layout.setContentsMargins(0, 0, 0, 0)
-        self.link_favorites_layout.setSpacing(8)
+        self.link_favorites_layout.setHorizontalSpacing(8)
+        self.link_favorites_layout.setVerticalSpacing(8)
         self.link_favorites_area.setWidget(favorites_widget)
         layout.addWidget(self.link_favorites_area, 1)
 
         return panel
+
+    def _link_favorites_column_count(self) -> int:
+        width = 0
+        panel = getattr(self, "link_favorites_content_panel", None)
+        if isinstance(panel, QWidget):
+            width = panel.width()
+        area = getattr(self, "link_favorites_area", None)
+        if width <= 0 and isinstance(area, QScrollArea):
+            width = area.viewport().width()
+        if width >= 620:
+            return 3
+        if width >= 420:
+            return 2
+        return 1
+
+    def update_link_favorites_responsive_layout(self) -> None:
+        if not hasattr(self, "link_favorites_layout") or not hasattr(self, "link_favorites_panel_layout"):
+            return
+        columns = self._link_favorites_column_count()
+        compact = columns == 1
+        _apply_panel_rhythm(self.link_favorites_panel_layout, "compact" if compact else "normal")
+        self.link_favorites_layout.setHorizontalSpacing(6 if compact else 8)
+        self.link_favorites_layout.setVerticalSpacing(6 if compact else 8)
+        self.link_favorites_area.setMinimumHeight(88 if compact else 120)
+        if getattr(self, "link_favorites_columns", 1) != columns:
+            self.link_favorites_columns = columns
+            self.refresh_link_favorites()
 
     def _build_media_panel(self) -> QWidget:
         panel = QWidget()
@@ -2861,6 +3684,7 @@ class MainWindow(QMainWindow):
         accent = _normalize_accent_color(getattr(self.preferences, "accent_color", "#4f8c6b"))
         accent_hover = _accent_hover_color(accent)
         accent_soft = _accent_rgba(accent, 0.10)
+        accent_handle = _accent_rgba(accent, 0.18)
         button_color = _normalize_accent_color(getattr(self.preferences, "button_color", "#4f8c6b"))
         button_hover = _accent_hover_color(button_color)
         is_dark_theme = _normalize_theme(getattr(self.preferences, "appearance_theme", "light")) == "dark"
@@ -2875,24 +3699,28 @@ class MainWindow(QMainWindow):
             button_hover,
             is_dark_theme,
         )
+        main_font_family = _css_font_stack(getattr(self.preferences, "main_font_family", ""))
+        main_font_size = _normalize_main_font_size(getattr(self.preferences, "main_font_size", 13))
+        spin_up_arrow, spin_down_arrow = _spin_arrow_asset_urls(palette)
         _apply_qt_palette(accent, palette)
         style = (
             """
             QMainWindow {
                 background: #ececed;
                 color: #1b1b20;
-                font-family: "Pretendard", "Segoe UI", "Malgun Gothic", sans-serif;
+                font-family: __MAIN_FONT_FAMILY__;
                 font-size: 13px;
             }
             QWidget {
                 color: #1b1b20;
-                font-family: "Pretendard", "Segoe UI", "Malgun Gothic", sans-serif;
+                font-family: __MAIN_FONT_FAMILY__;
                 font-size: 13px;
             }
             QDialog {
                 background: #ffffff;
                 color: #1b1b20;
-                font-family: "Pretendard", "Segoe UI", "Malgun Gothic", sans-serif;
+                font-family: __MAIN_FONT_FAMILY__;
+                font-size: 13px;
             }
             QLabel {
                 background: transparent;
@@ -3008,23 +3836,42 @@ class MainWindow(QMainWindow):
                 border: none;
             }
             QWidget#checklistAddPanel {
-                background: #f4f4f6;
-                border: 1px solid #f0f0f3;
-                border-radius: 14px;
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
             }
-            QWidget#memoFolderStrip {
+            QLineEdit#checklistInput {
                 background: #f4f4f6;
-                border: 1px solid #f0f0f3;
-                border-radius: 13px;
+                border: 1px solid #e7e7ec;
+                border-radius: 11px;
+                color: #1b1b20;
+                font-size: 13.5px;
+                padding: 9px 11px;
+            }
+            QLineEdit#checklistInput:focus {
+                border-color: #5a5ad6;
+                background: #ffffff;
+            }
+            QPushButton#checklistAddButton {
+                background: __ACTION_BUTTON_BG__;
+                border: 1px solid __ACTION_BUTTON_BORDER__;
+                border-radius: 11px;
+                color: __ACTION_BUTTON_TEXT__;
+                font-weight: 700;
+                min-height: 36px;
+                padding: 0px 14px;
+            }
+            QPushButton#checklistAddButton:hover {
+                background: __ACTION_BUTTON_HOVER_BG__;
             }
             QScrollArea#checklistItemsArea, QScrollArea#favoritesShelfArea {
-                background: #f4f4f6;
-                border: 1px solid #f0f0f3;
-                border-radius: 14px;
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
             }
             QScrollArea#checklistItemsArea::viewport, QScrollArea#favoritesShelfArea::viewport {
-                background: #f4f4f6;
-                border-radius: 14px;
+                background: #ffffff;
+                border-radius: 15px;
             }
             QScrollArea#checklistItemsArea QWidget, QScrollArea#favoritesShelfArea QWidget {
                 background: transparent;
@@ -3166,6 +4013,30 @@ class MainWindow(QMainWindow):
                 border: 1px solid #f0f0f3;
                 border-radius: 13px;
             }
+            QWidget#timelineFilterSegment {
+                background: #e9e9ef;
+                border: 1px solid #e7e7ec;
+                border-radius: 10px;
+            }
+            QToolButton#timelineFilterButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                color: #9c9ca6;
+                font-size: 11px;
+                font-weight: 600;
+                min-height: 24px;
+                padding: 3px 9px;
+            }
+            QToolButton#timelineFilterButton:hover {
+                background: rgba(90, 90, 214, 0.10);
+                color: #5c5c66;
+            }
+            QToolButton#timelineFilterButton:checked {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                color: #1b1b20;
+            }
             QWidget#timelineStatStrip {
                 background: transparent;
             }
@@ -3197,23 +4068,23 @@ class MainWindow(QMainWindow):
             QLabel#checklistSummaryBadge {
                 background: rgba(90, 90, 214, 0.10);
                 border: 1px solid #5a5ad6;
-                border-radius: 8px;
+                border-radius: 10px;
                 color: #5a5ad6;
                 font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
-                font-size: 10px;
+                font-size: 12px;
                 font-weight: 700;
-                padding: 3px 7px;
+                padding: 5px 10px;
             }
             QProgressBar#checklistProgress {
                 background: #e9e9ef;
                 border: none;
-                border-radius: 4px;
-                max-height: 8px;
-                min-height: 8px;
+                border-radius: 5px;
+                max-height: 10px;
+                min-height: 10px;
             }
             QProgressBar#checklistProgress::chunk {
                 background: #5a5ad6;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QWidget#focusPanel, QWidget#pomodoroPanel, QWidget#timelinePanel, QWidget#checklistPanel,
             QWidget#plainPanel, QWidget#compactFavoritesPanel {
@@ -3248,6 +4119,14 @@ class MainWindow(QMainWindow):
             }
             QWidget#featureBox {
                 background: transparent;
+            }
+            QWidget#featureResizeGrip {
+                background: transparent;
+                border: none;
+            }
+            QWidget#featureHeaderBand {
+                background: transparent;
+                border: none;
             }
             QWidget#featureCell {
                 background: transparent;
@@ -3286,11 +4165,19 @@ class MainWindow(QMainWindow):
             QWidget#featureMoveBar {
                 background: transparent;
                 border: none;
-                border-radius: 9px;
+                border-radius: 5px;
             }
             QWidget#featureMoveBar:hover {
-                background: rgba(90, 90, 214, 0.10);
-                border: 1px solid #f0f0f3;
+                background: rgba(90, 90, 214, 0.16);
+                border: none;
+            }
+            QWidget#featureMoveBar[hovering="true"] {
+                background: rgba(90, 90, 214, 0.16);
+                border: none;
+            }
+            QWidget#featureMoveBar[dragging="true"] {
+                background: #5a5ad6;
+                border: none;
             }
             QWidget#columnDropZone {
                 background: rgba(90, 90, 214, 0.05);
@@ -3361,6 +4248,81 @@ class MainWindow(QMainWindow):
             QLabel#settingsColorLabel {
                 color: #1b1b20;
                 font-weight: 700;
+            }
+            QWidget#favoritesSettingsHeader, QWidget#favoritesSettingsListCard, QWidget#favoritesSettingsEditorCard {
+                background: #f4f4f6;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
+            }
+            QWidget#favoritesDisplayPanel {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 13px;
+            }
+            QListWidget#favoritesSettingsList {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 13px;
+                padding: 6px;
+            }
+            QListWidget#favoritesSettingsList::item {
+                border-radius: 9px;
+                color: #5c5c66;
+                margin: 2px 0px;
+                min-height: 34px;
+                padding: 7px 9px;
+            }
+            QListWidget#favoritesSettingsList::item:hover {
+                background: rgba(90, 90, 214, 0.10);
+                color: #1b1b20;
+            }
+            QListWidget#favoritesSettingsList::item:selected {
+                background: rgba(90, 90, 214, 0.10);
+                color: #5a5ad6;
+                font-weight: 700;
+            }
+            QLabel#favoriteIconPreview {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
+                color: #5a5ad6;
+                font-size: 18px;
+                font-weight: 800;
+            }
+            QWidget#itemTypeSettingsHeader, QWidget#itemTypeSettingsListCard, QWidget#itemTypeSettingsEditorCard {
+                background: #f4f4f6;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
+            }
+            QListWidget#itemTypeSettingsList {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 13px;
+                padding: 6px;
+            }
+            QListWidget#itemTypeSettingsList::item {
+                border-radius: 9px;
+                color: #5c5c66;
+                margin: 2px 0px;
+                min-height: 34px;
+                padding: 7px 9px;
+            }
+            QListWidget#itemTypeSettingsList::item:hover {
+                background: rgba(90, 90, 214, 0.10);
+                color: #1b1b20;
+            }
+            QListWidget#itemTypeSettingsList::item:selected {
+                background: rgba(90, 90, 214, 0.10);
+                color: #5a5ad6;
+                font-weight: 700;
+            }
+            QLabel#itemTypePreviewBadge {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
+                color: #5a5ad6;
+                font-size: 15px;
+                font-weight: 800;
             }
             QWidget#timelineWaitingRail {
                 background: #f4f4f6;
@@ -3449,10 +4411,22 @@ class MainWindow(QMainWindow):
                 outline: 0;
                 padding: 4px;
             }
+            QAbstractItemView#focusTargetComboView::item {
+                min-height: 22px;
+                padding: 2px 8px;
+            }
+            QListWidget#focusTargetsList {
+                padding: 2px;
+            }
+            QListWidget#focusTargetsList::item {
+                min-height: 22px;
+                padding: 1px 6px;
+                margin: 0px;
+            }
             QSpinBox, QTimeEdit {
                 background: #f4f4f6;
                 border: 1px solid #e7e7ec;
-                border-radius: 11px;
+                border-radius: 12px;
                 color: #1b1b20;
                 min-height: 30px;
                 padding: 4px 30px 4px 8px;
@@ -3469,7 +4443,8 @@ class MainWindow(QMainWindow):
                 width: 24px;
                 border-left: 1px solid #e7e7ec;
                 border-bottom: 1px solid #f0f0f3;
-                border-top-right-radius: 10px;
+                border-top-right-radius: 11px;
+                border-bottom-right-radius: 0px;
                 background: #fbfbfc;
             }
             QSpinBox::down-button, QTimeEdit::down-button {
@@ -3477,8 +4452,19 @@ class MainWindow(QMainWindow):
                 subcontrol-position: bottom right;
                 width: 24px;
                 border-left: 1px solid #e7e7ec;
-                border-bottom-right-radius: 10px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 11px;
                 background: #fbfbfc;
+            }
+            QSpinBox::up-arrow, QTimeEdit::up-arrow {
+                image: url(__SPIN_UP_ARROW__);
+                width: 9px;
+                height: 9px;
+            }
+            QSpinBox::down-arrow, QTimeEdit::down-arrow {
+                image: url(__SPIN_DOWN_ARROW__);
+                width: 9px;
+                height: 9px;
             }
             QSpinBox::up-button:hover, QSpinBox::down-button:hover,
             QTimeEdit::up-button:hover, QTimeEdit::down-button:hover {
@@ -3617,7 +4603,7 @@ class MainWindow(QMainWindow):
             QPushButton#favoriteButton, QToolButton#favoriteButton {
                 background: __BUTTON_BG__;
                 border: 1px solid __BUTTON_BORDER__;
-                border-radius: 14px;
+                border-radius: 12px;
                 color: __BUTTON_TEXT__;
                 font-weight: 600;
                 min-height: 56px;
@@ -3724,7 +4710,7 @@ class MainWindow(QMainWindow):
             }
             QWidget#checklistRow:hover, QWidget#checklistRowCompleted:hover {
                 background: #f4f4f6;
-                border-radius: 10px;
+                border-radius: 9px;
             }
             QWidget#checklistRowCompleted {
                 background: transparent;
@@ -3732,16 +4718,16 @@ class MainWindow(QMainWindow):
             QCheckBox#checklistItemCheck, QCheckBox#checklistItemCheckDone {
                 background: transparent;
                 border: none;
-                min-height: 22px;
+                min-height: 19px;
                 padding: 0px;
                 spacing: 0px;
             }
             QCheckBox#checklistItemCheck::indicator, QCheckBox#checklistItemCheckDone::indicator {
-                width: 18px;
-                height: 18px;
-                border-radius: 6px;
+                width: 17px;
+                height: 17px;
+                border-radius: 5px;
                 border: 2px solid #e7e7ec;
-                background: #ffffff;
+                background: transparent;
             }
             QCheckBox#checklistItemCheck::indicator:hover,
             QCheckBox#checklistItemCheckDone::indicator:hover {
@@ -3759,36 +4745,22 @@ class MainWindow(QMainWindow):
             }
             QLabel#checklistItemTitle {
                 color: #1b1b20;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
             }
             QLabel#checklistItemTitleDone {
                 color: #9c9ca6;
-                font-size: 14px;
+                font-size: 13px;
                 font-weight: 600;
                 text-decoration: line-through;
             }
-            QLabel#checklistTimeBadge, QLabel#checklistKindBadge, QLabel#checklistDetailBadge {
-                border-radius: 8px;
-                font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
-                font-size: 10px;
-                font-weight: 600;
-                padding: 3px 7px;
-            }
-            QLabel#checklistTimeBadge {
-                background: rgba(90, 90, 214, 0.10);
-                border: 1px solid #5a5ad6;
-                color: #5a5ad6;
-            }
-            QLabel#checklistKindBadge {
-                background: #f4f4f6;
-                border: 1px solid #f0f0f3;
-                color: #5c5c66;
-            }
-            QLabel#checklistDetailBadge {
-                background: #ffffff;
-                border: 1px solid #e7e7ec;
+            QLabel#checklistItemMeta, QLabel#checklistItemMetaDone {
+                background: transparent;
+                border: none;
                 color: #9c9ca6;
+                font-size: 11px;
+                font-weight: 500;
+                padding: 0px;
             }
             QMenu {
                 background: #ffffff;
@@ -3952,7 +4924,7 @@ class MainWindow(QMainWindow):
                 border-radius: 8px;
                 color: #5c5c66;
                 font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
-                font-size: 10px;
+                font-size: 11px;
                 font-weight: 600;
                 padding: 3px 7px;
             }
@@ -3961,7 +4933,7 @@ class MainWindow(QMainWindow):
                 border: 1px solid #e7e7ec;
                 border-radius: 8px;
                 color: #5c5c66;
-                font-size: 10px;
+                font-size: 11px;
                 font-weight: 600;
                 padding: 3px 7px;
             }
@@ -3970,14 +4942,14 @@ class MainWindow(QMainWindow):
                 border: 1px solid #5a5ad6;
                 border-radius: 8px;
                 color: #5a5ad6;
-                font-size: 10px;
+                font-size: 11px;
                 font-weight: 700;
                 padding: 3px 7px;
             }
             QLabel#noteBodyLabel {
                 color: #1b1b20;
-                font-size: 12px;
-                font-weight: 500;
+                font-size: 13px;
+                font-weight: 600;
             }
             QListWidget#waitingList {
                 background: #ffffff;
@@ -4105,10 +5077,12 @@ class MainWindow(QMainWindow):
             }
             """
         )
+        style = _scale_style_font_sizes(style, main_font_size)
         self.setStyleSheet(
             _replace_style_tokens(
                 style,
                 (
+                    ("__MAIN_FONT_FAMILY__", main_font_family),
                     ("__BUTTON_BG__", button_palette["bg"]),
                     ("__BUTTON_HOVER_BG__", button_palette["hover_bg"]),
                     ("__BUTTON_BORDER__", button_palette["border"]),
@@ -4118,9 +5092,12 @@ class MainWindow(QMainWindow):
                     ("__ACTION_BUTTON_HOVER_BG__", action_button_palette["hover_bg"]),
                     ("__ACTION_BUTTON_BORDER__", action_button_palette["border"]),
                     ("__ACTION_BUTTON_TEXT__", action_button_palette["text"]),
+                    ("__SPIN_UP_ARROW__", spin_up_arrow),
+                    ("__SPIN_DOWN_ARROW__", spin_down_arrow),
                     ("#5a5ad6", accent),
                     ("#7676e8", accent_hover),
                     ("rgba(90, 90, 214, 0.10)", accent_soft),
+                    ("rgba(90, 90, 214, 0.16)", accent_handle),
                     ("#ececed", palette["bg"]),
                     ("#fbfbfc", palette["app"]),
                     ("#ffffff", palette["surface"]),
@@ -4149,7 +5126,8 @@ class MainWindow(QMainWindow):
         stack = getattr(self, "focus_ratio_stack", None)
         if not isinstance(stack, QStackedWidget):
             return
-        stack.setCurrentIndex(1 if _normalize_focus_rate_display(self.preferences.focus_rate_display) == "bar" else 0)
+        force_bar = bool(getattr(self, "_focus_force_rate_bar", False))
+        stack.setCurrentIndex(1 if force_bar or _normalize_focus_rate_display(self.preferences.focus_rate_display) == "bar" else 0)
 
     def sync_theme_segment(self) -> None:
         theme = _normalize_theme(getattr(self.preferences, "appearance_theme", "light"))
@@ -4300,6 +5278,18 @@ class MainWindow(QMainWindow):
             )
 
     def toggle_focus_target_controls(self, enabled: bool) -> None:
+        if enabled and hasattr(self, "target_combo"):
+            self.refresh_targets()
+            if not self.target_combo.currentData():
+                for index in range(self.target_combo.count()):
+                    if self.target_combo.itemData(index):
+                        self.target_combo.setCurrentIndex(index)
+                        break
+        target_controls_visible = (
+            bool(enabled)
+            and not bool(getattr(self, "_focus_responsive_tiny", False))
+            and not bool(getattr(self, "_focus_responsive_dense", False))
+        )
         for widget_name in (
             "target_combo",
             "add_target_button",
@@ -4307,28 +5297,57 @@ class MainWindow(QMainWindow):
             "target_action_box",
             "focus_targets_label",
             "focus_targets_list",
-            "remove_target_button",
         ):
             widget = getattr(self, widget_name, None)
             if isinstance(widget, QWidget):
                 widget.setEnabled(enabled)
-                widget.setVisible(enabled)
+                widget.setVisible(target_controls_visible)
+        if hasattr(self, "remove_target_button"):
+            self.remove_target_button.hide()
         if not enabled and hasattr(self, "focus_targets_list"):
             self.focus_targets_list.clear()
+        if hasattr(self, "focus_content_panel"):
+            QTimer.singleShot(0, self.update_focus_panel_responsive_layout)
 
-    def add_focus_target(self) -> None:
+    def add_focus_target(self, target: dict[str, str] | None = None, show_duplicate_message: bool = True) -> None:
         if hasattr(self, "use_focus_target_check") and not self.use_focus_target_check.isChecked():
             return
-        target = self.target_combo.currentData()
+        target = target or self.target_combo.currentData()
         if not target:
             return
         if self._has_focus_target(target):
-            self.statusBar().showMessage("이미 지정된 창입니다.", 1800)
+            if show_duplicate_message:
+                self.statusBar().showMessage("이미 지정된 창입니다.", 1800)
             return
         item = QListWidgetItem(_target_label(target["process_name"], target["window_title"]))
         item.setData(Qt.ItemDataRole.UserRole, dict(target))
+        item.setSizeHint(QSize(0, 24))
         self.focus_targets_list.addItem(item)
         self.statusBar().showMessage("지정 창을 추가했습니다.", 1800)
+
+    def add_focus_target_from_combo(self) -> None:
+        if hasattr(self, "use_focus_target_check") and self.use_focus_target_check.isChecked():
+            self.add_focus_target(show_duplicate_message=False)
+
+    def add_focus_target_from_combo_index(self, model_index) -> None:
+        if not (hasattr(self, "use_focus_target_check") and self.use_focus_target_check.isChecked()):
+            return
+        row = model_index.row()
+        target = self.target_combo.itemData(row)
+        if not target:
+            return
+        self.target_combo.setCurrentIndex(row)
+        self.add_focus_target(dict(target), show_duplicate_message=False)
+
+    def show_focus_target_context_menu(self, position: QPoint) -> None:
+        item = self.focus_targets_list.itemAt(position)
+        if item is None:
+            return
+        self.focus_targets_list.setCurrentItem(item)
+        menu = _style_popup_menu(QMenu(self.focus_targets_list), self.focus_targets_list)
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(self.remove_selected_focus_target)
+        menu.exec(self.focus_targets_list.mapToGlobal(position))
 
     def remove_selected_focus_target(self) -> None:
         row = self.focus_targets_list.currentRow()
@@ -4348,6 +5367,12 @@ class MainWindow(QMainWindow):
         if targets:
             return targets
         target = self.target_combo.currentData()
+        if not target:
+            for index in range(self.target_combo.count()):
+                candidate = self.target_combo.itemData(index)
+                if candidate:
+                    target = candidate
+                    break
         return [dict(target)] if target else []
 
     def _has_focus_target(self, target: dict[str, str]) -> bool:
@@ -4484,7 +5509,7 @@ class MainWindow(QMainWindow):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, note.id)
             item.setToolTip(self._note_list_label(note, compact=False))
-            item.setSizeHint(QSize(0, 78))
+            item.setSizeHint(QSize(0, 84))
             self.notes_list.addItem(item)
             self.notes_list.setItemWidget(item, self._build_note_list_row(note))
 
@@ -4597,13 +5622,53 @@ class MainWindow(QMainWindow):
         self.set_media_panel_file_path("")
 
     def show_media_panel_context_menu(self, source_widget: QWidget, position: QPoint) -> None:
-        menu = QMenu(source_widget)
-        change_action = menu.addAction("이미지 변경")
-        change_action.triggered.connect(lambda _checked=False: self.choose_media_panel_file())
-        clear_action = menu.addAction("비우기")
-        clear_action.setEnabled(bool(self.preferences.media_panel_file_path.strip()))
-        clear_action.triggered.connect(lambda _checked=False: self.clear_media_panel_file())
-        menu.exec(source_widget.mapToGlobal(position))
+        pinned = self.feature_panel_pinned("media_panel")
+        _show_light_action_popup(
+            source_widget,
+            position,
+            [
+                ("패널 고정 해제" if pinned else "패널 고정", lambda: self.set_feature_panel_pinned("media_panel", not pinned), True),
+                ("새창으로 열기", lambda: self.open_feature_widget("media_panel"), True),
+                ("메인창에서 숨기기", lambda: self.hide_feature_from_main("media_panel"), True),
+                ("이미지 변경", self.choose_media_panel_file, True),
+                ("비우기", self.clear_media_panel_file, bool(self.preferences.media_panel_file_path.strip())),
+            ],
+        )
+
+    def choose_header_banner_file(self) -> None:
+        image_path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "배너 이미지/GIF 선택",
+            "",
+            "Image Files (*.png *.jpg *.jpeg *.bmp *.gif *.webp);;All Files (*.*)",
+        )
+        if image_path:
+            self.set_header_banner_file_path(image_path)
+
+    def clear_header_banner_file(self) -> None:
+        self.set_header_banner_file_path("")
+
+    def show_header_banner_context_menu(self, source_widget: QWidget, position: QPoint) -> None:
+        pinned = self.feature_panel_pinned("header_banner")
+        _show_light_action_popup(
+            source_widget,
+            position,
+            [
+                ("패널 고정 해제" if pinned else "패널 고정", lambda: self.set_feature_panel_pinned("header_banner", not pinned), True),
+                ("메인창에서 숨기기", lambda: self.hide_feature_from_main("header_banner"), True),
+                ("이미지 변경", self.choose_header_banner_file, True),
+                ("비우기", self.clear_header_banner_file, bool(self.preferences.header_banner_image_path.strip())),
+            ],
+        )
+
+    def set_header_banner_file_path(self, image_path: str) -> None:
+        self.preferences.header_banner_image_path = image_path.strip()
+        self.preferences = self.repository.save_preferences(self.preferences)
+        if hasattr(self, "header_banner_widget"):
+            self.header_banner_widget.set_banner_image(self.preferences.header_banner_image_path)
+        self.apply_header_banner_preferences()
+        message = "배너를 비웠습니다." if not self.preferences.header_banner_image_path else "배너를 업데이트했습니다."
+        self.statusBar().showMessage(message, 1800)
 
     def set_media_panel_file_path(self, image_path: str) -> None:
         self.preferences.media_panel_file_path = image_path.strip()
@@ -4660,37 +5725,53 @@ class MainWindow(QMainWindow):
     def refresh_link_favorites(self) -> None:
         if not hasattr(self, "link_favorites_layout"):
             return
+        columns = self._link_favorites_column_count()
+        self.link_favorites_columns = columns
+        self.link_favorite_buttons_by_id = {}
         while self.link_favorites_layout.count():
             item = self.link_favorites_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                widget.setParent(None)
                 widget.deleteLater()
+        for column in range(3):
+            self.link_favorites_layout.setColumnStretch(column, 1 if column < columns else 0)
+        for row in range(getattr(self, "_link_favorites_stretch_rows", 0) + 2):
+            self.link_favorites_layout.setRowStretch(row, 0)
 
         favorites = self.repository.list_link_favorites()
         if not favorites:
             empty_label = QLabel("저장된 즐겨찾기가 없습니다. 설정에서 추가하세요.")
             empty_label.setObjectName("mutedLabel")
             empty_label.setWordWrap(True)
-            self.link_favorites_layout.addWidget(empty_label)
-            self.link_favorites_layout.addStretch(1)
+            self.link_favorites_layout.addWidget(empty_label, 0, 0, 1, columns)
+            self.link_favorites_layout.setRowStretch(1, 1)
+            self._link_favorites_stretch_rows = 1
             self.refresh_compact_widget()
             return
 
-        for favorite in favorites:
+        for index, favorite in enumerate(favorites):
             button = self._build_favorite_button(favorite)
-            self.link_favorites_layout.addWidget(button)
-        self.link_favorites_layout.addStretch(1)
+            row, column = divmod(index, columns)
+            self.link_favorites_layout.addWidget(button, row, column)
+        row_count = (len(favorites) + columns - 1) // columns
+        self.link_favorites_layout.setRowStretch(row_count, 1)
+        self._link_favorites_stretch_rows = row_count
         self.refresh_compact_widget()
 
     def _build_favorite_button(self, favorite: LinkFavorite) -> QWidget:
         mode = self.preferences.favorite_display_mode
         secondary_label = _favorite_secondary_label(favorite)
         if mode == "text":
-            button = QPushButton(f"{favorite.title}\n{secondary_label}" if secondary_label else favorite.title)
+            button = FavoriteDragPushButton(
+                favorite.id,
+                self.handle_link_favorite_reorder_drop,
+                f"{favorite.title}\n{secondary_label}" if secondary_label else favorite.title,
+            )
             button.setObjectName("favoriteButton")
             button.setMinimumHeight(56 if secondary_label else 40)
         else:
-            button = QToolButton()
+            button = FavoriteDragToolButton(favorite.id, self.handle_link_favorite_reorder_drop)
             button.setObjectName("favoriteButton")
             if mode == "icon_only":
                 button.setText("")
@@ -4722,7 +5803,47 @@ class MainWindow(QMainWindow):
                 source, position, favorite_id
             )
         )
+        if favorite.id is not None:
+            self.link_favorite_buttons_by_id[int(favorite.id)] = button
         return button
+
+    def handle_link_favorite_reorder_drop(self, source_id: int, global_position: QPoint) -> None:
+        favorites = self.repository.list_link_favorites()
+        ordered_ids = [int(favorite.id) for favorite in favorites if favorite.id is not None]
+        if source_id not in ordered_ids:
+            return
+        target_id, drop_after = self._link_favorite_drop_target(source_id, global_position)
+        if target_id == source_id:
+            return
+        ordered_ids.remove(source_id)
+        if target_id is not None and target_id in ordered_ids:
+            insert_index = ordered_ids.index(target_id) + (1 if drop_after else 0)
+        else:
+            insert_index = len(ordered_ids)
+        ordered_ids.insert(insert_index, source_id)
+        self.repository.reorder_link_favorites(ordered_ids)
+        self.refresh_link_favorites()
+        self.refresh_compact_favorites()
+        self.refresh_feature_widget("link_favorites")
+        self.statusBar().showMessage("즐겨찾기 위치를 바꿨습니다.", 1500)
+
+    def _link_favorite_drop_target(self, source_id: int, global_position: QPoint) -> tuple[int | None, bool]:
+        for favorite_id, button in getattr(self, "link_favorite_buttons_by_id", {}).items():
+            if favorite_id == source_id or not button.isVisible():
+                continue
+            local_position = button.mapFromGlobal(global_position)
+            if not button.rect().contains(local_position):
+                continue
+            drop_after = (
+                local_position.y() >= button.height() // 2
+                if self.link_favorites_columns <= 1
+                else local_position.x() >= button.width() // 2
+            )
+            return favorite_id, drop_after
+        area = getattr(self, "link_favorites_area", None)
+        if isinstance(area, QScrollArea) and area.viewport().rect().contains(area.viewport().mapFromGlobal(global_position)):
+            return None, True
+        return source_id, False
 
     def refresh_compact_favorites(self) -> None:
         if not hasattr(self, "compact_favorites_layout"):
@@ -5327,6 +6448,8 @@ class MainWindow(QMainWindow):
                 "memo": self._splitter_sizes("memo_splitter"),
             },
             "layout": {
+                "dashboard_columns": DASHBOARD_GRID_COLUMNS,
+                "dashboard_row_height": DASHBOARD_GRID_ROW_HEIGHT,
                 "dashboard": self._current_feature_dashboard_layout(),
                 "rows": self._current_feature_rows_layout(),
                 "grid": self._current_feature_grid_layout(),
@@ -5368,6 +6491,8 @@ class MainWindow(QMainWindow):
                 "memo": [220, 220],
             },
             "layout": {
+                "dashboard_columns": DASHBOARD_GRID_COLUMNS,
+                "dashboard_row_height": DASHBOARD_GRID_ROW_HEIGHT,
                 "dashboard": self.default_feature_dashboard_layout(),
                 "rows": self.default_feature_rows_layout(),
                 "grid": self.default_feature_grid_layout(),
@@ -5383,7 +6508,7 @@ class MainWindow(QMainWindow):
         if isinstance(window_state, dict):
             width = int(window_state.get("width", self.width()))
             height = int(window_state.get("height", self.height()))
-            self.resize(max(980, width), max(640, height))
+            self.resize(max(720, width), max(520, height))
 
         if include_visibility:
             self._apply_layout_visibility(state.get("visible"))
@@ -5471,15 +6596,15 @@ class MainWindow(QMainWindow):
 
     def default_feature_dashboard_layout(self) -> list[dict[str, object]]:
         return [
-            {"key": "header_banner", "x": 0, "y": 0, "w": 6, "h": 2},
-            {"key": "today_checklist", "x": 0, "y": 2, "w": 2, "h": 5},
-            {"key": "today_timeline", "x": 2, "y": 2, "w": 4, "h": 10},
-            {"key": "focus", "x": 0, "y": 7, "w": 3, "h": 5},
-            {"key": "quick_memo", "x": 3, "y": 12, "w": 3, "h": 5},
-            {"key": "pomodoro", "x": 0, "y": 17, "w": 2, "h": 2},
-            {"key": "link_favorites", "x": 2, "y": 17, "w": 2, "h": 4},
-            {"key": "media_panel", "x": 4, "y": 17, "w": 2, "h": 4},
-            {"key": "datetime", "x": 0, "y": 21, "w": 2, "h": 1},
+            {"key": "header_banner", "x": 0, "y": 0, "w": 12, "h": 3},
+            {"key": "focus", "x": 0, "y": 3, "w": 5, "h": 7},
+            {"key": "today_timeline", "x": 0, "y": 10, "w": 5, "h": 11},
+            {"key": "today_checklist", "x": 5, "y": 3, "w": 4, "h": 6},
+            {"key": "quick_memo", "x": 5, "y": 9, "w": 4, "h": 12},
+            {"key": "pomodoro", "x": 9, "y": 3, "w": 3, "h": 4},
+            {"key": "media_panel", "x": 9, "y": 7, "w": 3, "h": 8},
+            {"key": "link_favorites", "x": 9, "y": 15, "w": 3, "h": 6},
+            {"key": "datetime", "x": 9, "y": 21, "w": 3, "h": 1},
         ]
 
     def default_feature_rows_layout(self) -> list[dict[str, object]]:
@@ -5506,11 +6631,74 @@ class MainWindow(QMainWindow):
         items = getattr(self, "feature_dashboard_items", [])
         if not items:
             items = self.default_feature_dashboard_layout()
-        return self._normalized_feature_dashboard_layout({"dashboard": items})
+        return self._normalized_feature_dashboard_layout(
+            {
+                "dashboard": items,
+                "dashboard_columns": DASHBOARD_GRID_COLUMNS,
+                "dashboard_row_height": DASHBOARD_GRID_ROW_HEIGHT,
+            }
+        )
 
     def _apply_feature_dashboard_layout(self, layout_state: object) -> None:
         self.feature_dashboard_items = self._normalized_feature_dashboard_layout(layout_state)
         self._render_feature_dashboard()
+
+    def _dashboard_layout_scale_factors(
+        self,
+        layout_state: object,
+        raw_items: object,
+    ) -> tuple[float, float]:
+        if not isinstance(raw_items, list):
+            return 1.0, 1.0
+        source_columns: int | None = None
+        source_row_height: int | None = None
+        source_gap: int | None = None
+        if isinstance(layout_state, dict):
+            try:
+                source_columns = int(layout_state.get("dashboard_columns"))
+            except (TypeError, ValueError):
+                source_columns = None
+            try:
+                source_row_height = int(layout_state.get("dashboard_row_height"))
+            except (TypeError, ValueError):
+                source_row_height = None
+            try:
+                source_gap = int(layout_state.get("dashboard_gap"))
+            except (TypeError, ValueError):
+                source_gap = None
+        if source_columns is None:
+            max_right = 0
+            for item in raw_items:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    right = int(item.get("x", 0)) + int(item.get("w", 1))
+                except (TypeError, ValueError):
+                    continue
+                max_right = max(max_right, right)
+            if 0 < max_right <= DASHBOARD_LEGACY_GRID_COLUMNS < DASHBOARD_GRID_COLUMNS:
+                source_columns = DASHBOARD_LEGACY_GRID_COLUMNS
+                source_row_height = DASHBOARD_LEGACY_ROW_HEIGHT
+                source_gap = DASHBOARD_LEGACY_GAP
+        width_scale = 1.0
+        height_scale = 1.0
+        if source_columns and source_columns > 0 and source_columns != DASHBOARD_GRID_COLUMNS:
+            width_scale = DASHBOARD_GRID_COLUMNS / source_columns
+        if source_row_height and source_row_height > 0 and source_row_height != DASHBOARD_GRID_ROW_HEIGHT:
+            source_step = source_row_height + (source_gap if source_gap is not None else DASHBOARD_GRID_GAP)
+            target_step = DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP
+            height_scale = source_step / max(1, target_step)
+        return width_scale, height_scale
+
+    def _scale_dashboard_value(self, value: object, scale: float, fallback: object = 1, minimum: int = 1) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            try:
+                parsed = int(fallback)
+            except (TypeError, ValueError):
+                parsed = 1
+        return max(minimum, int(round(parsed * scale)))
 
     def _normalized_feature_dashboard_layout(self, layout_state: object) -> list[dict[str, object]]:
         raw_items: object = None
@@ -5522,6 +6710,7 @@ class MainWindow(QMainWindow):
         feature_keys = set(self.feature_boxes)
         items: list[dict[str, object]] = []
         seen: set[str] = set()
+        width_scale, height_scale = self._dashboard_layout_scale_factors(layout_state, raw_items)
         if isinstance(raw_items, list):
             for raw_item in raw_items:
                 if not isinstance(raw_item, dict):
@@ -5531,19 +6720,33 @@ class MainWindow(QMainWindow):
                     continue
                 width = self._normalized_feature_dashboard_width(
                     key,
-                    raw_item.get("w", self._default_feature_dashboard_width(key)),
+                    self._scale_dashboard_value(
+                        raw_item.get("w", self._default_feature_dashboard_width(key)),
+                        width_scale,
+                        self._default_feature_dashboard_width(key),
+                    ),
                 )
                 item = {
                     "key": key,
                     "w": width,
+                    "pinned": bool(raw_item.get("pinned", False)),
                     "h": self._normalized_feature_dashboard_height(
                         key,
-                        raw_item.get("h", self._default_feature_dashboard_height(key)),
+                        self._scale_dashboard_value(
+                            raw_item.get("h", self._default_feature_dashboard_height(key)),
+                            height_scale,
+                            self._default_feature_dashboard_height(key),
+                        ),
                     ),
                 }
                 if "x" in raw_item and "y" in raw_item:
-                    item["x"] = self._normalized_dashboard_x(raw_item.get("x"), width)
-                    item["y"] = self._normalized_dashboard_y(raw_item.get("y"))
+                    item["x"] = self._normalized_dashboard_x(
+                        self._scale_dashboard_value(raw_item.get("x", 0), width_scale, 0, minimum=0),
+                        width,
+                    )
+                    item["y"] = self._normalized_dashboard_y(
+                        self._scale_dashboard_value(raw_item.get("y", 0), height_scale, 0, minimum=0)
+                    )
                 items.append(item)
                 seen.add(key)
 
@@ -5565,6 +6768,7 @@ class MainWindow(QMainWindow):
                         "y": self._normalized_dashboard_y(default_item.get("y", 0)),
                         "w": width,
                         "h": self._normalized_feature_dashboard_height(key, default_item.get("h")),
+                        "pinned": bool(default_item.get("pinned", False)),
                     }
                 )
                 seen.add(key)
@@ -5631,10 +6835,29 @@ class MainWindow(QMainWindow):
                 )
         return items
 
-    def _pack_feature_dashboard_items(self, raw_items: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _pack_feature_dashboard_items(
+        self,
+        raw_items: list[dict[str, object]],
+        priority_keys: list[str] | tuple[str, ...] | None = None,
+        flow_direction: str | None = None,
+        strict_lateral_push: bool = False,
+    ) -> list[dict[str, object]]:
+        ordered_items = list(raw_items)
+        pinned_keys = {str(item.get("key", "")) for item in ordered_items if bool(item.get("pinned", False))}
+        if priority_keys:
+            priority = {str(key): index for index, key in enumerate(priority_keys)}
+            ordered_items.sort(
+                key=lambda item: (
+                    0 if str(item.get("key", "")) in pinned_keys else 1,
+                    priority.get(str(item.get("key", "")), len(priority)),
+                )
+            )
+        elif pinned_keys:
+            ordered_items.sort(key=lambda item: 0 if str(item.get("key", "")) in pinned_keys else 1)
+
         packed: list[dict[str, object]] = []
         occupied: set[tuple[int, int]] = set()
-        for raw_item in raw_items:
+        for raw_item in ordered_items:
             key = str(raw_item.get("key", ""))
             if key not in self.feature_boxes:
                 continue
@@ -5653,12 +6876,48 @@ class MainWindow(QMainWindow):
                 row = self._normalized_dashboard_y(preferred_y)
                 if self._dashboard_slot_is_free(column, row, width, height, occupied):
                     occupied.update(self._dashboard_cells(column, row, width, height))
-                    packed.append({"key": key, "x": column, "y": row, "w": width, "h": height})
+                    packed.append(
+                        {
+                            "key": key,
+                            "x": column,
+                            "y": row,
+                            "w": width,
+                            "h": height,
+                            "pinned": bool(raw_item.get("pinned", False)),
+                        }
+                    )
                     continue
 
-            column, row = self._first_free_dashboard_slot(width, height, occupied, preferred_x, preferred_y)
+            if (
+                strict_lateral_push
+                and str(flow_direction or "").lower() in {"left", "right"}
+                and preferred_x is not None
+                and preferred_y is not None
+            ):
+                slot = self._first_same_row_directional_dashboard_slot(
+                    width,
+                    height,
+                    occupied,
+                    self._normalized_dashboard_x(preferred_x, width),
+                    self._normalized_dashboard_y(preferred_y),
+                    str(flow_direction),
+                )
+                if slot is None:
+                    return []
+                column, row = slot
+            else:
+                column, row = self._first_free_dashboard_slot(width, height, occupied, preferred_x, preferred_y, flow_direction)
             occupied.update(self._dashboard_cells(column, row, width, height))
-            packed.append({"key": key, "x": column, "y": row, "w": width, "h": height})
+            packed.append(
+                {
+                    "key": key,
+                    "x": column,
+                    "y": row,
+                    "w": width,
+                    "h": height,
+                    "pinned": bool(raw_item.get("pinned", False)),
+                }
+            )
         return packed
 
     def _dashboard_cells(self, column: int, row: int, width: int, height: int) -> set[tuple[int, int]]:
@@ -5680,6 +6939,13 @@ class MainWindow(QMainWindow):
             return False
         return occupied.isdisjoint(self._dashboard_cells(column, row, width, height))
 
+    def _dashboard_flow_direction(self, from_x: int, from_y: int, to_x: int, to_y: int) -> str:
+        dx = int(to_x) - int(from_x)
+        dy = int(to_y) - int(from_y)
+        if abs(dx) > abs(dy):
+            return "left" if dx < 0 else "right"
+        return "down"
+
     def _first_free_dashboard_slot(
         self,
         width: int,
@@ -5687,10 +6953,22 @@ class MainWindow(QMainWindow):
         occupied: set[tuple[int, int]],
         preferred_x: object = None,
         preferred_y: object = None,
+        flow_direction: str | None = None,
     ) -> tuple[int, int]:
         if preferred_x is not None and preferred_y is not None:
             start_column = self._normalized_dashboard_x(preferred_x, width)
             start_row = self._normalized_dashboard_y(preferred_y)
+            if flow_direction:
+                directional_slot = self._first_directional_dashboard_slot(
+                    width,
+                    height,
+                    occupied,
+                    start_column,
+                    start_row,
+                    flow_direction,
+                )
+                if directional_slot is not None:
+                    return directional_slot
             max_radius = max(24, len(occupied) + height + 4)
             for radius in range(max_radius + 1):
                 candidates: list[tuple[int, int]] = []
@@ -5713,31 +6991,96 @@ class MainWindow(QMainWindow):
                     return column, row
             row += 1
 
+    def _first_directional_dashboard_slot(
+        self,
+        width: int,
+        height: int,
+        occupied: set[tuple[int, int]],
+        start_column: int,
+        start_row: int,
+        flow_direction: str,
+    ) -> tuple[int, int] | None:
+        max_column = max(0, DASHBOARD_GRID_COLUMNS - width)
+        max_scan_row = start_row + max(36, len(occupied) + height + 8)
+        direction = flow_direction.lower()
+
+        def primary_columns() -> list[int]:
+            if direction == "left":
+                return list(range(min(start_column, max_column), -1, -1))
+            if direction == "down":
+                return [min(start_column, max_column)]
+            return list(range(min(start_column, max_column), max_column + 1))
+
+        def fallback_columns() -> list[int]:
+            if direction == "left":
+                return list(range(min(start_column + 1, max_column), max_column + 1))
+            if direction == "down":
+                columns = [column for column in range(0, max_column + 1) if column != min(start_column, max_column)]
+                columns.sort(key=lambda column: (abs(column - start_column), column))
+                return columns
+            return list(range(0, min(start_column, max_column)))
+
+        if direction != "down":
+            same_row = start_row
+            for column in primary_columns():
+                if self._dashboard_slot_is_free(column, same_row, width, height, occupied):
+                    return column, same_row
+
+        for row in range(start_row + 1, max_scan_row + 1):
+            for column in primary_columns():
+                if self._dashboard_slot_is_free(column, row, width, height, occupied):
+                    return column, row
+
+        for row in range(start_row + 1, max_scan_row + 1):
+            for column in fallback_columns():
+                if self._dashboard_slot_is_free(column, row, width, height, occupied):
+                    return column, row
+        return None
+
+    def _first_same_row_directional_dashboard_slot(
+        self,
+        width: int,
+        height: int,
+        occupied: set[tuple[int, int]],
+        start_column: int,
+        start_row: int,
+        flow_direction: str,
+    ) -> tuple[int, int] | None:
+        max_column = max(0, DASHBOARD_GRID_COLUMNS - width)
+        if flow_direction.lower() == "left":
+            columns = range(min(start_column, max_column), -1, -1)
+        else:
+            columns = range(min(start_column, max_column), max_column + 1)
+        for column in columns:
+            if self._dashboard_slot_is_free(column, start_row, width, height, occupied):
+                return column, start_row
+        return None
+
     def _default_feature_dashboard_width(self, feature_key: str) -> int:
         return {
-            "header_banner": 6,
-            "today_timeline": 4,
-            "focus": 3,
-            "quick_memo": 3,
-            "today_checklist": 2,
-            "link_favorites": 2,
-            "media_panel": 2,
-            "pomodoro": 2,
-            "datetime": 2,
-        }.get(feature_key, 3)
+            "header_banner": 12,
+            "today_timeline": 5,
+            "focus": 5,
+            "quick_memo": 4,
+            "today_checklist": 4,
+            "link_favorites": 3,
+            "media_panel": 3,
+            "pomodoro": 3,
+            "datetime": 3,
+        }.get(feature_key, 6)
 
     def _default_feature_dashboard_height(self, feature_key: str) -> int:
         return {
-            "header_banner": 2,
-            "today_timeline": 10,
-            "focus": 5,
-            "quick_memo": 5,
-            "today_checklist": 4,
-            "link_favorites": 4,
-            "media_panel": 4,
-            "pomodoro": 2,
+            "header_banner": 3,
+            "today_timeline": 11,
+            "focus": 7,
+            "quick_memo": 12,
+            "today_checklist": 6,
+            "link_favorites": 6,
+            "media_panel": 8,
+            "pomodoro": 4,
             "datetime": 1,
-        }.get(feature_key, 3)
+        }.get(feature_key, 5)
 
     def _normalized_dashboard_width(self, width: object) -> int:
         try:
@@ -5748,9 +7091,9 @@ class MainWindow(QMainWindow):
 
     def _minimum_feature_dashboard_width(self, feature_key: str) -> int:
         return {
-            "focus": 2,
-            "quick_memo": 2,
-            "today_timeline": 2,
+            "focus": 3,
+            "quick_memo": 3,
+            "today_timeline": 3,
             "today_checklist": 2,
             "link_favorites": 1,
             "pomodoro": 1,
@@ -5762,10 +7105,10 @@ class MainWindow(QMainWindow):
     def _minimum_feature_dashboard_height(self, feature_key: str) -> int:
         return {
             "focus": 4,
-            "quick_memo": 4,
-            "today_timeline": 6,
+            "quick_memo": 3,
+            "today_timeline": 5,
             "today_checklist": 3,
-            "link_favorites": 3,
+            "link_favorites": 2,
             "pomodoro": 2,
             "datetime": 1,
             "media_panel": 2,
@@ -5833,7 +7176,8 @@ class MainWindow(QMainWindow):
             pixel_height = int(height)
         except (TypeError, ValueError):
             return 3
-        return self._normalized_dashboard_height(round(pixel_height / DASHBOARD_GRID_ROW_HEIGHT))
+        row_step = DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP
+        return self._normalized_dashboard_height(round((pixel_height + DASHBOARD_GRID_GAP) / max(1, row_step)))
 
     def _dashboard_column_width(self) -> float:
         container_width = max(720, self.feature_grid_container.width())
@@ -5847,22 +7191,53 @@ class MainWindow(QMainWindow):
     def _dashboard_item_pixel_height(self, height: int) -> int:
         return int(DASHBOARD_GRID_ROW_HEIGHT * height + DASHBOARD_GRID_GAP * max(0, height - 1))
 
+    def _full_scroll_position(self) -> tuple[int, int] | None:
+        scroll = getattr(self, "full_scroll_area", None)
+        if not isinstance(scroll, QScrollArea):
+            return None
+        return scroll.horizontalScrollBar().value(), scroll.verticalScrollBar().value()
+
+    def _restore_full_scroll_position(self, position: tuple[int, int] | None, deferred: bool = False) -> None:
+        if position is None:
+            return
+        if deferred:
+            QTimer.singleShot(0, lambda saved_position=position: self._restore_full_scroll_position(saved_position))
+            return
+        scroll = getattr(self, "full_scroll_area", None)
+        if not isinstance(scroll, QScrollArea):
+            return
+        horizontal, vertical = position
+        horizontal_bar = scroll.horizontalScrollBar()
+        vertical_bar = scroll.verticalScrollBar()
+        horizontal_bar.setValue(max(horizontal_bar.minimum(), min(int(horizontal), horizontal_bar.maximum())))
+        vertical_bar.setValue(max(vertical_bar.minimum(), min(int(vertical), vertical_bar.maximum())))
+
     def _resize_feature_dashboard_item(
         self,
         feature_key: str,
         width: object | None = None,
         height: object | None = None,
+        width_edge: str = "right",
     ) -> None:
+        if self.feature_panel_pinned(feature_key):
+            return
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         changed = False
         for item in items:
             if str(item.get("key", "")) != feature_key:
                 continue
             if width is not None:
-                item["w"] = self._normalized_feature_dashboard_width(
+                next_width = self._normalized_feature_dashboard_width(
                     feature_key,
                     self._dashboard_width_from_pixels(width),
                 )
+                if width_edge == "left":
+                    current_width = self._normalized_dashboard_width(item.get("w"))
+                    current_x = self._normalized_dashboard_x(item.get("x"), current_width)
+                    current_right = current_x + current_width
+                    next_width = min(next_width, current_right)
+                    item["x"] = self._normalized_dashboard_x(current_right - next_width, next_width)
+                item["w"] = next_width
                 changed = True
             if height is not None:
                 item["h"] = self._normalized_feature_dashboard_height(
@@ -5873,47 +7248,76 @@ class MainWindow(QMainWindow):
             break
         if not changed:
             return
-        self.feature_dashboard_items = self._pack_feature_dashboard_items(items)
+        if height is not None and width is None:
+            flow_direction = "down"
+        elif width_edge == "left":
+            flow_direction = "left"
+        else:
+            flow_direction = "right"
+        self.feature_dashboard_items = self._pack_feature_dashboard_items(
+            items,
+            priority_keys=[feature_key],
+            flow_direction=flow_direction,
+        )
         self._render_feature_dashboard()
         self.save_last_layout_state()
 
     def _move_feature_in_dashboard(self, source_key: str, target_key: str, placement: str = "after") -> None:
+        if self.feature_panel_pinned(source_key) or self.feature_panel_pinned(target_key):
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
+            return
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         source_item = next((item for item in items if str(item.get("key", "")) == source_key), None)
         target_item = next((item for item in items if str(item.get("key", "")) == target_key), None)
         if source_item is None or target_item is None:
             return
-        source_slot = {
-            "x": self._normalized_dashboard_x(source_item.get("x"), self._normalized_dashboard_width(source_item.get("w"))),
-            "y": self._normalized_dashboard_y(source_item.get("y")),
-            "w": self._normalized_dashboard_width(source_item.get("w")),
-            "h": self._normalized_dashboard_height(source_item.get("h")),
-        }
-        target_slot = {
-            "x": self._normalized_dashboard_x(target_item.get("x"), self._normalized_dashboard_width(target_item.get("w"))),
-            "y": self._normalized_dashboard_y(target_item.get("y")),
-            "w": self._normalized_dashboard_width(target_item.get("w")),
-            "h": self._normalized_dashboard_height(target_item.get("h")),
-        }
-        source_item.update(target_slot)
-        target_item.update(source_slot)
-        self.feature_dashboard_items = self._pack_feature_dashboard_items(items)
+        source_width = self._normalized_feature_dashboard_width(source_key, source_item.get("w"))
+        target_width = self._normalized_feature_dashboard_width(target_key, target_item.get("w"))
+        source_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+        source_y = self._normalized_dashboard_y(source_item.get("y"))
+        target_x = self._normalized_dashboard_x(target_item.get("x"), target_width)
+        target_y = self._normalized_dashboard_y(target_item.get("y"))
+
+        source_item["x"] = self._normalized_dashboard_x(target_x, source_width)
+        source_item["y"] = target_y
+        source_item["w"] = source_width
+        source_item["h"] = self._normalized_feature_dashboard_height(source_key, source_item.get("h"))
+        target_item["x"] = self._normalized_dashboard_x(source_x, target_width)
+        target_item["y"] = source_y
+        target_item["w"] = target_width
+        target_item["h"] = self._normalized_feature_dashboard_height(target_key, target_item.get("h"))
+
+        self.feature_dashboard_items = self._pack_feature_dashboard_items(
+            items,
+            priority_keys=[source_key, target_key],
+        )
         self._render_feature_dashboard()
         self.save_last_layout_state()
         self.statusBar().showMessage("패널 위치를 바꿨습니다.", 1800)
 
     def _move_feature_to_dashboard_end(self, source_key: str) -> None:
+        if self.feature_panel_pinned(source_key):
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
+            return
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         source_item = next((item for item in items if str(item.get("key", "")) == source_key), None)
         if source_item is None:
             return
         items = [item for item in items if str(item.get("key", "")) != source_key]
         items.append(source_item)
-        self.feature_dashboard_items = self._pack_feature_dashboard_items(items)
+        self.feature_dashboard_items = self._pack_feature_dashboard_items(items, priority_keys=[source_key], flow_direction="down")
         self._render_feature_dashboard()
         self.save_last_layout_state()
 
-    def _move_feature_to_dashboard_position(self, source_key: str, global_position: QPoint) -> bool:
+    def _move_feature_to_dashboard_position(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> bool:
+        if self.feature_panel_pinned(source_key):
+            self.statusBar().showMessage("고정된 패널은 이동할 수 없습니다.", 1600)
+            return False
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         source_item = next((item for item in items if str(item.get("key", "")) == source_key), None)
         if source_item is None:
@@ -5921,83 +7325,204 @@ class MainWindow(QMainWindow):
         position = self._dashboard_grid_position_from_global(
             global_position,
             self._normalized_dashboard_width(source_item.get("w")),
+            drag_offset,
         )
         if position is None:
             return False
+        source_width = self._normalized_dashboard_width(source_item.get("w"))
+        old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+        old_y = self._normalized_dashboard_y(source_item.get("y"))
         source_item["x"], source_item["y"] = position
-        self.feature_dashboard_items = self._pack_feature_dashboard_items(items)
+        flow_direction = self._dashboard_flow_direction(
+            old_x,
+            old_y,
+            position[0],
+            position[1],
+        )
+        strict_lateral_push = flow_direction in {"left", "right"} and position[1] == old_y
+        packed_items = self._pack_feature_dashboard_items(
+            items,
+            priority_keys=[source_key],
+            flow_direction=flow_direction,
+            strict_lateral_push=strict_lateral_push,
+        )
+        if strict_lateral_push and not packed_items:
+            self.statusBar().showMessage("옆으로 밀 공간이 없어 이동하지 않았습니다.", 1600)
+            return False
+        self.feature_dashboard_items = packed_items
         self._render_feature_dashboard()
         self.save_last_layout_state()
         self.statusBar().showMessage("패널 위치를 바꿨습니다.", 1800)
         return True
 
-    def _dashboard_grid_position_from_global(self, global_position: QPoint, width: int = 1) -> tuple[int, int] | None:
+    def _dashboard_grid_position_from_global(
+        self,
+        global_position: QPoint,
+        width: int = 1,
+        drag_offset: QPoint | None = None,
+    ) -> tuple[int, int] | None:
         container = getattr(self, "feature_grid_container", None)
         if not isinstance(container, QWidget):
             return None
-        local_position = container.mapFromGlobal(global_position)
-        if not container.rect().contains(local_position):
+        cursor_position = container.mapFromGlobal(global_position)
+        if not container.rect().contains(cursor_position):
             return None
+        local_position = cursor_position - drag_offset if isinstance(drag_offset, QPoint) else cursor_position
         column_step = self._dashboard_column_width() + DASHBOARD_GRID_GAP
         row_step = DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP
         column = round(local_position.x() / max(1, column_step))
         row = round(local_position.y() / max(1, row_step))
         return self._normalized_dashboard_x(column, width), self._normalized_dashboard_y(row)
 
-    def _show_dashboard_drag_guides(self, source_key: str, global_position: QPoint) -> None:
+    def _show_dashboard_drag_guides(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> None:
         overlay = getattr(self, "dashboard_guide_overlay", None)
         container = getattr(self, "feature_grid_container", None)
         if not isinstance(overlay, DashboardGridGuideOverlay) or not isinstance(container, QWidget):
             return
+        scroll_position = self._full_scroll_position()
         overlay.hide()
         overlay.setGeometry(container.rect())
-        preview_item = self._dashboard_preview_item(source_key, global_position)
-        overlay.set_preview_rect(self._dashboard_item_rect(preview_item) if preview_item else QRectF())
+        preview_layout = self._dashboard_preview_layout(source_key, global_position, drag_offset)
+        preview_item = next((item for item in preview_layout if str(item.get("key", "")) == source_key), None)
+        impact_rects = self._dashboard_preview_impact_rects(source_key, preview_layout)
+        overlay.set_preview_rect(self._dashboard_item_rect(preview_item) if preview_item else QRectF(), impact_rects)
         overlay.raise_()
         overlay.show()
+        self._restore_full_scroll_position(scroll_position)
 
     def _hide_dashboard_drag_guides(self) -> None:
         overlay = getattr(self, "dashboard_guide_overlay", None)
         if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.hide()
-            overlay.set_preview_rect(QRectF())
+            overlay.set_preview_rect(QRectF(), [])
 
-    def _dashboard_preview_item(self, source_key: str, global_position: QPoint) -> dict[str, object] | None:
+    def _dashboard_preview_item(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> dict[str, object] | None:
+        preview_layout = self._dashboard_preview_layout(source_key, global_position, drag_offset)
+        return next((item for item in preview_layout if str(item.get("key", "")) == source_key), None)
+
+    def _dashboard_preview_layout(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> list[dict[str, object]]:
         target = self._feature_drop_target_at(global_position, source_key)
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         source_item = next((item for item in items if str(item.get("key", "")) == source_key), None)
         if source_item is None:
-            return None
+            return []
+        position = self._dashboard_grid_position_from_global(
+            global_position,
+            self._normalized_dashboard_width(source_item.get("w")),
+            drag_offset,
+        )
+        if position is not None:
+            source_width = self._normalized_dashboard_width(source_item.get("w"))
+            old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+            old_y = self._normalized_dashboard_y(source_item.get("y"))
+            column, row = position
+            source_item["x"] = column
+            source_item["y"] = row
+            flow_direction = self._dashboard_flow_direction(old_x, old_y, column, row)
+            strict_lateral_push = flow_direction in {"left", "right"} and row == old_y
+            preview_items = self._pack_feature_dashboard_items(
+                items,
+                priority_keys=[source_key],
+                flow_direction=flow_direction,
+                strict_lateral_push=strict_lateral_push,
+            )
+            if strict_lateral_push and not preview_items:
+                return [dict(item) for item in self._current_feature_dashboard_layout()]
+            return preview_items
         if target is not None:
             target_kind, target_key, _placement = target
             if target_kind == "feature":
                 target_item = next((item for item in items if str(item.get("key", "")) == target_key), None)
                 if target_item is not None:
-                    return {
-                        "key": source_key,
-                        "x": self._normalized_dashboard_x(
-                            target_item.get("x"),
-                            self._normalized_dashboard_width(target_item.get("w")),
-                        ),
-                        "y": self._normalized_dashboard_y(target_item.get("y")),
-                        "w": self._normalized_dashboard_width(target_item.get("w")),
-                        "h": self._normalized_dashboard_height(target_item.get("h")),
-                    }
+                    source_width = self._normalized_feature_dashboard_width(source_key, source_item.get("w"))
+                    source_height = self._normalized_feature_dashboard_height(source_key, source_item.get("h"))
+                    target_width = self._normalized_feature_dashboard_width(target_key, target_item.get("w"))
+                    target_height = self._normalized_feature_dashboard_height(target_key, target_item.get("h"))
+                    source_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+                    source_y = self._normalized_dashboard_y(source_item.get("y"))
+                    target_x = self._normalized_dashboard_x(target_item.get("x"), target_width)
+                    target_y = self._normalized_dashboard_y(target_item.get("y"))
+                    source_item.update(
+                        {
+                            "x": self._normalized_dashboard_x(target_x, source_width),
+                            "y": target_y,
+                            "w": source_width,
+                            "h": source_height,
+                        }
+                    )
+                    target_item.update(
+                        {
+                            "x": self._normalized_dashboard_x(source_x, target_width),
+                            "y": source_y,
+                            "w": target_width,
+                            "h": target_height,
+                        }
+                    )
+                    return self._pack_feature_dashboard_items(
+                        items,
+                        priority_keys=[source_key, target_key],
+                    )
 
         position = self._dashboard_grid_position_from_global(
             global_position,
             self._normalized_dashboard_width(source_item.get("w")),
+            drag_offset,
         )
         if position is None:
-            return source_item
+            return self._pack_feature_dashboard_items(items)
+        source_width = self._normalized_dashboard_width(source_item.get("w"))
+        old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+        old_y = self._normalized_dashboard_y(source_item.get("y"))
         column, row = position
-        return {
-            "key": source_key,
-            "x": column,
-            "y": row,
-            "w": self._normalized_dashboard_width(source_item.get("w")),
-            "h": self._normalized_dashboard_height(source_item.get("h")),
+        source_item["x"] = column
+        source_item["y"] = row
+        return self._pack_feature_dashboard_items(
+            items,
+            priority_keys=[source_key],
+            flow_direction=self._dashboard_flow_direction(old_x, old_y, column, row),
+        )
+
+    def _dashboard_preview_impact_rects(self, source_key: str, preview_layout: list[dict[str, object]]) -> list[QRectF]:
+        if not preview_layout:
+            return []
+        current = {
+            str(item.get("key", "")): (
+                int(item.get("x", 0)),
+                int(item.get("y", 0)),
+                int(item.get("w", 1)),
+                int(item.get("h", 1)),
+            )
+            for item in self._current_feature_dashboard_layout()
         }
+        rects: list[QRectF] = []
+        for item in preview_layout:
+            key = str(item.get("key", ""))
+            if not key or key == source_key:
+                continue
+            next_slot = (
+                int(item.get("x", 0)),
+                int(item.get("y", 0)),
+                int(item.get("w", 1)),
+                int(item.get("h", 1)),
+            )
+            if current.get(key) != next_slot:
+                rects.append(self._dashboard_item_rect(item))
+        return rects
 
     def _dashboard_item_rect(self, item: dict[str, object]) -> QRectF:
         width = self._normalized_dashboard_width(item.get("w"))
@@ -6015,6 +7540,7 @@ class MainWindow(QMainWindow):
         layout = getattr(self, "feature_dashboard_layout", None)
         if not isinstance(layout, QGridLayout):
             return
+        scroll_position = self._full_scroll_position()
 
         while layout.count():
             item = layout.takeAt(0)
@@ -6033,8 +7559,16 @@ class MainWindow(QMainWindow):
         if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.setGeometry(self.feature_grid_container.rect())
             overlay.raise_()
+        self._restore_full_scroll_position(scroll_position)
+        self._restore_full_scroll_position(scroll_position, deferred=True)
 
-        all_items = self._normalized_feature_dashboard_layout({"dashboard": self.feature_dashboard_items})
+        all_items = self._normalized_feature_dashboard_layout(
+            {
+                "dashboard": self.feature_dashboard_items,
+                "dashboard_columns": DASHBOARD_GRID_COLUMNS,
+                "dashboard_row_height": DASHBOARD_GRID_ROW_HEIGHT,
+            }
+        )
         self.feature_dashboard_items = all_items
         visible_items = self._pack_feature_dashboard_items(
             [dict(item) for item in all_items if self._feature_should_be_visible(str(item.get("key", "")))]
@@ -6169,8 +7703,37 @@ class MainWindow(QMainWindow):
                 return widths[keys.index(feature_key)]
         return self._default_feature_panel_width(feature_key)
 
+    def feature_panel_pinned(self, feature_key: str) -> bool:
+        if hasattr(self, "feature_dashboard_layout"):
+            for item in self._current_feature_dashboard_layout():
+                if str(item.get("key", "")) == feature_key:
+                    return bool(item.get("pinned", False))
+        return False
+
+    def set_feature_panel_pinned(self, feature_key: str, pinned: bool) -> None:
+        if feature_key not in self.feature_boxes:
+            return
+        if not hasattr(self, "feature_dashboard_layout"):
+            self.statusBar().showMessage("현재 배치에서는 패널 고정을 사용할 수 없습니다.", 1800)
+            return
+        items = [dict(item) for item in self._current_feature_dashboard_layout()]
+        changed = False
+        for item in items:
+            if str(item.get("key", "")) == feature_key:
+                item["pinned"] = bool(pinned)
+                changed = True
+                break
+        if not changed:
+            return
+        self.feature_dashboard_items = self._pack_feature_dashboard_items(items)
+        self._render_feature_dashboard()
+        self.save_last_layout_state()
+        self.statusBar().showMessage("패널을 고정했습니다." if pinned else "패널 고정을 해제했습니다.", 1800)
+
     def resize_feature_panel_height(self, feature_key: str, height: int) -> None:
         if feature_key not in self.feature_boxes:
+            return
+        if self.feature_panel_pinned(feature_key):
             return
         if hasattr(self, "feature_dashboard_layout"):
             self._resize_feature_dashboard_item(feature_key, height=height)
@@ -6185,6 +7748,8 @@ class MainWindow(QMainWindow):
 
     def resize_feature_panel_width(self, feature_key: str, width: int) -> None:
         if feature_key not in self.feature_boxes:
+            return
+        if self.feature_panel_pinned(feature_key):
             return
         if hasattr(self, "feature_dashboard_layout"):
             self._resize_feature_dashboard_item(feature_key, width=width)
@@ -6204,6 +7769,17 @@ class MainWindow(QMainWindow):
         self._sync_feature_row_splitter_widths(row_splitter)
         self.feature_layout_rows = self._current_feature_rows_layout()
         self.save_last_layout_state()
+
+    def resize_feature_panel_width_from_edge(self, feature_key: str, width: int, edge: str = "right") -> None:
+        if feature_key not in self.feature_boxes:
+            return
+        if self.feature_panel_pinned(feature_key):
+            return
+        normalized_edge = "left" if edge == "left" else "right"
+        if hasattr(self, "feature_dashboard_layout"):
+            self._resize_feature_dashboard_item(feature_key, width=width, width_edge=normalized_edge)
+            return
+        self.resize_feature_panel_width(feature_key, width)
 
     def _feature_row_column_location(self, feature_key: str) -> tuple[QSplitter, int] | None:
         for row_splitter in getattr(self, "feature_row_splitters", []):
@@ -7276,6 +8852,7 @@ class MainWindow(QMainWindow):
         if session is None:
             planned = self.planned_minutes_spin.value() * 60
             remaining = planned
+            time_text = _format_clock(remaining)
             status = "대기 중"
             title = self.focus_title_edit.text().strip() or "집중 대기"
             detail = "집중할 일을 고른 뒤 시작하세요. 화면 지정은 선택입니다."
@@ -7288,6 +8865,7 @@ class MainWindow(QMainWindow):
             paused_seconds = 0
         else:
             remaining = self._display_remaining_seconds(session)
+            time_text = self._display_focus_time_text(session)
             status = _status_label(session.status)
             title = session.title
             ratio = self.focus_timer.focus_ratio() if self.focus_timer else 1.0
@@ -7305,7 +8883,7 @@ class MainWindow(QMainWindow):
             )
 
         self.focus_status_label.setText(status)
-        self.remaining_time_label.setText(_format_clock(remaining))
+        self.remaining_time_label.setText(time_text)
         self.focus_detail_label.setText(detail)
         self.focus_ratio_label.setText(f"{int(ratio * 100)}%")
         self.focus_ratio_bar.setValue(int(ratio * 1000))
@@ -7318,7 +8896,7 @@ class MainWindow(QMainWindow):
             self.focus_paused_metric_label.setText(_format_duration(paused_seconds))
         if hasattr(self, "header_focus_status_label"):
             self.header_focus_status_label.setText(status)
-            self.header_focus_time_label.setText(_format_clock(remaining))
+            self.header_focus_time_label.setText(time_text)
             if hasattr(self, "header_focus_card"):
                 self.header_focus_card.setToolTip(f"{title}\n{detail}")
         self.pause_focus_button.setText(pause_text)
@@ -7326,7 +8904,7 @@ class MainWindow(QMainWindow):
         self.complete_focus_button.setEnabled(controls_enabled)
 
         self.compact_title_label.setText(title)
-        self.compact_time_label.setText(_format_clock(remaining))
+        self.compact_time_label.setText(time_text)
         self.compact_status_label.setText(f"{status} · 집중률 {int(ratio * 100)}%")
         self.compact_progress.setValue(progress)
         self.compact_pause_button.setText(pause_text)
@@ -7339,6 +8917,14 @@ class MainWindow(QMainWindow):
         if session.status == "break" and self.break_until is not None:
             return max(0, int((self.break_until - datetime.now()).total_seconds()))
         return session.remaining_seconds
+
+    def _display_focus_time_text(self, session) -> str:
+        if session.status == "break":
+            return _format_clock(self._display_remaining_seconds(session))
+        extra_seconds = max(0, session.focused_seconds - session.planned_seconds)
+        if extra_seconds > 0:
+            return f"+{_format_clock(extra_seconds)}"
+        return _format_clock(session.remaining_seconds)
 
     def update_pomodoro_controls(self) -> None:
         visible = self.preferences.show_pomodoro_controls
@@ -7522,7 +9108,10 @@ class MainWindow(QMainWindow):
 
         note_id = int(item.data(Qt.ItemDataRole.UserRole))
         attachments = self.repository.list_quick_note_attachments(note_id)
-        menu = QMenu(self.notes_list)
+        menu = _style_popup_menu(QMenu(self.notes_list), self.notes_list)
+        copy_action = menu.addAction("복사")
+        copy_action.triggered.connect(self.copy_selected_quick_note)
+        menu.addSeparator()
         edit_action = menu.addAction("수정")
         edit_action.triggered.connect(self.edit_selected_quick_note)
         self._add_note_folder_menu(menu, note_id)
@@ -7537,6 +9126,16 @@ class MainWindow(QMainWindow):
         delete_action = menu.addAction("삭제")
         delete_action.triggered.connect(self.delete_selected_quick_note)
         menu.exec(self.notes_list.mapToGlobal(position))
+
+    def copy_selected_quick_note(self) -> None:
+        item = self.notes_list.currentItem()
+        if item is None or item.data(Qt.ItemDataRole.UserRole) is None:
+            return
+        note = self.repository.get_quick_note(int(item.data(Qt.ItemDataRole.UserRole)))
+        if note is None:
+            return
+        QApplication.clipboard().setText(note.body)
+        self.statusBar().showMessage("메모 내용을 복사했습니다.", 1800)
 
     def open_quick_note_attachment(self, attachment_id: int | None) -> None:
         if attachment_id is None:
@@ -8006,6 +9605,7 @@ class IntegratedWidgetDialog(QDialog):
         if session is None:
             planned = self.owner.planned_minutes_spin.value() * 60
             remaining = planned
+            time_text = _format_clock(remaining)
             status = "대기 중"
             title = self.owner.focus_title_edit.text().strip() or "집중 대기"
             ratio = 1.0
@@ -8014,6 +9614,7 @@ class IntegratedWidgetDialog(QDialog):
             controls_enabled = False
         else:
             remaining = self.owner._display_remaining_seconds(session)
+            time_text = self.owner._display_focus_time_text(session)
             status = _status_label(session.status)
             title = session.title
             ratio = self.owner.focus_timer.focus_ratio() if self.owner.focus_timer else 1.0
@@ -8021,7 +9622,7 @@ class IntegratedWidgetDialog(QDialog):
             pause_text = "재개" if session.status in {"paused", "break"} else "일시정지"
             controls_enabled = session.status in {"running", "paused", "break"}
         self.title_label.setText(title)
-        self.time_label.setText(_format_clock(remaining))
+        self.time_label.setText(time_text)
         self.status_label.setText(f"{status} · 집중률 {int(ratio * 100)}%")
         self.progress.setValue(progress)
         self.pause_button.setText(pause_text)
@@ -8116,10 +9717,13 @@ class FocusWidgetDialog(QDialog):
     def __init__(self, owner: MainWindow) -> None:
         super().__init__(owner)
         self.owner = owner
+        self._syncing_from_owner = False
         self.setWindowTitle("집중 새창")
+        self.setWindowFlag(Qt.WindowType.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowType.WindowMinimizeButtonHint, True)
         self.setSizeGripEnabled(True)
-        self.setMinimumSize(QSize(220, 150))
-        self.resize(320, 190)
+        self.setMinimumSize(QSize(220, 130))
+        self.resize(420, 320)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(14, 12, 14, 12)
@@ -8147,6 +9751,81 @@ class FocusWidgetDialog(QDialog):
         self.progress.setTextVisible(False)
         layout.addWidget(self.progress)
 
+        self.detail_label = QLabel()
+        self.detail_label.setObjectName("mutedLabel")
+        self.detail_label.setWordWrap(True)
+        layout.addWidget(self.detail_label)
+
+        self.start_panel = QWidget()
+        start_layout = QGridLayout(self.start_panel)
+        start_layout.setContentsMargins(0, 0, 0, 0)
+        start_layout.setHorizontalSpacing(8)
+        start_layout.setVerticalSpacing(6)
+        start_layout.addWidget(QLabel("집중"), 0, 0)
+        self.title_edit = QLineEdit()
+        self.title_edit.setPlaceholderText("지금 집중할 일")
+        start_layout.addWidget(self.title_edit, 0, 1, 1, 3)
+        self.title_edit.textChanged.connect(self.sync_title_to_owner)
+
+        self.dialog_use_target_check = QCheckBox("화면 지정 사용")
+        self.dialog_use_target_check.toggled.connect(self.sync_target_check_to_owner)
+        start_layout.addWidget(self.dialog_use_target_check, 1, 0, 1, 4)
+
+        self.dialog_target_combo = QComboBox()
+        self.dialog_target_combo.setObjectName("focusWidgetTargetCombo")
+        self.dialog_target_combo.setMinimumContentsLength(12)
+        self.dialog_target_combo.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.dialog_target_combo.setMinimumWidth(0)
+        self.dialog_target_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dialog_target_combo.view().setObjectName("focusWidgetTargetComboView")
+        self.dialog_target_combo.view().setSpacing(0)
+        self.dialog_target_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
+        self.dialog_target_combo.activated.connect(lambda _index: self.add_target_from_dialog_combo())
+        self.dialog_target_combo.view().pressed.connect(self.add_target_from_dialog_index)
+        _stabilize_control(self.dialog_target_combo, 120)
+        start_layout.addWidget(self.dialog_target_combo, 2, 0, 1, 3)
+
+        self.dialog_target_refresh_button = QPushButton("갱신")
+        self.dialog_target_refresh_button.setObjectName("ghostButton")
+        self.dialog_target_refresh_button.clicked.connect(self.refresh_dialog_targets_from_provider)
+        _stabilize_control(self.dialog_target_refresh_button, 58)
+        start_layout.addWidget(self.dialog_target_refresh_button, 2, 3)
+
+        self.dialog_targets_list = QListWidget()
+        self.dialog_targets_list.setObjectName("focusWidgetTargetsList")
+        self.dialog_targets_list.setMinimumHeight(82)
+        self.dialog_targets_list.setMaximumHeight(108)
+        self.dialog_targets_list.setSpacing(1)
+        self.dialog_targets_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.dialog_targets_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.dialog_targets_list.customContextMenuRequested.connect(self.show_dialog_target_context_menu)
+        start_layout.addWidget(self.dialog_targets_list, 3, 0, 1, 4)
+
+        self.dialog_remove_target_button = QPushButton("삭제")
+        self.dialog_remove_target_button.setObjectName("ghostButton")
+        self.dialog_remove_target_button.clicked.connect(self.remove_selected_dialog_target)
+        _stabilize_control(self.dialog_remove_target_button, 58)
+        self.dialog_remove_target_button.hide()
+
+        start_layout.addWidget(QLabel("목표"), 4, 0)
+        self.planned_spin = QSpinBox()
+        self.planned_spin.setRange(1, 240)
+        self.planned_spin.setSuffix("분")
+        _stabilize_control(self.planned_spin, 82)
+        self.planned_spin.valueChanged.connect(lambda value: self.owner.planned_minutes_spin.setValue(value))
+        start_layout.addWidget(self.planned_spin, 4, 1)
+        start_layout.addWidget(QLabel("자리 비움"), 4, 2)
+        self.idle_spin = QSpinBox()
+        self.idle_spin.setRange(10, 600)
+        self.idle_spin.setSuffix("초")
+        _stabilize_control(self.idle_spin, 82)
+        self.idle_spin.valueChanged.connect(lambda value: self.owner.idle_cutoff_spin.setValue(value))
+        start_layout.addWidget(self.idle_spin, 4, 3)
+        self.start_button = QPushButton("시작")
+        self.start_button.clicked.connect(self.start_focus)
+        start_layout.addWidget(self.start_button, 5, 0, 1, 4)
+        layout.addWidget(self.start_panel)
+
         button_row = QHBoxLayout()
         self.pause_button = QPushButton("일시정지")
         self.pause_button.clicked.connect(owner.pause_or_resume_focus)
@@ -8157,30 +9836,173 @@ class FocusWidgetDialog(QDialog):
         layout.addLayout(button_row)
 
         self.refresh()
+        self.update_responsive_layout()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_responsive_layout()
+
+    def update_responsive_layout(self) -> None:
+        micro = self.width() < 280 or self.height() < 170
+        full = self.width() >= 430 and self.height() >= 300
+        self.title_label.setVisible(not micro)
+        self.always_on_top_check.setVisible(not micro)
+        self.status_label.setVisible(not micro)
+        self.progress.setVisible(not micro)
+        self.pause_button.setVisible(True)
+        self.done_button.setVisible(True)
+        self.detail_label.setVisible(full)
+        self.start_panel.setVisible(full)
+        self.time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.update_dialog_target_controls()
+
+    def update_dialog_target_controls(self) -> None:
+        target_visible = self.start_panel.isVisible() and self.dialog_use_target_check.isChecked()
+        for widget in (
+            self.dialog_target_combo,
+            self.dialog_target_refresh_button,
+            self.dialog_targets_list,
+        ):
+            widget.setVisible(target_visible)
+            widget.setEnabled(target_visible)
+        self.dialog_remove_target_button.hide()
+
+    def sync_title_to_owner(self, text: str) -> None:
+        if self._syncing_from_owner:
+            return
+        self.owner.focus_title_edit.setText(text)
+
+    def sync_target_check_to_owner(self, enabled: bool) -> None:
+        if self._syncing_from_owner:
+            self.update_dialog_target_controls()
+            return
+        self.owner.use_focus_target_check.setChecked(enabled)
+        if enabled:
+            self.sync_dialog_targets_from_owner(refresh_provider=True)
+        self.update_dialog_target_controls()
+
+    def refresh_dialog_targets_from_provider(self) -> None:
+        self.owner.refresh_targets()
+        self.sync_dialog_targets_from_owner()
+
+    def sync_dialog_targets_from_owner(self, refresh_provider: bool = False) -> None:
+        if refresh_provider or self.owner.target_combo.count() == 0:
+            self.owner.refresh_targets()
+            if self.owner.use_focus_target_check.isChecked() and not self.owner.target_combo.currentData():
+                for index in range(self.owner.target_combo.count()):
+                    if self.owner.target_combo.itemData(index):
+                        self.owner.target_combo.setCurrentIndex(index)
+                        break
+        current_data = self.dialog_target_combo.currentData()
+        owner_current_data = self.owner.target_combo.currentData()
+        self.dialog_target_combo.blockSignals(True)
+        self.dialog_target_combo.clear()
+        for index in range(self.owner.target_combo.count()):
+            self.dialog_target_combo.addItem(self.owner.target_combo.itemText(index), self.owner.target_combo.itemData(index))
+        target_data = current_data if current_data is not None else owner_current_data
+        if target_data is not None:
+            for index in range(self.dialog_target_combo.count()):
+                if self.dialog_target_combo.itemData(index) == target_data:
+                    self.dialog_target_combo.setCurrentIndex(index)
+                    break
+        self.dialog_target_combo.blockSignals(False)
+        self.dialog_targets_list.clear()
+        for index in range(self.owner.focus_targets_list.count()):
+            owner_item = self.owner.focus_targets_list.item(index)
+            item = QListWidgetItem(owner_item.text())
+            item.setData(Qt.ItemDataRole.UserRole, owner_item.data(Qt.ItemDataRole.UserRole))
+            item.setSizeHint(QSize(0, 24))
+            self.dialog_targets_list.addItem(item)
+        self.update_dialog_target_controls()
+
+    def add_target_from_dialog_combo(self) -> None:
+        if not self.dialog_use_target_check.isChecked():
+            return
+        target = self.dialog_target_combo.currentData()
+        if not target:
+            return
+        self.owner.add_focus_target(dict(target), show_duplicate_message=False)
+        self.sync_dialog_targets_from_owner()
+
+    def add_target_from_dialog_index(self, model_index) -> None:
+        if not model_index.isValid():
+            return
+        row = model_index.row()
+        if row < 0:
+            return
+        self.dialog_target_combo.setCurrentIndex(row)
+        self.add_target_from_dialog_combo()
+        self.dialog_target_combo.hidePopup()
+
+    def show_dialog_target_context_menu(self, position: QPoint) -> None:
+        item = self.dialog_targets_list.itemAt(position)
+        if item is None:
+            return
+        self.dialog_targets_list.setCurrentItem(item)
+        menu = _style_popup_menu(QMenu(self.dialog_targets_list), self.dialog_targets_list)
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(self.remove_selected_dialog_target)
+        menu.exec(self.dialog_targets_list.mapToGlobal(position))
+
+    def remove_selected_dialog_target(self) -> None:
+        row = self.dialog_targets_list.currentRow()
+        if row < 0:
+            return
+        target = self.dialog_targets_list.item(row).data(Qt.ItemDataRole.UserRole)
+        for index in range(self.owner.focus_targets_list.count()):
+            owner_item = self.owner.focus_targets_list.item(index)
+            if owner_item.data(Qt.ItemDataRole.UserRole) == target:
+                self.owner.focus_targets_list.takeItem(index)
+                break
+        self.sync_dialog_targets_from_owner()
+
+    def start_focus(self) -> None:
+        self.owner.focus_title_edit.setText(self.title_edit.text().strip())
+        self.owner.planned_minutes_spin.setValue(self.planned_spin.value())
+        self.owner.idle_cutoff_spin.setValue(self.idle_spin.value())
+        self.owner.start_focus()
+        self.refresh()
 
     def refresh(self) -> None:
         session = self.owner.focus_timer.session if self.owner.focus_timer else None
+        self._syncing_from_owner = True
+        self.title_edit.setText(self.owner.focus_title_edit.text())
+        self.planned_spin.setValue(self.owner.planned_minutes_spin.value())
+        self.idle_spin.setValue(self.owner.idle_cutoff_spin.value())
+        self.dialog_use_target_check.setChecked(self.owner.use_focus_target_check.isChecked())
+        self._syncing_from_owner = False
+        self.sync_dialog_targets_from_owner()
         if session is None:
             planned = self.owner.planned_minutes_spin.value() * 60
             self.title_label.setText(self.owner.focus_title_edit.text().strip() or "집중 대기")
             self.time_label.setText(_format_clock(planned))
             self.status_label.setText("대기 중")
+            self.detail_label.setText("집중할 일을 적고 시작하세요. 화면 지정은 메인창 설정을 따릅니다.")
             self.progress.setValue(0)
+            self.start_button.setEnabled(True)
             self.pause_button.setText("일시정지")
             self.pause_button.setEnabled(False)
             self.done_button.setEnabled(False)
+            self.update_responsive_layout()
             return
 
         ratio = self.owner.focus_timer.focus_ratio() if self.owner.focus_timer else 1.0
         progress = int(1000 * min(1.0, session.focused_seconds / max(1, session.planned_seconds)))
         self.title_label.setText(session.title)
-        self.time_label.setText(_format_clock(self.owner._display_remaining_seconds(session)))
+        self.time_label.setText(self.owner._display_focus_time_text(session))
         self.status_label.setText(f"{_status_label(session.status)} · 집중률 {int(ratio * 100)}%")
+        self.detail_label.setText(
+            f"목표 {_format_duration(session.planned_seconds)} · "
+            f"집중 {_format_duration(session.focused_seconds)} · "
+            f"이탈 {_format_duration(session.away_seconds)}"
+        )
         self.progress.setValue(progress)
         controls_enabled = session.status in {"running", "paused", "break"}
+        self.start_button.setEnabled(False)
         self.pause_button.setText("재개" if session.status in {"paused", "break"} else "일시정지")
         self.pause_button.setEnabled(controls_enabled)
         self.done_button.setEnabled(controls_enabled)
+        self.update_responsive_layout()
 
 
 class PomodoroWidgetDialog(QDialog):
@@ -8559,6 +10381,12 @@ class QuickNoteDetailDialog(QDialog):
         self.body_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         layout.addWidget(self.body_view, 1)
 
+        self.body_editor = RichNoteEditor(self.repository, self)
+        self.body_editor.text_edit.setMinimumHeight(280)
+        self.body_editor.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.body_editor.hide()
+        layout.addWidget(self.body_editor, 1)
+
         self.attachments_area = QScrollArea()
         self.attachments_area.setWidgetResizable(True)
         self.attachments_area.setFrameShape(QFrame.Shape.NoFrame)
@@ -8575,6 +10403,14 @@ class QuickNoteDetailDialog(QDialog):
         self.edit_button = QPushButton("수정")
         _stabilize_control(self.edit_button, 84)
         self.edit_button.clicked.connect(self.edit_note)
+        self.save_button = QPushButton("저장")
+        _stabilize_control(self.save_button, 84)
+        self.save_button.clicked.connect(self.save_edit)
+        self.save_button.hide()
+        self.cancel_button = QPushButton("취소")
+        _stabilize_control(self.cancel_button, 84)
+        self.cancel_button.clicked.connect(self.cancel_edit)
+        self.cancel_button.hide()
         self.delete_button = QPushButton("삭제")
         _stabilize_control(self.delete_button, 84)
         self.delete_button.clicked.connect(self.delete_note)
@@ -8582,6 +10418,8 @@ class QuickNoteDetailDialog(QDialog):
         _stabilize_control(close_button, 84)
         close_button.clicked.connect(self.accept)
         button_row.addWidget(self.edit_button)
+        button_row.addWidget(self.save_button)
+        button_row.addWidget(self.cancel_button)
         button_row.addWidget(self.delete_button)
         button_row.addStretch(1)
         button_row.addWidget(close_button)
@@ -8597,10 +10435,15 @@ class QuickNoteDetailDialog(QDialog):
             self.body_view.setPlainText("메모를 찾을 수 없습니다.")
             self.attachments_area.setVisible(False)
             self.edit_button.setEnabled(False)
+            self.save_button.setEnabled(False)
+            self.cancel_button.setEnabled(False)
             self.delete_button.setEnabled(False)
             return
 
+        self.set_edit_mode(False)
         self.edit_button.setEnabled(True)
+        self.save_button.setEnabled(True)
+        self.cancel_button.setEnabled(True)
         self.delete_button.setEnabled(True)
 
         meta = [f"작성 시간 {_format_datetime(note.created_at, _preferences_from_widget(self), '%Y-%m-%d')}"]
@@ -8654,13 +10497,34 @@ class QuickNoteDetailDialog(QDialog):
         if note is None:
             self.refresh_note()
             return
-        dialog = QuickNoteEditDialog(note, self.repository, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        self.body_editor.set_content(note.body, note.content_html)
+        self.set_edit_mode(True)
+
+    def save_edit(self) -> None:
+        note = self.repository.get_quick_note(self.note_id)
+        if note is None:
+            self.refresh_note()
             return
-        note.body = dialog.body() or "이미지 메모"
-        note.content_html = dialog.content_html()
+        if not self.body_editor.has_content():
+            QMessageBox.information(self, "빠른 메모 수정", "메모 내용을 입력하세요.")
+            return
+        note.body = self.body_editor.to_plain_text() or "이미지 메모"
+        note.content_html = self.body_editor.to_html()
         self.repository.save_quick_note(note)
         self.refresh_note()
+
+    def cancel_edit(self) -> None:
+        self.set_edit_mode(False)
+        self.refresh_note()
+
+    def set_edit_mode(self, editing: bool) -> None:
+        self.body_view.setVisible(not editing)
+        self.body_editor.setVisible(editing)
+        self.attachments_area.setVisible((not editing) and self.attachments_area.isVisible())
+        self.edit_button.setVisible(not editing)
+        self.save_button.setVisible(editing)
+        self.cancel_button.setVisible(editing)
+        self.delete_button.setVisible(not editing)
 
     def delete_note(self) -> None:
         note = self.repository.get_quick_note(self.note_id)
@@ -9235,13 +11099,33 @@ class FavoritesSettingsDialog(QDialog):
         self.selected_site_icon_data: bytes = b""
         self.selected_site_icon_file_name = ""
         self.setWindowTitle("즐겨찾기 설정")
-        self.resize(660, 520)
+        self.resize(760, 560)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
 
-        display_form = QFormLayout()
+        header = QWidget()
+        header.setObjectName("favoritesSettingsHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 14, 16, 14)
+        header_layout.setSpacing(12)
+
+        title_column = QVBoxLayout()
+        title_column.setSpacing(3)
+        title = QLabel("즐겨찾기")
+        title.setObjectName("settingsGroupTitle")
+        subtitle = QLabel("자주 여는 링크와 프로그램을 카드처럼 관리합니다.")
+        subtitle.setObjectName("mutedLabel")
+        title_column.addWidget(title)
+        title_column.addWidget(subtitle)
+        header_layout.addLayout(title_column, 1)
+
+        display_panel = QWidget()
+        display_panel.setObjectName("favoritesDisplayPanel")
+        display_form = QFormLayout(display_panel)
+        display_form.setContentsMargins(12, 9, 12, 9)
+        display_form.setSpacing(8)
         self.display_mode_combo = QComboBox()
         self.display_mode_combo.addItem("글자만 표시", "text")
         self.display_mode_combo.addItem("아이콘과 이름 표시", "icon_with_label")
@@ -9249,20 +11133,59 @@ class FavoritesSettingsDialog(QDialog):
         mode_index = self.display_mode_combo.findData(_normalized_favorite_display_mode(preferences.favorite_display_mode))
         self.display_mode_combo.setCurrentIndex(max(0, mode_index))
         display_form.addRow("표시 방식", self.display_mode_combo)
-        layout.addLayout(display_form)
+        header_layout.addWidget(display_panel)
+        layout.addWidget(header)
 
         body_row = QHBoxLayout()
+        body_row.setSpacing(14)
+        list_card = QWidget()
+        list_card.setObjectName("favoritesSettingsListCard")
+        list_layout = QVBoxLayout(list_card)
+        list_layout.setContentsMargins(14, 12, 14, 14)
+        list_layout.setSpacing(9)
+        list_title_row = QHBoxLayout()
+        list_title = QLabel("등록된 항목")
+        list_title.setObjectName("settingsColorLabel")
+        self.favorites_count_label = QLabel("0개")
+        self.favorites_count_label.setObjectName("timelineSummaryBadge")
+        list_title_row.addWidget(list_title)
+        list_title_row.addStretch(1)
+        list_title_row.addWidget(self.favorites_count_label)
+        list_layout.addLayout(list_title_row)
         self.favorites_list = QListWidget()
+        self.favorites_list.setObjectName("favoritesSettingsList")
         self.favorites_list.setMinimumWidth(190)
         self.favorites_list.currentItemChanged.connect(self.load_selected_favorite)
-        body_row.addWidget(self.favorites_list, 1)
+        list_layout.addWidget(self.favorites_list, 1)
+        body_row.addWidget(list_card, 1)
 
         editor = QWidget()
+        editor.setObjectName("favoritesSettingsEditorCard")
         editor_layout = QVBoxLayout(editor)
-        editor_layout.setContentsMargins(0, 0, 0, 0)
-        editor_layout.setSpacing(10)
+        editor_layout.setContentsMargins(16, 14, 16, 14)
+        editor_layout.setSpacing(12)
+
+        editor_header = QHBoxLayout()
+        editor_title_column = QVBoxLayout()
+        editor_title_column.setSpacing(3)
+        editor_title = QLabel("바로가기 편집")
+        editor_title.setObjectName("settingsColorLabel")
+        editor_hint = QLabel("이름, 실행 대상, 아이콘 표시를 정합니다.")
+        editor_hint.setObjectName("mutedLabel")
+        editor_title_column.addWidget(editor_title)
+        editor_title_column.addWidget(editor_hint)
+        editor_header.addLayout(editor_title_column, 1)
+
+        self.favorite_icon_preview = QLabel("Aa")
+        self.favorite_icon_preview.setObjectName("favoriteIconPreview")
+        self.favorite_icon_preview.setFixedSize(58, 58)
+        self.favorite_icon_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        editor_header.addWidget(self.favorite_icon_preview)
+        editor_layout.addLayout(editor_header)
 
         form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.favorite_title_edit = QLineEdit()
         self.favorite_title_edit.setPlaceholderText("화면에 보일 이름")
         self.favorite_target_edit = QLineEdit()
@@ -9273,16 +11196,23 @@ class FavoritesSettingsDialog(QDialog):
         self.favorite_icon_path_edit = QLineEdit()
         self.favorite_icon_path_edit.setReadOnly(True)
         self.favorite_icon_path_edit.setPlaceholderText("아이콘 이미지 파일")
+        self.favorite_title_edit.textChanged.connect(lambda _text: self.update_favorite_icon_preview())
+        self.favorite_target_edit.textChanged.connect(lambda _text: self.update_favorite_icon_preview())
+        self.favorite_icon_text_edit.textChanged.connect(lambda _text: self.update_favorite_icon_preview())
 
         icon_file_row = QHBoxLayout()
+        icon_file_row.setSpacing(6)
         icon_file_row.addWidget(self.favorite_icon_path_edit, 1)
         choose_icon_button = QPushButton("선택")
+        choose_icon_button.setObjectName("softButton")
         _stabilize_control(choose_icon_button, 72)
         choose_icon_button.clicked.connect(self.choose_favorite_icon)
         site_icon_button = QPushButton("사이트 아이콘")
+        site_icon_button.setObjectName("softButton")
         _stabilize_control(site_icon_button, 104)
         site_icon_button.clicked.connect(self.fetch_favorite_site_icon)
         clear_icon_button = QPushButton("비우기")
+        clear_icon_button.setObjectName("ghostButton")
         _stabilize_control(clear_icon_button, 72)
         clear_icon_button.clicked.connect(self.clear_favorite_icon)
         icon_file_row.addWidget(choose_icon_button)
@@ -9297,12 +11227,15 @@ class FavoritesSettingsDialog(QDialog):
 
         action_row = QHBoxLayout()
         new_button = QPushButton("새 즐겨찾기")
+        new_button.setObjectName("ghostButton")
         _stabilize_control(new_button, 104)
         new_button.clicked.connect(self.clear_editor)
         save_button = QPushButton("저장")
+        save_button.setObjectName("primaryButton")
         _stabilize_control(save_button, 84)
         save_button.clicked.connect(self.save_favorite)
         delete_button = QPushButton("삭제")
+        delete_button.setObjectName("ghostButton")
         _stabilize_control(delete_button, 84)
         delete_button.clicked.connect(self.delete_selected_favorite)
         action_row.addWidget(new_button)
@@ -9318,12 +11251,14 @@ class FavoritesSettingsDialog(QDialog):
         button_row = QHBoxLayout()
         button_row.addStretch(1)
         done_button = QPushButton("완료")
+        done_button.setObjectName("primaryButton")
         _stabilize_control(done_button, 84)
         done_button.clicked.connect(self.accept)
         button_row.addWidget(done_button)
         layout.addLayout(button_row)
 
         self.refresh_favorites()
+        self.update_favorite_icon_preview()
 
     def favorite_display_mode(self) -> str:
         return _normalized_favorite_display_mode(str(self.display_mode_combo.currentData()))
@@ -9332,7 +11267,10 @@ class FavoritesSettingsDialog(QDialog):
         self.favorites_list.blockSignals(True)
         self.favorites_list.clear()
         selected_row = -1
-        for row, favorite in enumerate(self.repository.list_link_favorites()):
+        favorites = self.repository.list_link_favorites()
+        if hasattr(self, "favorites_count_label"):
+            self.favorites_count_label.setText(f"{len(favorites)}개")
+        for row, favorite in enumerate(favorites):
             item = QListWidgetItem(favorite.title)
             item.setData(Qt.ItemDataRole.UserRole, favorite.id)
             item.setToolTip(favorite.target)
@@ -9368,6 +11306,7 @@ class FavoritesSettingsDialog(QDialog):
         self.favorite_target_edit.setText(favorite.target)
         self.favorite_icon_text_edit.setText(favorite.icon_text)
         self.favorite_icon_path_edit.setText(favorite.icon_path)
+        self.update_favorite_icon_preview()
 
     def clear_editor(self) -> None:
         self.selected_favorite_id = None
@@ -9379,6 +11318,7 @@ class FavoritesSettingsDialog(QDialog):
         self.favorite_target_edit.clear()
         self.favorite_icon_text_edit.clear()
         self.favorite_icon_path_edit.clear()
+        self.update_favorite_icon_preview()
 
     def choose_favorite_icon(self) -> None:
         file_path, _selected_filter = QFileDialog.getOpenFileName(
@@ -9393,6 +11333,7 @@ class FavoritesSettingsDialog(QDialog):
         self.selected_site_icon_data = b""
         self.selected_site_icon_file_name = ""
         self.favorite_icon_path_edit.setText(file_path)
+        self.update_favorite_icon_preview()
 
     def fetch_favorite_site_icon(self) -> None:
         target = self.favorite_target_edit.text().strip()
@@ -9411,12 +11352,42 @@ class FavoritesSettingsDialog(QDialog):
         self.selected_site_icon_file_name = file_name
         self.selected_site_icon_data = data
         self.favorite_icon_path_edit.setText(f"사이트 아이콘: {file_name}")
+        self.update_favorite_icon_preview()
 
     def clear_favorite_icon(self) -> None:
         self.selected_icon_source_path = ""
         self.selected_site_icon_data = b""
         self.selected_site_icon_file_name = ""
         self.favorite_icon_path_edit.clear()
+        self.update_favorite_icon_preview()
+
+    def update_favorite_icon_preview(self) -> None:
+        preview = getattr(self, "favorite_icon_preview", None)
+        if not isinstance(preview, QLabel):
+            return
+        pixmap = QPixmap()
+        if self.selected_site_icon_data:
+            pixmap.loadFromData(self.selected_site_icon_data)
+        else:
+            icon_path = self.selected_icon_source_path or self.favorite_icon_path_edit.text().strip()
+            if icon_path and not icon_path.startswith("사이트 아이콘:") and Path(icon_path).exists():
+                pixmap = QPixmap(icon_path)
+        if not pixmap.isNull():
+            preview.setText("")
+            preview.setPixmap(
+                pixmap.scaled(
+                    34,
+                    34,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+            )
+            return
+        preview.setPixmap(QPixmap())
+        fallback = self.favorite_icon_text_edit.text().strip()
+        if not fallback:
+            fallback = (self.favorite_title_edit.text().strip() or self.favorite_target_edit.text().strip() or "Aa")[:2]
+        preview.setText(fallback[:2])
 
     def save_favorite(self) -> None:
         target = self.favorite_target_edit.text().strip()
@@ -9495,6 +11466,15 @@ class ChecklistItemEditDialog(QDialog):
         _populate_item_type_combo(self.item_type_combo, repository, item_type, item.item_type_id)
         _stabilize_control(self.item_type_combo, 150)
 
+        initial_date = self._item_date()
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setMinimumDate(QDate(2000, 1, 1))
+        self.date_edit.setMaximumDate(QDate(2100, 12, 31))
+        self.date_edit.setDate(QDate(initial_date.year, initial_date.month, initial_date.day))
+        _stabilize_control(self.date_edit, 132)
+
         self.time_edit = QTimeEdit()
         self.time_edit.setDisplayFormat(_time_edit_display_format(_preferences_from_widget(parent)))
         self.time_edit.setTime(self._item_time())
@@ -9506,7 +11486,9 @@ class ChecklistItemEditDialog(QDialog):
             self.use_time_check = QCheckBox("시간 지정")
             self.use_time_check.setChecked(task is not None and task.due_at is not None)
             self.use_time_check.toggled.connect(self.time_edit.setEnabled)
+            self.use_time_check.toggled.connect(self.date_edit.setEnabled)
             self.time_edit.setEnabled(self.use_time_check.isChecked())
+            self.date_edit.setEnabled(self.use_time_check.isChecked())
 
         self.minutes_spin = QSpinBox()
         self.minutes_spin.setRange(0, 240)
@@ -9518,6 +11500,7 @@ class ChecklistItemEditDialog(QDialog):
         form.addRow("제목", self.title_edit)
         if self.use_time_check is not None:
             form.addRow("", self.use_time_check)
+        form.addRow("날짜", self.date_edit)
         form.addRow("시간", self.time_edit)
         form.addRow("소요", self.minutes_spin)
         layout.addLayout(form)
@@ -9540,6 +11523,9 @@ class ChecklistItemEditDialog(QDialog):
     def selected_time(self) -> QTime:
         return self.time_edit.time()
 
+    def selected_date_value(self) -> date:
+        return _date_from_qdate(self.date_edit.date())
+
     def duration_minutes(self) -> int:
         return self.minutes_spin.value()
 
@@ -9551,7 +11537,7 @@ class ChecklistItemEditDialog(QDialog):
 
     def selected_datetime(self) -> datetime:
         qtime = self.selected_time()
-        return datetime.combine(self.item_date, time(qtime.hour(), qtime.minute()))
+        return datetime.combine(self.selected_date_value(), time(qtime.hour(), qtime.minute()))
 
     def accept(self) -> None:
         if not self.item_title():
@@ -9703,17 +11689,20 @@ class TodayChecklistWidget(QWidget):
         self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
+        self.panel_rhythm_layout = layout
+        _apply_panel_rhythm(layout)
 
         title_row = QHBoxLayout()
         if show_title:
             title = QLabel("오늘 체크리스트")
             title.setObjectName("sectionTitle")
+            _stabilize_panel_caption(title)
             title_row.addWidget(title)
         title_row.addStretch(1)
         self.summary_label = QLabel()
         self.summary_label.setObjectName("checklistSummaryBadge")
+        self.summary_label.setMinimumHeight(PANEL_CONTROL_HEIGHT)
+        self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_row.addWidget(self.summary_label)
         layout.addLayout(title_row)
 
@@ -9735,15 +11724,15 @@ class TodayChecklistWidget(QWidget):
         items_widget = QWidget()
         items_widget.setMinimumWidth(0)
         self.items_layout = QVBoxLayout(items_widget)
-        self.items_layout.setContentsMargins(0, 0, 0, 0)
-        self.items_layout.setSpacing(10)
+        self.items_layout.setContentsMargins(8, 8, 8, 8)
+        self.items_layout.setSpacing(12)
 
         self.active_label = QLabel()
         self.active_label.setObjectName("eyebrowLabel")
         self.items_layout.addWidget(self.active_label)
         self.active_items_layout = QVBoxLayout()
         self.active_items_layout.setContentsMargins(0, 0, 0, 0)
-        self.active_items_layout.setSpacing(6)
+        self.active_items_layout.setSpacing(9)
         self.items_layout.addLayout(self.active_items_layout)
 
         self.completed_label = QLabel()
@@ -9751,35 +11740,47 @@ class TodayChecklistWidget(QWidget):
         self.items_layout.addWidget(self.completed_label)
         self.completed_items_layout = QVBoxLayout()
         self.completed_items_layout.setContentsMargins(0, 0, 0, 0)
-        self.completed_items_layout.setSpacing(6)
+        self.completed_items_layout.setSpacing(9)
         self.items_layout.addLayout(self.completed_items_layout)
         self.items_layout.addStretch(1)
 
         self.items_area.setWidget(items_widget)
-        layout.addWidget(self.items_area, 1)
 
         add_panel = QWidget()
         add_panel.setObjectName("checklistAddPanel")
         add_row = QHBoxLayout(add_panel)
-        add_row.setContentsMargins(10, 9, 10, 9)
+        add_row.setContentsMargins(12, 11, 12, 11)
         add_row.setSpacing(8)
         self.new_task_type_combo = QComboBox()
+        self.new_task_type_combo.setObjectName("checklistFolderCombo")
+        self.new_task_type_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_task_type_combo.view().setObjectName("checklistFolderComboView")
+        self.new_task_type_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
+        self.new_task_type_combo.view().pressed.connect(self.select_checklist_folder_from_index)
         _populate_item_type_combo(self.new_task_type_combo, self.repository, "task")
         _stabilize_control(self.new_task_type_combo, 110)
         self.new_task_edit = QLineEdit()
+        self.new_task_edit.setObjectName("checklistInput")
         self.new_task_edit.setPlaceholderText("오늘 항목 추가")
         _stabilize_control(self.new_task_edit, 160)
         self.new_task_edit.returnPressed.connect(self.add_today_task)
         add_button = QPushButton("추가")
-        add_button.setObjectName("softButton")
+        add_button.setObjectName("checklistAddButton")
         _stabilize_control(add_button, 72)
         add_button.clicked.connect(self.add_today_task)
         add_row.addWidget(self.new_task_type_combo)
         add_row.addWidget(self.new_task_edit, 1)
         add_row.addWidget(add_button)
         layout.addWidget(add_panel)
+        layout.addWidget(self.items_area, 1)
 
         self.refresh_checklist()
+
+    def select_checklist_folder_from_index(self, model_index) -> None:
+        if not model_index.isValid():
+            return
+        self.new_task_type_combo.setCurrentIndex(model_index.row())
+        self.new_task_type_combo.hidePopup()
 
     def refresh_checklist(self) -> None:
         self._refreshing = True
@@ -9898,17 +11899,17 @@ class TodayChecklistWidget(QWidget):
         row.setToolTip(label)
         row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         row_layout = QHBoxLayout(row)
-        row_layout.setContentsMargins(4, 9, 4, 9)
+        row_layout.setContentsMargins(8, 12, 8, 12)
         row_layout.setSpacing(12)
 
         checkbox = QCheckBox()
         checkbox.setObjectName("checklistItemCheckDone" if completed else "checklistItemCheck")
         checkbox.setToolTip(label)
-        checkbox.setMinimumSize(22, 22)
-        checkbox.setMaximumSize(22, 22)
-        checkbox.setMinimumWidth(22)
-        checkbox.setMaximumWidth(22)
-        checkbox.setFixedHeight(22)
+        checkbox.setMinimumSize(19, 19)
+        checkbox.setMaximumSize(19, 19)
+        checkbox.setMinimumWidth(19)
+        checkbox.setMaximumWidth(19)
+        checkbox.setFixedHeight(19)
         checkbox.setChecked(bool(item["completed"]))
         checkbox.toggled.connect(
             lambda checked, item_type=str(item["type"]), item_id=int(item["id"]): self.set_completed(
@@ -9921,7 +11922,7 @@ class TodayChecklistWidget(QWidget):
 
         text_box = QVBoxLayout()
         text_box.setContentsMargins(0, 0, 0, 0)
-        text_box.setSpacing(6)
+        text_box.setSpacing(8)
 
         title_label = QLabel(str(item.get("title") or label))
         title_label.setObjectName("checklistItemTitleDone" if completed else "checklistItemTitle")
@@ -9931,30 +11932,19 @@ class TodayChecklistWidget(QWidget):
         title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         text_box.addWidget(title_label)
 
-        meta_widget = QWidget()
-        meta_widget.setObjectName("checklistMetaRow")
-        meta_widget.setMinimumWidth(0)
-        meta_row = QHBoxLayout()
-        meta_row.setContentsMargins(0, 0, 0, 0)
-        meta_row.setSpacing(6)
-        meta_widget.setLayout(meta_row)
-        for key, object_name in (
-            ("time_label", "checklistTimeBadge"),
-            ("kind", "checklistKindBadge"),
-            ("detail", "checklistDetailBadge"),
-        ):
-            value = str(item.get(key) or "").strip()
-            if not value:
-                continue
-            badge = QLabel(value)
-            badge.setObjectName(object_name)
-            badge.setMinimumWidth(0)
-            badge.setMaximumWidth(170)
-            badge.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
-            badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-            meta_row.addWidget(badge)
-        meta_row.addStretch(1)
-        text_box.addWidget(meta_widget)
+        meta_values = [
+            str(item.get(key) or "").strip()
+            for key in ("time_label", "kind", "detail")
+            if str(item.get(key) or "").strip()
+        ]
+        if meta_values:
+            meta_label = QLabel(" · ".join(meta_values))
+            meta_label.setObjectName("checklistItemMetaDone" if completed else "checklistItemMeta")
+            meta_label.setWordWrap(True)
+            meta_label.setMinimumWidth(0)
+            meta_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+            meta_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            text_box.addWidget(meta_label)
         row_layout.addLayout(text_box, 1)
 
         for menu_widget in (row, checkbox):
@@ -10050,13 +12040,14 @@ class TodayChecklistWidget(QWidget):
         item_id: int,
         label: str,
     ) -> None:
-        menu = QMenu(widget)
-        edit_action = menu.addAction("수정")
-        edit_action.triggered.connect(lambda _checked=False: self.edit_item(item_type, item_id))
-        menu.addSeparator()
-        delete_action = menu.addAction("삭제")
-        delete_action.triggered.connect(lambda _checked=False: self.delete_item(item_type, item_id, label))
-        menu.exec(widget.mapToGlobal(position))
+        _show_light_action_popup(
+            widget,
+            position,
+            [
+                ("수정", lambda: self.edit_item(item_type, item_id), True),
+                ("삭제", lambda: self.delete_item(item_type, item_id, label), True),
+            ],
+        )
 
     def edit_item(self, item_type: str, item_id: int) -> None:
         item: Task | Event | None
@@ -10186,21 +12177,26 @@ class TodayTimelineWidget(QWidget):
         self.on_delete_focus_session = on_delete_focus_session
         self.show_waiting_panel = show_waiting_panel
         self.waiting_panel_pinned = waiting_panel_pinned
+        self.waiting_auto_collapsed = False
         self.on_waiting_pinned_changed = on_waiting_pinned_changed
         self.setObjectName("timelinePanel")
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
+        self.panel_rhythm_layout = layout
+        _apply_panel_rhythm(layout)
 
         title_row = QHBoxLayout()
         if title_text:
             title = QLabel(title_text)
             title.setObjectName("sectionTitle")
+            _stabilize_panel_caption(title)
             title_row.addWidget(title)
         title_row.addStretch(1)
         self.date_label = QLabel()
         self.date_label.setObjectName("timelineDateBadge")
+        self.date_label.setMinimumHeight(PANEL_CONTROL_HEIGHT)
+        self.date_label.setMaximumHeight(PANEL_CONTROL_HEIGHT)
+        self.date_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         title_row.addWidget(self.date_label)
         layout.addLayout(title_row)
 
@@ -10208,6 +12204,7 @@ class TodayTimelineWidget(QWidget):
         self.summary_label.setObjectName("timelineSummaryBadge")
         self.summary_label.setWordWrap(True)
         self.summary_label.setMinimumWidth(0)
+        self.summary_label.hide()
 
         stat_strip = QWidget()
         stat_strip.setObjectName("timelineStatStrip")
@@ -10238,7 +12235,6 @@ class TodayTimelineWidget(QWidget):
         toolbar_layout = QHBoxLayout(toolbar)
         toolbar_layout.setContentsMargins(10, 8, 10, 8)
         toolbar_layout.setSpacing(8)
-        toolbar_layout.addWidget(self.summary_label, 0, Qt.AlignmentFlag.AlignVCenter)
         toolbar_layout.addStretch(1)
         filter_row = QHBoxLayout()
         filter_row.setContentsMargins(0, 0, 0, 0)
@@ -10246,6 +12242,31 @@ class TodayTimelineWidget(QWidget):
         filter_label = QLabel("보기")
         filter_label.setObjectName("mutedLabel")
         filter_row.addWidget(filter_label)
+        filter_segment = QWidget()
+        filter_segment.setObjectName("timelineFilterSegment")
+        filter_segment_layout = QHBoxLayout(filter_segment)
+        filter_segment_layout.setContentsMargins(3, 3, 3, 3)
+        filter_segment_layout.setSpacing(2)
+        self.timeline_filter_key = "all"
+        self.timeline_filter_button_group = QButtonGroup(self)
+        self.timeline_filter_button_group.setExclusive(True)
+        self.timeline_filter_buttons: dict[str, QToolButton] = {}
+        for filter_text, filter_key in (
+            ("전체", "all"),
+            ("항목", "schedule_task"),
+            ("완료", "completed"),
+            ("집중", "focus"),
+        ):
+            button = QToolButton()
+            button.setObjectName("timelineFilterButton")
+            button.setText(filter_text)
+            button.setCheckable(True)
+            button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            button.clicked.connect(lambda _checked=False, key=filter_key: self.set_timeline_filter(key))
+            self.timeline_filter_button_group.addButton(button)
+            self.timeline_filter_buttons[filter_key] = button
+            filter_segment_layout.addWidget(button)
+        filter_row.addWidget(filter_segment)
         self.timeline_filter_combo = QComboBox()
         self.timeline_filter_combo.setObjectName("timelineFilterCombo")
         self.timeline_filter_combo.addItem("전체", "all")
@@ -10254,8 +12275,11 @@ class TodayTimelineWidget(QWidget):
         self.timeline_filter_combo.addItem("집중 기록", "focus")
         _stabilize_control(self.timeline_filter_combo, 88)
         self.timeline_filter_combo.setMinimumWidth(72)
-        self.timeline_filter_combo.currentIndexChanged.connect(lambda _index: self.refresh_timeline())
-        filter_row.addWidget(self.timeline_filter_combo)
+        self.timeline_filter_combo.hide()
+        self.timeline_filter_combo.currentIndexChanged.connect(
+            lambda _index: self.set_timeline_filter(str(self.timeline_filter_combo.currentData() or "all"))
+        )
+        self._sync_timeline_filter_buttons("all")
         toolbar_layout.addLayout(filter_row)
         time_layout.addWidget(toolbar)
 
@@ -10335,11 +12359,54 @@ class TodayTimelineWidget(QWidget):
 
         self.refresh_timeline()
 
+    def _preferences(self) -> Preference:
+        current = self.parentWidget()
+        while current is not None:
+            preferences = getattr(current, "preferences", None)
+            if isinstance(preferences, Preference):
+                self.preferences = preferences
+                return preferences
+            current = current.parentWidget()
+        preferences = self.repository.get_preferences()
+        self.preferences = preferences
+        return preferences
+
     def _build_timeline_stat_chip(self, label: str, value: str) -> QLabel:
         chip = QLabel(f"{label} {value}")
         chip.setObjectName("timelineStatChip")
         chip.setMinimumWidth(0)
         return chip
+
+    def set_timeline_filter(self, filter_key: str) -> None:
+        valid_keys = {"all", "schedule_task", "completed", "focus"}
+        next_key = filter_key if filter_key in valid_keys else "all"
+        if getattr(self, "timeline_filter_key", "all") == next_key:
+            self._sync_timeline_filter_buttons(next_key)
+            return
+        self.timeline_filter_key = next_key
+        if hasattr(self, "timeline_filter_combo"):
+            index = self.timeline_filter_combo.findData(next_key)
+            if index >= 0 and self.timeline_filter_combo.currentIndex() != index:
+                self.timeline_filter_combo.blockSignals(True)
+                self.timeline_filter_combo.setCurrentIndex(index)
+                self.timeline_filter_combo.blockSignals(False)
+        self._sync_timeline_filter_buttons(next_key)
+        self.refresh_timeline()
+
+    def _current_timeline_filter_key(self) -> str:
+        if hasattr(self, "timeline_filter_key"):
+            return str(self.timeline_filter_key)
+        if hasattr(self, "timeline_filter_combo"):
+            return str(self.timeline_filter_combo.currentData() or "all")
+        return "all"
+
+    def _sync_timeline_filter_buttons(self, filter_key: str) -> None:
+        buttons = getattr(self, "timeline_filter_buttons", {})
+        for key, button in buttons.items():
+            if isinstance(button, QToolButton):
+                button.blockSignals(True)
+                button.setChecked(key == filter_key)
+                button.blockSignals(False)
 
     def set_waiting_panel_visible(
         self,
@@ -10350,33 +12417,69 @@ class TodayTimelineWidget(QWidget):
         self.show_waiting_panel = visible
         if pinned is not None:
             self.waiting_panel_pinned = pinned
-        rail_visible = visible and not self.waiting_panel_pinned
-        panel_visible = visible and self.waiting_panel_pinned
+        self._apply_waiting_panel_layout()
+        if notify and self.on_waiting_pinned_changed is not None and pinned is not None:
+            self.on_waiting_pinned_changed(self.waiting_panel_pinned)
+
+    def _apply_waiting_panel_layout(self) -> None:
+        if not hasattr(self, "content_splitter"):
+            return
+        visible = self.show_waiting_panel
+        self.waiting_auto_collapsed = visible and self.waiting_panel_pinned and self.width() < 760
+        effective_pinned = self.waiting_panel_pinned and not self.waiting_auto_collapsed
+        rail_visible = visible and not effective_pinned
+        panel_visible = visible and effective_pinned
         if hasattr(self, "waiting_rail"):
             self.waiting_rail.setVisible(rail_visible)
         if hasattr(self, "waiting_panel"):
             self.waiting_panel.setVisible(panel_visible)
         if hasattr(self, "waiting_pin_button"):
             self.waiting_pin_button.setText("접기" if self.waiting_panel_pinned else "고정")
-            self.waiting_pin_button.setToolTip("대기함을 사이드바로 접기" if self.waiting_panel_pinned else "대기함을 펼쳐 고정")
-        if visible and self.waiting_panel_pinned:
+            if self.waiting_auto_collapsed:
+                self.waiting_pin_button.setToolTip("폭이 좁아 대기함이 임시로 접혔습니다.")
+            else:
+                self.waiting_pin_button.setToolTip("대기함을 사이드바로 접기" if self.waiting_panel_pinned else "대기함을 펼쳐 고정")
+        total_width = max(0, self.content_splitter.width()) if hasattr(self, "content_splitter") else 0
+        if panel_visible:
             self.content_splitter.setStretchFactor(0, 3)
             self.content_splitter.setStretchFactor(1, 0)
             self.content_splitter.setStretchFactor(2, 1)
-            current_sizes = self.content_splitter.sizes()
-            if len(current_sizes) == 3 and (current_sizes[2] <= 0 or current_sizes[0] <= 0):
-                self.content_splitter.setSizes([680, 42, 260])
-        elif visible:
+            side_width = min(260, max(170, total_width // 4 if total_width else 220))
+            table_width = max(260, total_width - side_width) if total_width else 680
+            self.content_splitter.setSizes([table_width, 0, side_width])
+        elif rail_visible:
             self.content_splitter.setStretchFactor(0, 1)
             self.content_splitter.setStretchFactor(1, 0)
             self.content_splitter.setStretchFactor(2, 0)
-            self.content_splitter.setSizes([900, 42, 0])
+            table_width = max(260, total_width - 42) if total_width else 900
+            self.content_splitter.setSizes([table_width, 42, 0])
         else:
             self.content_splitter.setStretchFactor(0, 1)
             self.content_splitter.setStretchFactor(1, 0)
             self.content_splitter.setStretchFactor(2, 0)
-        if notify and self.on_waiting_pinned_changed is not None and pinned is not None:
-            self.on_waiting_pinned_changed(self.waiting_panel_pinned)
+            self.content_splitter.setSizes([max(260, total_width) if total_width else 900, 0, 0])
+        QTimer.singleShot(0, self._finalize_waiting_panel_layout)
+
+    def _finalize_waiting_panel_layout(self) -> None:
+        if not hasattr(self, "content_splitter"):
+            return
+        total_width = max(0, self.content_splitter.width())
+        if total_width <= 0:
+            return
+        visible = self.show_waiting_panel
+        effective_pinned = self.waiting_panel_pinned and not getattr(self, "waiting_auto_collapsed", False)
+        rail_visible = visible and not effective_pinned
+        panel_visible = visible and effective_pinned
+        if panel_visible:
+            side_width = min(260, max(170, total_width // 4))
+            sizes = [max(260, total_width - side_width), 0, side_width]
+        elif rail_visible:
+            sizes = [max(260, total_width - 42), 42, 0]
+        else:
+            sizes = [max(260, total_width), 0, 0]
+        if self.content_splitter.sizes() != sizes:
+            self.content_splitter.setSizes(sizes)
+        self._resize_time_columns()
 
     def set_waiting_panel_pinned(self, pinned: bool, notify: bool = True) -> None:
         self.set_waiting_panel_visible(self.show_waiting_panel, pinned, notify=notify)
@@ -10457,7 +12560,7 @@ class TodayTimelineWidget(QWidget):
         self.timeline_event_edit.setPlaceholderText("시간 있는 할 일 추가")
         _stabilize_control(self.timeline_event_edit, 120)
         self.timeline_event_time = QTimeEdit()
-        self.timeline_event_time.setDisplayFormat(_time_edit_display_format(_preferences_from_widget(self)))
+        self.timeline_event_time.setDisplayFormat(_time_edit_display_format(self._preferences()))
         self.timeline_event_time.setTime(QTime.currentTime())
         _stabilize_control(self.timeline_event_time, 76)
         add_event_button = QPushButton("추가")
@@ -10491,7 +12594,7 @@ class TodayTimelineWidget(QWidget):
         return panel
 
     def add_waiting_task(self) -> None:
-        preferences = _preferences_from_widget(self)
+        preferences = self._preferences()
         dialog = TaskAddDialog(self.repository, self.selected_date, preferences, self)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
@@ -10532,8 +12635,12 @@ class TodayTimelineWidget(QWidget):
         block_time = self._time_for_block_position(position, source_widget)
         if block_time is None:
             return
-        menu = QMenu(self.block_table)
-        time_label = _format_time(block_time, _preferences_from_widget(self))
+        menu = _style_popup_menu(QMenu(self.block_table), source_widget)
+        payloads = self._payloads_for_block_position(position, source_widget)
+        if payloads:
+            self._add_time_block_item_actions(menu, payloads)
+            menu.addSeparator()
+        time_label = _format_time(block_time, self._preferences())
         for item_type in self.repository.list_item_types("task"):
             action = menu.addAction(f"{time_label} {item_type.name} 추가")
             action.triggered.connect(
@@ -10544,6 +12651,69 @@ class TodayTimelineWidget(QWidget):
                 )
             )
         menu.exec(source_widget.mapToGlobal(position))
+
+    def _payloads_for_block_position(self, position: QPoint, source: QWidget | None = None) -> list[dict[str, object]]:
+        source_widget = source or self.block_table.viewport()
+        if source_widget is self.block_table or source_widget is self.block_table.viewport():
+            viewport_position = position
+        else:
+            viewport_position = self.block_table.viewport().mapFromGlobal(source_widget.mapToGlobal(position))
+        row = self.block_table.rowAt(viewport_position.y())
+        column = self.block_table.columnAt(viewport_position.x())
+        if row < 0 or column < 1:
+            return []
+        item = self.block_table.item(row, column)
+        if item is None:
+            return []
+        payloads = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(payloads, list):
+            return []
+        return [dict(payload) for payload in payloads if isinstance(payload, dict)]
+
+    def _add_time_block_item_actions(self, menu: QMenu, payloads: list[dict[str, object]]) -> None:
+        if len(payloads) > 1:
+            title_action = menu.addAction("이 시간의 항목")
+            title_action.setEnabled(False)
+        for index, payload in enumerate(payloads):
+            if index:
+                menu.addSeparator()
+            item_type = str(payload.get("type", ""))
+            item_id = int(payload.get("id") or 0)
+            title = str(payload.get("title") or "")
+            label = _shorten(title or "항목", 28)
+            if item_type == "focus_session":
+                delete_action = menu.addAction(f"집중 기록 삭제 - {label}")
+                delete_action.triggered.connect(lambda _checked=False, session_id=item_id: self.delete_focus_session(session_id))
+                continue
+            if item_type not in {"task", "event"}:
+                continue
+            if item_type == "task" and self.on_focus_task is not None:
+                focus_action = menu.addAction(f"집중으로 가져오기 - {label}")
+                focus_action.triggered.connect(lambda _checked=False, task_id=item_id: self.on_focus_task(task_id))
+            edit_action = menu.addAction(f"수정 - {label}")
+            edit_action.triggered.connect(
+                lambda _checked=False, target_type=item_type, target_id=item_id: self.edit_timeline_item(
+                    target_type,
+                    target_id,
+                )
+            )
+            completed = bool(payload.get("completed", False))
+            complete_action = menu.addAction(f"{'완료 취소' if completed else '완료 처리'} - {label}")
+            complete_action.triggered.connect(
+                lambda _checked=False, target_type=item_type, target_id=item_id, target_completed=completed: self.set_timeline_item_completed(
+                    target_type,
+                    target_id,
+                    not target_completed,
+                )
+            )
+            delete_action = menu.addAction(f"삭제 - {label}")
+            delete_action.triggered.connect(
+                lambda _checked=False, target_type=item_type, target_id=item_id, target_title=title: self.delete_timeline_item(
+                    target_type,
+                    target_id,
+                    target_title,
+                )
+            )
 
     def _time_for_block_position(self, position: QPoint, source: QWidget | None = None) -> datetime | None:
         source_widget = source or self.block_table.viewport()
@@ -10651,7 +12821,7 @@ class TodayTimelineWidget(QWidget):
             return
 
         task_id = int(data["id"])
-        menu = QMenu(self.waiting_list)
+        menu = _style_popup_menu(QMenu(self.waiting_list), self.waiting_list)
         if self.on_focus_task is not None:
             focus_action = menu.addAction("집중으로 가져오기")
             focus_action.triggered.connect(lambda _checked=False: self.on_focus_task(task_id))
@@ -10678,7 +12848,7 @@ class TodayTimelineWidget(QWidget):
         item_type = str(data.get("type", ""))
         item_id = int(data.get("id", 0))
         title = str(data.get("title", ""))
-        menu = QMenu(self.timeline_list)
+        menu = _style_popup_menu(QMenu(self.timeline_list), self.timeline_list)
 
         if item_type == "focus_session":
             delete_action = menu.addAction("집중 기록 삭제")
@@ -10788,7 +12958,7 @@ class TodayTimelineWidget(QWidget):
 
     def refresh_timeline(self) -> None:
         selected_date = self.selected_date
-        preferences = _preferences_from_widget(self)
+        preferences = self._preferences()
         if hasattr(self, "timeline_event_time"):
             self.timeline_event_time.setDisplayFormat(_time_edit_display_format(preferences))
         if hasattr(self, "timeline_event_type_combo"):
@@ -10797,7 +12967,7 @@ class TodayTimelineWidget(QWidget):
         self.date_label.setText(selected_date.strftime("%Y년 %m월 %d일"))
         all_items = _today_timeline_items(self.repository, selected_date, preferences)
         all_blocks = _today_timeline_blocks(self.repository, selected_date)
-        filter_key = str(self.timeline_filter_combo.currentData()) if hasattr(self, "timeline_filter_combo") else "all"
+        filter_key = self._current_timeline_filter_key()
         items = [item for item in all_items if _timeline_filter_matches(item[2], filter_key)]
         blocks = [block for block in all_blocks if _timeline_filter_matches(block[2], filter_key)]
         schedule_count = sum(1 for item in all_items if item[2] in {"schedule", "task"})
@@ -10806,10 +12976,8 @@ class TodayTimelineWidget(QWidget):
         self.timeline_item_stat_label.setText(f"항목 {schedule_count}개")
         self.timeline_completed_stat_label.setText(f"완료 {completed_count}개")
         self.timeline_focus_stat_label.setText(f"집중 기록 {focus_count}개")
-        visible_suffix = "" if filter_key == "all" else f" · 표시 {len(items)}개"
-        self.summary_label.setText(
-            f"항목 {schedule_count}개 · 완료 {completed_count}개 · 집중 기록 {focus_count}개{visible_suffix}"
-        )
+        self.summary_label.setText("")
+        self.summary_label.hide()
         _fill_time_block_table(self.block_table, selected_date, blocks, preferences)
         list_items = [item for item in items if item[2] != "completed"] if filter_key == "all" else items
         _fill_timeline_list(self.timeline_list, list_items, preferences)
@@ -10819,16 +12987,22 @@ class TodayTimelineWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self._apply_waiting_panel_layout()
         self._resize_time_columns()
 
     def _resize_time_columns(self) -> None:
         viewport_width = max(0, self.block_table.viewport().width() - 4)
+        preferences = self._preferences()
+        hour_labels = [_format_time(time(row, 0), preferences) for row in range(24)]
+        hour_text_width = max((self.block_table.fontMetrics().horizontalAdvance(label) for label in hour_labels), default=0)
+        required_hour_width = hour_text_width + 18
         if viewport_width < 260:
             hour_width = 42
         elif viewport_width < 360:
             hour_width = 50
         else:
             hour_width = 64
+        hour_width = max(hour_width, required_hour_width)
         self.block_table.setColumnWidth(0, hour_width)
         available_width = max(0, viewport_width - hour_width)
         block_width = max(24, available_width // 6)
@@ -11125,6 +13299,75 @@ class DateItemDialog(QDialog):
         super().accept()
 
 
+class CompletedAtEditDialog(QDialog):
+    def __init__(
+        self,
+        repository: ScheduleRepository,
+        item_type: str,
+        item: Task | Event,
+        preferences: Preference,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.item_type = item_type
+        self.item = item
+        self.preferences = preferences
+        completed_at = item.completed_at or datetime.now()
+        item_label = _item_type_label(repository, item_type, item.item_type_id)
+        self.setWindowTitle("완료 날짜/시간 수정")
+        self.setMinimumSize(QSize(360, 220))
+        self.resize(420, 240)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        heading = QLabel(f"{item_label} 완료 날짜/시간")
+        heading.setObjectName("sectionTitle")
+        layout.addWidget(heading)
+
+        title = QLabel(item.title)
+        title.setObjectName("mutedLabel")
+        title.setWordWrap(True)
+        layout.addWidget(title)
+
+        form = QFormLayout()
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.date_edit.setMinimumDate(QDate(2000, 1, 1))
+        self.date_edit.setMaximumDate(QDate(2100, 12, 31))
+        self.date_edit.setDate(QDate(completed_at.year, completed_at.month, completed_at.day))
+        _stabilize_control(self.date_edit, 132)
+
+        self.time_edit = QTimeEdit()
+        self.time_edit.setDisplayFormat(_time_edit_display_format(preferences))
+        self.time_edit.setTime(QTime(completed_at.hour, completed_at.minute))
+        _stabilize_control(self.time_edit, 112)
+
+        form.addRow("완료 날짜", self.date_edit)
+        form.addRow("완료 시간", self.time_edit)
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch(1)
+        cancel_button = QPushButton("취소")
+        _stabilize_control(cancel_button, 84)
+        cancel_button.clicked.connect(self.reject)
+        save_button = QPushButton("저장")
+        _stabilize_control(save_button, 84)
+        save_button.clicked.connect(self.accept)
+        button_row.addWidget(cancel_button)
+        button_row.addWidget(save_button)
+        layout.addLayout(button_row)
+
+    def selected_datetime(self) -> datetime:
+        selected_date = _date_from_qdate(self.date_edit.date())
+        selected_time = self.time_edit.time()
+        return datetime.combine(selected_date, time(selected_time.hour(), selected_time.minute()))
+
+
 class DateReviewDialog(QDialog):
     def __init__(
         self,
@@ -11357,7 +13600,29 @@ class DateReviewDialog(QDialog):
         self._show_delete_context_menu(self.schedule_list, position)
 
     def show_record_context_menu(self, position: QPoint) -> None:
-        self._show_delete_context_menu(self.record_list, position)
+        item = self.record_list.itemAt(position)
+        if item is None:
+            return
+        self.record_list.setCurrentItem(item)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+
+        item_type = str(data.get("type", ""))
+        item_id = int(data.get("id") or 0)
+        menu = _style_popup_menu(QMenu(self.record_list), self.record_list)
+        if item_type in {"task", "event"} and data.get("record_kind") == "completed":
+            edit_action = menu.addAction("완료 날짜/시간 수정")
+            edit_action.triggered.connect(
+                lambda _checked=False, target_type=item_type, target_id=item_id: self.edit_completed_record(
+                    target_type,
+                    target_id,
+                )
+            )
+            menu.addSeparator()
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(lambda _checked=False: self.delete_selected_date_item(self.record_list))
+        menu.exec(self.record_list.mapToGlobal(position))
 
     def show_quick_note_context_menu(self, position: QPoint) -> None:
         self._show_delete_context_menu(self.quick_note_list, position)
@@ -11424,6 +13689,30 @@ class DateReviewDialog(QDialog):
         if hasattr(parent, "refresh_all"):
             parent.refresh_all()
 
+    def edit_completed_record(self, item_type: str, item_id: int) -> None:
+        item: Task | Event | None
+        if item_type == "task":
+            item = self.repository.get_task(item_id)
+        elif item_type == "event":
+            item = self.repository.get_event(item_id)
+        else:
+            return
+        if item is None:
+            self.refresh_selected_date()
+            return
+        dialog = CompletedAtEditDialog(self.repository, item_type, item, self.preferences, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        completed_at = dialog.selected_datetime()
+        if item_type == "task":
+            self.repository.update_task_completed_at(item_id, completed_at)
+        else:
+            self.repository.update_event_completed_at(item_id, completed_at)
+        self.refresh_selected_date()
+        parent = self.parent()
+        if hasattr(parent, "refresh_all"):
+            parent.refresh_all()
+
     def _is_active_focus_session(self, session_id: int) -> bool:
         parent = self.parent()
         focus_timer = getattr(parent, "focus_timer", None)
@@ -11457,43 +13746,91 @@ class ItemTypeSettingsDialog(QDialog):
         self.selected_type_id: int | None = None
         self.setWindowTitle("할 일 폴더 관리")
         self.setSizeGripEnabled(True)
-        self.setMinimumSize(QSize(520, 420))
-        self.resize(620, 480)
+        self.setMinimumSize(QSize(600, 460))
+        self.resize(720, 520)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(12)
+        layout.setContentsMargins(20, 18, 20, 18)
+        layout.setSpacing(14)
 
+        header = QWidget()
+        header.setObjectName("itemTypeSettingsHeader")
+        header_layout = QHBoxLayout(header)
+        header_layout.setContentsMargins(16, 14, 16, 14)
+        header_layout.setSpacing(12)
+        header_text = QVBoxLayout()
+        header_text.setSpacing(3)
         heading = QLabel("할 일 폴더")
-        heading.setObjectName("sectionTitle")
-        layout.addWidget(heading)
+        heading.setObjectName("settingsGroupTitle")
+        heading_hint = QLabel("체크리스트, 대기함, 날짜별 보기에서 함께 쓰는 분류를 관리합니다.")
+        heading_hint.setObjectName("mutedLabel")
+        heading_hint.setWordWrap(True)
+        header_text.addWidget(heading)
+        header_text.addWidget(heading_hint)
+        header_layout.addLayout(header_text, 1)
+        self.type_total_badge = QLabel("0개")
+        self.type_total_badge.setObjectName("timelineSummaryBadge")
+        header_layout.addWidget(self.type_total_badge)
+        layout.addWidget(header)
 
         body = QHBoxLayout()
+        body.setSpacing(14)
         list_panel = QWidget()
+        list_panel.setObjectName("itemTypeSettingsListCard")
         list_layout = QVBoxLayout(list_panel)
-        list_layout.setContentsMargins(0, 0, 0, 0)
-        list_layout.setSpacing(6)
+        list_layout.setContentsMargins(14, 12, 14, 14)
+        list_layout.setSpacing(9)
+        list_title_row = QHBoxLayout()
         list_title = QLabel("폴더 목록")
-        list_title.setObjectName("mutedLabel")
-        list_layout.addWidget(list_title)
+        list_title.setObjectName("settingsColorLabel")
+        self.type_count_badge = QLabel("0개")
+        self.type_count_badge.setObjectName("timelineSummaryBadge")
+        list_title_row.addWidget(list_title)
+        list_title_row.addStretch(1)
+        list_title_row.addWidget(self.type_count_badge)
+        list_layout.addLayout(list_title_row)
         self.type_list = QListWidget()
+        self.type_list.setObjectName("itemTypeSettingsList")
         self.type_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.type_list.currentItemChanged.connect(self.load_selected_type)
         list_layout.addWidget(self.type_list, 1)
         body.addWidget(list_panel, 1)
 
         form_panel = QWidget()
+        form_panel.setObjectName("itemTypeSettingsEditorCard")
         form_layout = QVBoxLayout(form_panel)
-        form_layout.setContentsMargins(0, 0, 0, 0)
-        form_layout.setSpacing(10)
+        form_layout.setContentsMargins(16, 14, 16, 14)
+        form_layout.setSpacing(12)
+
+        editor_header = QHBoxLayout()
+        editor_text = QVBoxLayout()
+        editor_text.setSpacing(3)
+        editor_title = QLabel("폴더 편집")
+        editor_title.setObjectName("settingsColorLabel")
+        self.selected_type_summary = QLabel("폴더를 선택하거나 새 폴더를 만듭니다.")
+        self.selected_type_summary.setObjectName("mutedLabel")
+        self.selected_type_summary.setWordWrap(True)
+        editor_text.addWidget(editor_title)
+        editor_text.addWidget(self.selected_type_summary)
+        editor_header.addLayout(editor_text, 1)
+        self.type_preview_badge = QLabel("폴더")
+        self.type_preview_badge.setObjectName("itemTypePreviewBadge")
+        self.type_preview_badge.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.type_preview_badge.setFixedSize(64, 58)
+        editor_header.addWidget(self.type_preview_badge)
+        form_layout.addLayout(editor_header)
 
         form = QFormLayout()
+        form.setSpacing(10)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
         self.type_name_edit = QLineEdit()
         self.type_name_edit.setPlaceholderText("예: 업무, 개인, 공부")
         _stabilize_control(self.type_name_edit, 220)
+        self.type_name_edit.textChanged.connect(lambda _text: self.update_type_preview())
         form.addRow("폴더 이름", self.type_name_edit)
 
         self.default_check = QCheckBox("기본 폴더로 사용")
+        self.default_check.toggled.connect(lambda _checked: self.update_type_preview())
         form.addRow("", self.default_check)
         form_layout.addLayout(form)
 
@@ -11504,17 +13841,21 @@ class ItemTypeSettingsDialog(QDialog):
 
         action_row = QHBoxLayout()
         new_button = QPushButton("새 폴더")
+        new_button.setObjectName("ghostButton")
         _stabilize_control(new_button, 88)
         new_button.clicked.connect(self.clear_form)
         save_button = QPushButton("저장")
+        save_button.setObjectName("primaryButton")
         _stabilize_control(save_button, 84)
         save_button.clicked.connect(self.save_current_type)
         delete_button = QPushButton("삭제")
+        delete_button.setObjectName("ghostButton")
         _stabilize_control(delete_button, 84)
         delete_button.clicked.connect(self.delete_selected_type)
         action_row.addWidget(new_button)
-        action_row.addWidget(save_button)
+        action_row.addStretch(1)
         action_row.addWidget(delete_button)
+        action_row.addWidget(save_button)
         form_layout.addLayout(action_row)
         form_layout.addStretch(1)
         body.addWidget(form_panel, 1)
@@ -11523,6 +13864,7 @@ class ItemTypeSettingsDialog(QDialog):
         close_row = QHBoxLayout()
         close_row.addStretch(1)
         close_button = QPushButton("닫기")
+        close_button.setObjectName("primaryButton")
         _stabilize_control(close_button, 84)
         close_button.clicked.connect(self.accept)
         close_row.addWidget(close_button)
@@ -11534,7 +13876,12 @@ class ItemTypeSettingsDialog(QDialog):
         self.type_list.clear()
         selected_row = 0
         task_counts = self._task_counts_by_type()
-        for row_index, item_type in enumerate(self.repository.list_item_types("task")):
+        item_types = self.repository.list_item_types("task")
+        if hasattr(self, "type_total_badge"):
+            self.type_total_badge.setText(f"{len(item_types)}개")
+        if hasattr(self, "type_count_badge"):
+            self.type_count_badge.setText(f"{len(item_types)}개")
+        for row_index, item_type in enumerate(item_types):
             item = QListWidgetItem(self._item_type_label(item_type, task_counts.get(item_type.id or -1, 0)))
             item.setData(Qt.ItemDataRole.UserRole, item_type.id)
             self.type_list.addItem(item)
@@ -11557,13 +13904,32 @@ class ItemTypeSettingsDialog(QDialog):
         self.selected_type_id = item_type.id
         self.type_name_edit.setText(item_type.name)
         self.default_check.setChecked(item_type.is_default)
+        self.update_type_preview()
 
     def clear_form(self) -> None:
         self.selected_type_id = None
         self.type_list.clearSelection()
         self.type_name_edit.clear()
         self.default_check.setChecked(False)
+        self.update_type_preview()
         self.type_name_edit.setFocus()
+
+    def update_type_preview(self) -> None:
+        preview = getattr(self, "type_preview_badge", None)
+        summary = getattr(self, "selected_type_summary", None)
+        name = self.type_name_edit.text().strip()
+        task_count = 0
+        if self.selected_type_id is not None:
+            task_count = self._task_counts_by_type().get(self.selected_type_id, 0)
+        if isinstance(preview, QLabel):
+            label = name[:2] if name else "폴더"
+            preview.setText(label)
+        if isinstance(summary, QLabel):
+            if name:
+                default_suffix = " · 기본 폴더" if self.default_check.isChecked() else ""
+                summary.setText(f"{name} · 할 일 {task_count}개{default_suffix}")
+            else:
+                summary.setText("폴더를 선택하거나 새 폴더를 만듭니다.")
 
     def save_current_type(self) -> None:
         name = self.type_name_edit.text().strip()
@@ -11725,6 +14091,32 @@ class SettingsDialog(QDialog):
         self.show_current_seconds_check = SwitchCheckBox("초 표시")
         self.show_current_seconds_check.setChecked(preferences.show_current_seconds)
         display_form.addRow("현재 초", self.show_current_seconds_check)
+
+        font_row = QWidget()
+        font_layout = QHBoxLayout(font_row)
+        font_layout.setContentsMargins(0, 0, 0, 0)
+        font_layout.setSpacing(8)
+        self.use_default_main_font_check = SwitchCheckBox("기본 글꼴")
+        self.use_default_main_font_check.setObjectName("mainFontDefaultCheck")
+        self.use_default_main_font_check.setChecked(not bool(_normalize_main_font_family(preferences.main_font_family)))
+        font_layout.addWidget(self.use_default_main_font_check)
+        self.main_font_combo = QFontComboBox()
+        self.main_font_combo.setObjectName("mainFontCombo")
+        if _normalize_main_font_family(preferences.main_font_family):
+            self.main_font_combo.setCurrentFont(QFont(preferences.main_font_family))
+        _stabilize_control(self.main_font_combo, 220)
+        self.main_font_combo.setEnabled(not self.use_default_main_font_check.isChecked())
+        self.use_default_main_font_check.toggled.connect(lambda checked: self.main_font_combo.setEnabled(not checked))
+        font_layout.addWidget(self.main_font_combo, 1)
+        display_form.addRow("메인 글꼴", font_row)
+
+        self.main_font_size_spin = QSpinBox()
+        self.main_font_size_spin.setObjectName("mainFontSizeSpin")
+        self.main_font_size_spin.setRange(10, 22)
+        self.main_font_size_spin.setValue(_normalize_main_font_size(preferences.main_font_size))
+        self.main_font_size_spin.setSuffix("px")
+        _stabilize_control(self.main_font_size_spin, 92)
+        display_form.addRow("메인 글자 크기", self.main_font_size_spin)
 
         self.show_header_banner_check = SwitchCheckBox("메인 화면에 표시")
         self.show_header_banner_check.setChecked(preferences.show_header_banner)
@@ -11932,6 +14324,9 @@ class SettingsDialog(QDialog):
         control_row.addWidget(choose_button)
 
         picker_button = QPushButton("스포이트")
+        picker_button.setObjectName("eyedropperButton")
+        picker_button.setCursor(_eyedropper_cursor())
+        picker_button.setToolTip("클릭한 뒤 원하는 색 위에 커서를 두면 색을 가져옵니다.")
         _stabilize_control(picker_button, 72)
         picker_button.clicked.connect(lambda _checked=False, name=key: self.pick_screen_color(name))
         control_row.addWidget(picker_button)
@@ -11971,10 +14366,14 @@ class SettingsDialog(QDialog):
 
     def pick_screen_color(self, key: str) -> None:
         self.statusBarMessage("마우스를 원하는 색 위에 올려두세요. 잠시 뒤 색을 가져옵니다.")
+        self._restore_screen_color_cursor()
+        QApplication.setOverrideCursor(_eyedropper_cursor())
+        self._screen_color_cursor_active = True
         QTimer.singleShot(1200, lambda name=key: self.apply_screen_color_sample(name))
 
     def apply_screen_color_sample(self, key: str) -> None:
         position = QCursor.pos()
+        self._restore_screen_color_cursor()
         screen = QGuiApplication.screenAt(position) or QGuiApplication.primaryScreen()
         if screen is None:
             self.statusBarMessage("스포이트로 색을 가져오지 못했습니다.")
@@ -11987,6 +14386,15 @@ class SettingsDialog(QDialog):
         if color.isValid():
             self.set_setting_color(key, color.name())
             self.statusBarMessage(f"{color.name()} 색을 가져왔습니다.")
+
+    def _restore_screen_color_cursor(self) -> None:
+        if getattr(self, "_screen_color_cursor_active", False):
+            QApplication.restoreOverrideCursor()
+            self._screen_color_cursor_active = False
+
+    def done(self, result: int) -> None:
+        self._restore_screen_color_cursor()
+        super().done(result)
 
     def statusBarMessage(self, message: str) -> None:
         parent = self.parent()
@@ -12064,6 +14472,12 @@ class SettingsDialog(QDialog):
         self.show_current_date_check.setChecked(preferences.show_current_date)
         self.show_current_time_check.setChecked(preferences.show_current_time)
         self.show_current_seconds_check.setChecked(preferences.show_current_seconds)
+        main_font_family = _normalize_main_font_family(preferences.main_font_family)
+        self.use_default_main_font_check.setChecked(not bool(main_font_family))
+        if main_font_family:
+            self.main_font_combo.setCurrentFont(QFont(main_font_family))
+        self.main_font_combo.setEnabled(not self.use_default_main_font_check.isChecked())
+        self.main_font_size_spin.setValue(_normalize_main_font_size(preferences.main_font_size))
         self.show_header_banner_check.setChecked(preferences.show_header_banner)
         self.set_header_banner_image_path(preferences.header_banner_image_path)
         self.header_banner_height_spin.setValue(_normalize_header_banner_height(preferences.header_banner_height))
@@ -12117,6 +14531,8 @@ class SettingsDialog(QDialog):
             panel_color=self.panel_color,
             table_color=self.table_color,
             text_color=self.text_color,
+            main_font_family="" if self.use_default_main_font_check.isChecked() else self.main_font_combo.currentFont().family(),
+            main_font_size=self.main_font_size_spin.value(),
             show_header_banner=self.show_header_banner_check.isChecked(),
             header_banner_image_path=self.header_banner_path_edit.text().strip(),
             header_banner_height=self.header_banner_height_spin.value(),
@@ -12183,7 +14599,8 @@ def _record_items_for_date(
             (
                 reference_at,
                 f"{_focus_session_time_label(session, preferences=preferences)}  [집중] {session.title} · "
-                f"집중 {_format_duration(session.focused_seconds)} · {_status_label(session.status)}",
+                f"{_focus_session_goal_summary(session)} · 집중 {_format_duration(session.focused_seconds)} · "
+                f"{_status_label(session.status)}",
                 {"type": "focus_session", "id": session.id, "kind": "집중 기록", "title": session.title},
             )
         )
@@ -12195,8 +14612,8 @@ def _record_items_for_date(
         items.append(
             (
                 task.completed_at,
-                f"{_format_time(task.completed_at, preferences)}  [완료] {kind} · {task.title}",
-                {"type": "task", "id": task.id, "kind": kind, "title": task.title},
+                f"{_format_datetime(task.completed_at, preferences)}  [완료] {kind} · {task.title}",
+                {"type": "task", "id": task.id, "kind": kind, "title": task.title, "record_kind": "completed"},
             )
         )
 
@@ -12207,8 +14624,8 @@ def _record_items_for_date(
         items.append(
             (
                 event.completed_at,
-                f"{_format_time(event.completed_at, preferences)}  [완료] {kind} · {event.title}",
-                {"type": "event", "id": event.id, "kind": kind, "title": event.title},
+                f"{_format_datetime(event.completed_at, preferences)}  [완료] {kind} · {event.title}",
+                {"type": "event", "id": event.id, "kind": kind, "title": event.title, "record_kind": "completed"},
             )
         )
 
@@ -12299,7 +14716,8 @@ def _today_timeline_items(
             (
                 reference_at,
                 f"{_focus_session_time_label(session, preferences=preferences)}  집중  {session.title} · "
-                f"집중 {_format_duration(session.focused_seconds)} · {_status_label(session.status)}",
+                f"{_focus_session_goal_summary(session)} · 집중 {_format_duration(session.focused_seconds)} · "
+                f"{_status_label(session.status)}",
                 "focus",
                 {"type": "focus_session", "id": session.id, "title": session.title},
             )
@@ -12311,9 +14729,9 @@ def _today_timeline_items(
 def _today_timeline_blocks(
     repository: ScheduleRepository,
     selected_date: date,
-) -> list[tuple[datetime, datetime, str, str]]:
+) -> list[TimelineBlock]:
     start_at, end_at = _day_window(selected_date)
-    blocks: list[tuple[datetime, datetime, str, str]] = []
+    blocks: list[TimelineBlock] = []
     listed_event_ids: set[int] = set()
 
     for event in repository.list_events(start_at, end_at, include_completed=True):
@@ -12328,6 +14746,7 @@ def _today_timeline_blocks(
             event.end_at,
             category,
             f"{_item_type_label(repository, 'event', event.item_type_id)} {event.title}",
+            {"type": "event", "id": event.id, "title": event.title, "completed": event.completed},
         )
 
     for task in repository.list_tasks(include_completed=True):
@@ -12338,9 +14757,6 @@ def _today_timeline_blocks(
         if task.due_at is not None and task.due_at.date() == selected_date:
             task_start = task.due_at
             task_end = task.due_at + timedelta(minutes=task.duration_minutes)
-        elif task.completed_at is not None and task.completed_at.date() == selected_date:
-            task_end = task.completed_at
-            task_start = task.completed_at - timedelta(minutes=task.duration_minutes)
 
         if task_start is None or task_end is None:
             continue
@@ -12352,6 +14768,7 @@ def _today_timeline_blocks(
             task_end,
             "completed" if task.completed else "task",
             f"{_item_type_label(repository, 'task', task.item_type_id)} {task.title}",
+            {"type": "task", "id": task.id, "title": task.title, "completed": task.completed},
         )
 
     for event in repository.list_completed_events():
@@ -12367,6 +14784,7 @@ def _today_timeline_blocks(
             event.completed_at + timedelta(minutes=10),
             "completed",
             f"완료 {_item_type_label(repository, 'event', event.item_type_id)} {event.title}",
+            {"type": "event", "id": event.id, "title": event.title, "completed": True},
         )
 
     for session in repository.list_focus_sessions(start_at, end_at):
@@ -12381,20 +14799,22 @@ def _today_timeline_blocks(
             session_start,
             session_end,
             "focus",
-            f"집중 {session.title}",
+            f"집중 {session.title} · {_focus_session_goal_summary(session)}",
+            {"type": "focus_session", "id": session.id, "title": session.title},
         )
 
     return blocks
 
 
 def _append_timeline_block(
-    blocks: list[tuple[datetime, datetime, str, str]],
+    blocks: list[TimelineBlock],
     day_start: datetime,
     day_end: datetime,
     started_at: datetime,
     ended_at: datetime,
     category: str,
     label: str,
+    payload: dict[str, object],
 ) -> None:
     clipped_start = max(day_start, started_at)
     clipped_end = min(day_end, ended_at)
@@ -12402,13 +14822,13 @@ def _append_timeline_block(
         clipped_end = min(day_end, clipped_start + timedelta(minutes=10))
     if clipped_end <= clipped_start:
         return
-    blocks.append((clipped_start, clipped_end, category, label))
+    blocks.append((clipped_start, clipped_end, category, label, payload))
 
 
 def _fill_time_block_table(
     table: QTableWidget,
     selected_date: date,
-    blocks: list[tuple[datetime, datetime, str, str]],
+    blocks: list[TimelineBlock],
     preferences: Preference | None = None,
 ) -> None:
     theme = preferences.appearance_theme if preferences is not None else "light"
@@ -12432,7 +14852,7 @@ def _fill_time_block_table(
             table.setItem(row, column, item)
 
     first_filled_item: QTableWidgetItem | None = None
-    for started_at, ended_at, category, label in blocks:
+    for started_at, ended_at, category, label, payload in blocks:
         start_seconds = int((started_at - day_start).total_seconds())
         end_seconds = int((ended_at - day_start).total_seconds())
         start_slot = max(0, start_seconds // 600)
@@ -12445,6 +14865,14 @@ def _fill_time_block_table(
                 continue
             tooltip = item.toolTip()
             item.setToolTip(tooltip + f"\n{_format_time_range(started_at, ended_at, preferences)} {label}")
+            if payload.get("id") is not None:
+                payloads = item.data(Qt.ItemDataRole.UserRole)
+                if not isinstance(payloads, list):
+                    payloads = []
+                payload_copy = dict(payload)
+                if payload_copy not in payloads:
+                    payloads.append(payload_copy)
+                    item.setData(Qt.ItemDataRole.UserRole, payloads)
             current_color = item.background().color().name().lower()
             item.setBackground(overlap_background if current_color != slot_background.name().lower() else QColor(_timeline_block_color(category)))
             if first_filled_item is None:
@@ -12894,6 +15322,43 @@ def _replace_style_tokens(style: str, replacements: tuple[tuple[str, str], ...])
     return style
 
 
+def _normalize_main_font_size(value: object) -> int:
+    try:
+        size = int(value)
+    except (TypeError, ValueError):
+        return 13
+    return min(22, max(10, size))
+
+
+def _normalize_main_font_family(value: object) -> str:
+    family = str(value or "").strip()
+    family = "".join(character for character in family if character not in "{};")
+    return family[:80]
+
+
+def _css_font_stack(font_family: object) -> str:
+    family = _normalize_main_font_family(font_family)
+    default_stack = '"Pretendard", "Segoe UI", "Malgun Gothic", sans-serif'
+    if not family:
+        return default_stack
+    escaped = family.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}", {default_stack}'
+
+
+def _scale_style_font_sizes(style: str, target_size: object) -> str:
+    normalized_size = _normalize_main_font_size(target_size)
+    if normalized_size == 13:
+        return style
+    scale = normalized_size / 13
+
+    def replace_font_size(match: re.Match[str]) -> str:
+        original_size = float(match.group(1))
+        scaled_size = min(96, max(8, round(original_size * scale)))
+        return f"font-size: {scaled_size}px"
+
+    return re.sub(r"font-size:\s*([0-9]+(?:\.[0-9]+)?)px", replace_font_size, style)
+
+
 def _hex_to_rgb(value: object) -> tuple[int, int, int]:
     color = _normalize_optional_color(value) or "#000000"
     return int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16)
@@ -13340,6 +15805,14 @@ def _format_duration(total_seconds: int) -> str:
     return f"{seconds}초"
 
 
+def _focus_session_goal_summary(session: FocusSession) -> str:
+    planned = _format_duration(session.planned_seconds)
+    extra_seconds = max(0, session.focused_seconds - session.planned_seconds)
+    if extra_seconds > 0:
+        return f"목표 {planned} · 초과 +{_format_duration(extra_seconds)}"
+    return f"목표 {planned}"
+
+
 def _status_label(status: str) -> str:
     return {
         "ready": "대기 중",
@@ -13353,11 +15826,18 @@ def _status_label(status: str) -> str:
 
 
 def _stabilize_control(control: QWidget, minimum_width: int | None = None) -> None:
-    control.setMinimumHeight(34)
+    control.setMinimumHeight(PANEL_CONTROL_HEIGHT)
+    control.setMaximumHeight(PANEL_CONTROL_HEIGHT)
     if minimum_width is not None:
         control.setMinimumWidth(minimum_width)
     control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
     if isinstance(control, QAbstractSpinBox):
         control.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
-        control.setMinimumHeight(38)
         control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+
+def _stabilize_panel_caption(label: QLabel, height: int = PANEL_CONTROL_HEIGHT) -> None:
+    label.setMinimumHeight(height)
+    label.setMaximumHeight(height)
+    label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+    label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
