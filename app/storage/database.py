@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Iterator
 
@@ -27,15 +28,66 @@ from app.models import (
     TrackedProgram,
 )
 
+_FOCUS_SESSION_COLOR_PALETTE = (
+    "#7cb7e8",
+    "#8fd0b3",
+    "#f0c36f",
+    "#d79adf",
+    "#ef8f8f",
+    "#9ba8ff",
+    "#8ac7d7",
+    "#c1d982",
+)
+
 
 def default_database_path() -> Path:
     override = os.environ.get("SCHEDULE_HELPER_DB")
     if override:
         return Path(override)
+    configured = configured_database_path()
+    if configured:
+        return configured
     base = os.environ.get("LOCALAPPDATA")
     if base:
         return Path(base) / "ScheduleHelper" / "schedule_helper.sqlite3"
     return Path.cwd() / "data" / "schedule_helper.sqlite3"
+
+
+def _app_data_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / "ScheduleHelper"
+    return Path.cwd() / "data"
+
+
+def database_location_config_path() -> Path:
+    override = os.environ.get("SCHEDULE_HELPER_CONFIG")
+    if override:
+        return Path(override)
+    return _app_data_dir() / "settings.json"
+
+
+def configured_database_path() -> Path | None:
+    config_path = database_location_config_path()
+    if not config_path.exists():
+        return None
+    try:
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    value = str(data.get("database_path", "")).strip()
+    return Path(value) if value else None
+
+
+def set_configured_database_path(path: Path | str) -> Path:
+    target = Path(path)
+    config_path = database_location_config_path()
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(
+        json.dumps({"database_path": str(target)}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return target
 
 
 def _dt(value: datetime | None) -> str | None:
@@ -78,6 +130,14 @@ def _time_format(value: str) -> str:
     return value if value in {"24h", "12h"} else "24h"
 
 
+def _default_focus_session_color(title: str) -> str:
+    normalized = title.strip().casefold()
+    if not normalized:
+        return _FOCUS_SESSION_COLOR_PALETTE[0]
+    index = sum((position + 1) * ord(character) for position, character in enumerate(normalized))
+    return _FOCUS_SESSION_COLOR_PALETTE[index % len(_FOCUS_SESSION_COLOR_PALETTE)]
+
+
 def _appearance_theme(value: str) -> str:
     return value if value in {"light", "dark"} else "light"
 
@@ -93,6 +153,37 @@ def _header_banner_position(value: str) -> str:
     if normalized in {"top", "bottom"}:
         return "center"
     return "center"
+
+
+def _image_position(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    return normalized if normalized in {"left", "center", "right", "top", "bottom"} else "center"
+
+
+def _image_view(value: object) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    try:
+        zoom = int(data.get("zoom", 100))
+        x = int(data.get("x", 50))
+        y = int(data.get("y", 50))
+    except (TypeError, ValueError):
+        return ""
+    normalized = {
+        "zoom": min(300, max(25, zoom)),
+        "x": min(100, max(0, x)),
+        "y": min(100, max(0, y)),
+    }
+    if normalized == {"zoom": 100, "x": 50, "y": 50}:
+        return ""
+    return json.dumps(normalized, separators=(",", ":"))
 
 
 def _accent_color(value: object) -> str:
@@ -123,6 +214,18 @@ def _window_dimension(value: object, default: int, minimum: int, maximum: int) -
 
 def _main_font_size(value: object) -> int:
     return _window_dimension(value, 13, 10, 22)
+
+
+def _label_font_size(value: object) -> int:
+    return _window_dimension(value, 13, 10, 20)
+
+
+def _content_font_size(value: object) -> int:
+    return _window_dimension(value, 13, 11, 24)
+
+
+def _datetime_panel_font_size(value: object) -> int:
+    return _window_dimension(value, 24, 12, 72)
 
 
 def _header_banner_height(value: object) -> int:
@@ -157,6 +260,7 @@ class ScheduleRepository:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.initialize()
         self.seed_defaults()
+        self.purge_expired_quick_notes()
 
     @contextmanager
     def connect(self) -> Iterator[sqlite3.Connection]:
@@ -229,6 +333,13 @@ class ScheduleRepository:
                     show_current_date INTEGER NOT NULL DEFAULT 1,
                     show_current_time INTEGER NOT NULL DEFAULT 1,
                     show_current_seconds INTEGER NOT NULL DEFAULT 0,
+                    datetime_panel_border_enabled INTEGER NOT NULL DEFAULT 0,
+                    datetime_panel_transparent_background INTEGER NOT NULL DEFAULT 1,
+                    datetime_panel_text_color TEXT NOT NULL DEFAULT '',
+                    datetime_panel_font_family TEXT NOT NULL DEFAULT '',
+                    datetime_panel_font_size INTEGER NOT NULL DEFAULT 24,
+                    datetime_panel_background_image_path TEXT NOT NULL DEFAULT '',
+                    datetime_panel_background_image_view TEXT NOT NULL DEFAULT '',
                     show_pomodoro_controls INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_inline INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_waiting_panel INTEGER NOT NULL DEFAULT 1,
@@ -239,6 +350,21 @@ class ScheduleRepository:
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
                     show_media_panel INTEGER NOT NULL DEFAULT 1,
                     media_panel_file_path TEXT NOT NULL DEFAULT '',
+                    media_panel_image_position TEXT NOT NULL DEFAULT 'center',
+                    media_panel_image_view TEXT NOT NULL DEFAULT '',
+                    show_media_panel_2 INTEGER NOT NULL DEFAULT 0,
+                    media_panel_2_file_path TEXT NOT NULL DEFAULT '',
+                    media_panel_2_image_position TEXT NOT NULL DEFAULT 'center',
+                    media_panel_2_image_view TEXT NOT NULL DEFAULT '',
+                    show_media_panel_3 INTEGER NOT NULL DEFAULT 0,
+                    media_panel_3_file_path TEXT NOT NULL DEFAULT '',
+                    media_panel_3_image_position TEXT NOT NULL DEFAULT 'center',
+                    media_panel_3_image_view TEXT NOT NULL DEFAULT '',
+                    show_media_panel_4 INTEGER NOT NULL DEFAULT 0,
+                    media_panel_4_file_path TEXT NOT NULL DEFAULT '',
+                    media_panel_4_image_position TEXT NOT NULL DEFAULT 'center',
+                    media_panel_4_image_view TEXT NOT NULL DEFAULT '',
+                    media_rounded_corners INTEGER NOT NULL DEFAULT 1,
                     show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
                     favorite_display_mode TEXT NOT NULL DEFAULT 'text',
                     time_format TEXT NOT NULL DEFAULT '24h',
@@ -252,8 +378,12 @@ class ScheduleRepository:
                     text_color TEXT NOT NULL DEFAULT '',
                     main_font_family TEXT NOT NULL DEFAULT '',
                     main_font_size INTEGER NOT NULL DEFAULT 13,
+                    label_font_size INTEGER NOT NULL DEFAULT 13,
+                    content_font_size INTEGER NOT NULL DEFAULT 13,
                     show_header_banner INTEGER NOT NULL DEFAULT 0,
                     header_banner_image_path TEXT NOT NULL DEFAULT '',
+                    header_banner_image_position TEXT NOT NULL DEFAULT 'center',
+                    header_banner_image_view TEXT NOT NULL DEFAULT '',
                     header_banner_height INTEGER NOT NULL DEFAULT 132,
                     header_banner_position TEXT NOT NULL DEFAULT 'center',
                     header_banner_span INTEGER NOT NULL DEFAULT 1,
@@ -298,6 +428,7 @@ class ScheduleRepository:
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     target_process_name TEXT NOT NULL DEFAULT '',
                     target_window_title TEXT NOT NULL DEFAULT '',
+                    color TEXT NOT NULL DEFAULT '',
                     planned_seconds INTEGER NOT NULL,
                     focused_seconds INTEGER NOT NULL DEFAULT 0,
                     paused_seconds INTEGER NOT NULL DEFAULT 0,
@@ -333,7 +464,8 @@ class ScheduleRepository:
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL,
                     process_name TEXT NOT NULL DEFAULT '',
-                    window_title TEXT NOT NULL DEFAULT ''
+                    window_title TEXT NOT NULL DEFAULT '',
+                    deleted_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS quick_note_attachments (
@@ -379,6 +511,9 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE events ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
             if "completed_at" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN completed_at TEXT")
+            focus_session_columns = {row["name"] for row in connection.execute("PRAGMA table_info(focus_sessions)")}
+            if "color" not in focus_session_columns:
+                connection.execute("ALTER TABLE focus_sessions ADD COLUMN color TEXT NOT NULL DEFAULT ''")
             default_task_type_id = self._ensure_default_item_type(connection, "task")
             default_event_type_id = self._ensure_default_item_type(connection, "event")
             connection.execute(
@@ -413,6 +548,28 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_current_time INTEGER NOT NULL DEFAULT 1")
             if "show_current_seconds" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_current_seconds INTEGER NOT NULL DEFAULT 0")
+            if "datetime_panel_border_enabled" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_border_enabled INTEGER NOT NULL DEFAULT 0"
+                )
+            if "datetime_panel_transparent_background" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_transparent_background INTEGER NOT NULL DEFAULT 1"
+                )
+            if "datetime_panel_text_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN datetime_panel_text_color TEXT NOT NULL DEFAULT ''")
+            if "datetime_panel_font_family" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN datetime_panel_font_family TEXT NOT NULL DEFAULT ''")
+            if "datetime_panel_font_size" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN datetime_panel_font_size INTEGER NOT NULL DEFAULT 24")
+            if "datetime_panel_background_image_path" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_background_image_path TEXT NOT NULL DEFAULT ''"
+                )
+            if "datetime_panel_background_image_view" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_background_image_view TEXT NOT NULL DEFAULT ''"
+                )
             if "show_pomodoro_controls" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_pomodoro_controls INTEGER NOT NULL DEFAULT 1"
@@ -449,6 +606,33 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_media_panel INTEGER NOT NULL DEFAULT 1")
             if "media_panel_file_path" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN media_panel_file_path TEXT NOT NULL DEFAULT ''")
+            if "media_panel_image_position" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN media_panel_image_position TEXT NOT NULL DEFAULT 'center'"
+                )
+            if "media_panel_image_view" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN media_panel_image_view TEXT NOT NULL DEFAULT ''")
+            for index in range(2, 5):
+                visible_column = f"show_media_panel_{index}"
+                path_column = f"media_panel_{index}_file_path"
+                position_column = f"media_panel_{index}_image_position"
+                view_column = f"media_panel_{index}_image_view"
+                if visible_column not in preference_columns:
+                    connection.execute(
+                        f"ALTER TABLE preferences ADD COLUMN {visible_column} INTEGER NOT NULL DEFAULT 0"
+                    )
+                if path_column not in preference_columns:
+                    connection.execute(f"ALTER TABLE preferences ADD COLUMN {path_column} TEXT NOT NULL DEFAULT ''")
+                if position_column not in preference_columns:
+                    connection.execute(
+                        f"ALTER TABLE preferences ADD COLUMN {position_column} TEXT NOT NULL DEFAULT 'center'"
+                    )
+                if view_column not in preference_columns:
+                    connection.execute(f"ALTER TABLE preferences ADD COLUMN {view_column} TEXT NOT NULL DEFAULT ''")
+            if "media_rounded_corners" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN media_rounded_corners INTEGER NOT NULL DEFAULT 1"
+                )
             if "show_compact_favorites_panel" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0"
@@ -487,10 +671,20 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_font_family TEXT NOT NULL DEFAULT ''")
             if "main_font_size" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_font_size INTEGER NOT NULL DEFAULT 13")
+            if "label_font_size" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN label_font_size INTEGER NOT NULL DEFAULT 13")
+            if "content_font_size" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN content_font_size INTEGER NOT NULL DEFAULT 13")
             if "show_header_banner" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_header_banner INTEGER NOT NULL DEFAULT 0")
             if "header_banner_image_path" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_image_path TEXT NOT NULL DEFAULT ''")
+            if "header_banner_image_position" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN header_banner_image_position TEXT NOT NULL DEFAULT 'center'"
+                )
+            if "header_banner_image_view" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_image_view TEXT NOT NULL DEFAULT ''")
             if "header_banner_height" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_height INTEGER NOT NULL DEFAULT 132")
             if "header_banner_position" not in preference_columns:
@@ -524,6 +718,8 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL")
             if "window_title" not in quick_note_columns:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN window_title TEXT NOT NULL DEFAULT ''")
+            if "deleted_at" not in quick_note_columns:
+                connection.execute("ALTER TABLE quick_notes ADD COLUMN deleted_at TEXT")
 
             quick_note_folder_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(quick_note_folders)")
@@ -575,11 +771,11 @@ class ScheduleRepository:
                        show_media_panel, media_panel_file_path,
                        show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color, button_color,
                        background_color, inner_background_color, panel_color, table_color, text_color,
-                       main_font_family, main_font_size,
+                       main_font_family, main_font_size, label_font_size, content_font_size,
                        show_header_banner, header_banner_image_path,
                        header_banner_height, header_banner_position, header_banner_span,
                        focus_rate_display)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 0, '', 132, 'center', 1, 'ring')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 13, 13, 0, '', 132, 'center', 1, 'ring')
                     """
                 )
 
@@ -797,6 +993,25 @@ class ScheduleRepository:
         with self.connect() as connection:
             connection.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
+    def move_tasks_to_type(self, task_ids: list[int] | tuple[int, ...] | set[int], item_type_id: int) -> int:
+        unique_task_ids = sorted({int(task_id) for task_id in task_ids if int(task_id) > 0})
+        if not unique_task_ids:
+            return 0
+
+        with self.connect() as connection:
+            item_type = connection.execute(
+                "SELECT id FROM item_types WHERE id = ? AND base_kind = 'task'",
+                (item_type_id,),
+            ).fetchone()
+            if item_type is None:
+                return 0
+            placeholders = ", ".join("?" for _ in unique_task_ids)
+            cursor = connection.execute(
+                f"UPDATE tasks SET item_type_id = ? WHERE id IN ({placeholders})",
+                (item_type_id, *unique_task_ids),
+            )
+        return int(cursor.rowcount)
+
     def mark_task_completed(self, task_id: int, completed: bool) -> None:
         completed_at = _dt_exact(datetime.now()) if completed else None
         with self.connect() as connection:
@@ -1000,6 +1215,13 @@ class ScheduleRepository:
             show_current_date=bool(row["show_current_date"]),
             show_current_time=bool(row["show_current_time"]),
             show_current_seconds=bool(row["show_current_seconds"]),
+            datetime_panel_border_enabled=bool(row["datetime_panel_border_enabled"]),
+            datetime_panel_transparent_background=bool(row["datetime_panel_transparent_background"]),
+            datetime_panel_text_color=_optional_color(row["datetime_panel_text_color"]),
+            datetime_panel_font_family=str(row["datetime_panel_font_family"] or "").strip(),
+            datetime_panel_font_size=_datetime_panel_font_size(row["datetime_panel_font_size"]),
+            datetime_panel_background_image_path=str(row["datetime_panel_background_image_path"] or "").strip(),
+            datetime_panel_background_image_view=_image_view(row["datetime_panel_background_image_view"]),
             show_pomodoro_controls=bool(row["show_pomodoro_controls"]),
             show_today_timeline_inline=bool(row["show_today_timeline_inline"]),
             show_today_timeline_waiting_panel=bool(row["show_today_timeline_waiting_panel"]),
@@ -1010,6 +1232,21 @@ class ScheduleRepository:
             show_link_favorites_panel=bool(row["show_link_favorites_panel"]),
             show_media_panel=bool(row["show_media_panel"]),
             media_panel_file_path=str(row["media_panel_file_path"] or "").strip(),
+            media_panel_image_position=_image_position(row["media_panel_image_position"]),
+            media_panel_image_view=_image_view(row["media_panel_image_view"]),
+            show_media_panel_2=bool(row["show_media_panel_2"]),
+            media_panel_2_file_path=str(row["media_panel_2_file_path"] or "").strip(),
+            media_panel_2_image_position=_image_position(row["media_panel_2_image_position"]),
+            media_panel_2_image_view=_image_view(row["media_panel_2_image_view"]),
+            show_media_panel_3=bool(row["show_media_panel_3"]),
+            media_panel_3_file_path=str(row["media_panel_3_file_path"] or "").strip(),
+            media_panel_3_image_position=_image_position(row["media_panel_3_image_position"]),
+            media_panel_3_image_view=_image_view(row["media_panel_3_image_view"]),
+            show_media_panel_4=bool(row["show_media_panel_4"]),
+            media_panel_4_file_path=str(row["media_panel_4_file_path"] or "").strip(),
+            media_panel_4_image_position=_image_position(row["media_panel_4_image_position"]),
+            media_panel_4_image_view=_image_view(row["media_panel_4_image_view"]),
+            media_rounded_corners=bool(row["media_rounded_corners"]),
             show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
             favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
             time_format=_time_format(str(row["time_format"])),
@@ -1023,8 +1260,12 @@ class ScheduleRepository:
             text_color=_optional_color(row["text_color"]),
             main_font_family=str(row["main_font_family"] or "").strip(),
             main_font_size=_main_font_size(row["main_font_size"]),
+            label_font_size=_label_font_size(row["label_font_size"]),
+            content_font_size=_content_font_size(row["content_font_size"]),
             show_header_banner=bool(row["show_header_banner"]),
             header_banner_image_path=str(row["header_banner_image_path"] or "").strip(),
+            header_banner_image_position=_image_position(row["header_banner_image_position"]),
+            header_banner_image_view=_image_view(row["header_banner_image_view"]),
             header_banner_height=_header_banner_height(row["header_banner_height"]),
             header_banner_position=_header_banner_position(str(row["header_banner_position"])),
             header_banner_span=_header_banner_span(row["header_banner_span"]),
@@ -1047,8 +1288,28 @@ class ScheduleRepository:
         preferences.text_color = _optional_color(preferences.text_color)
         preferences.main_font_family = preferences.main_font_family.strip()
         preferences.main_font_size = _main_font_size(preferences.main_font_size)
+        preferences.label_font_size = _label_font_size(preferences.label_font_size)
+        preferences.content_font_size = _content_font_size(preferences.content_font_size)
+        preferences.datetime_panel_text_color = _optional_color(preferences.datetime_panel_text_color)
+        preferences.datetime_panel_font_family = preferences.datetime_panel_font_family.strip()
+        preferences.datetime_panel_font_size = _datetime_panel_font_size(preferences.datetime_panel_font_size)
+        preferences.datetime_panel_background_image_path = preferences.datetime_panel_background_image_path.strip()
+        preferences.datetime_panel_background_image_view = _image_view(preferences.datetime_panel_background_image_view)
         preferences.media_panel_file_path = preferences.media_panel_file_path.strip()
+        preferences.media_panel_image_position = _image_position(preferences.media_panel_image_position)
+        preferences.media_panel_image_view = _image_view(preferences.media_panel_image_view)
+        preferences.media_panel_2_file_path = preferences.media_panel_2_file_path.strip()
+        preferences.media_panel_2_image_position = _image_position(preferences.media_panel_2_image_position)
+        preferences.media_panel_2_image_view = _image_view(preferences.media_panel_2_image_view)
+        preferences.media_panel_3_file_path = preferences.media_panel_3_file_path.strip()
+        preferences.media_panel_3_image_position = _image_position(preferences.media_panel_3_image_position)
+        preferences.media_panel_3_image_view = _image_view(preferences.media_panel_3_image_view)
+        preferences.media_panel_4_file_path = preferences.media_panel_4_file_path.strip()
+        preferences.media_panel_4_image_position = _image_position(preferences.media_panel_4_image_position)
+        preferences.media_panel_4_image_view = _image_view(preferences.media_panel_4_image_view)
         preferences.header_banner_image_path = preferences.header_banner_image_path.strip()
+        preferences.header_banner_image_position = _image_position(preferences.header_banner_image_position)
+        preferences.header_banner_image_view = _image_view(preferences.header_banner_image_view)
         preferences.header_banner_height = _header_banner_height(preferences.header_banner_height)
         preferences.header_banner_position = _header_banner_position(preferences.header_banner_position)
         preferences.header_banner_span = _header_banner_span(preferences.header_banner_span)
@@ -1069,11 +1330,11 @@ class ScheduleRepository:
                    show_media_panel, media_panel_file_path,
                    show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color,
                    button_color, background_color, inner_background_color, panel_color, table_color, text_color,
-                   main_font_family, main_font_size,
+                   main_font_family, main_font_size, label_font_size, content_font_size,
                    show_header_banner, header_banner_image_path, header_banner_height, header_banner_position, header_banner_span,
                    focus_rate_display,
                    last_window_width, last_window_height, last_layout_state)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -1109,6 +1370,8 @@ class ScheduleRepository:
                     text_color = excluded.text_color,
                     main_font_family = excluded.main_font_family,
                     main_font_size = excluded.main_font_size,
+                    label_font_size = excluded.label_font_size,
+                    content_font_size = excluded.content_font_size,
                     show_header_banner = excluded.show_header_banner,
                     header_banner_image_path = excluded.header_banner_image_path,
                     header_banner_height = excluded.header_banner_height,
@@ -1154,6 +1417,8 @@ class ScheduleRepository:
                     preferences.text_color,
                     preferences.main_font_family,
                     preferences.main_font_size,
+                    preferences.label_font_size,
+                    preferences.content_font_size,
                     int(preferences.show_header_banner),
                     preferences.header_banner_image_path,
                     preferences.header_banner_height,
@@ -1163,6 +1428,62 @@ class ScheduleRepository:
                     preferences.last_window_width,
                     preferences.last_window_height,
                     preferences.last_layout_state,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE preferences
+                SET datetime_panel_border_enabled = ?,
+                    datetime_panel_transparent_background = ?,
+                    datetime_panel_text_color = ?,
+                    datetime_panel_font_family = ?,
+                    datetime_panel_font_size = ?,
+                    datetime_panel_background_image_path = ?,
+                    datetime_panel_background_image_view = ?,
+                    media_panel_image_position = ?,
+                    media_panel_image_view = ?,
+                    show_media_panel_2 = ?,
+                    media_panel_2_file_path = ?,
+                    media_panel_2_image_position = ?,
+                    media_panel_2_image_view = ?,
+                    show_media_panel_3 = ?,
+                    media_panel_3_file_path = ?,
+                    media_panel_3_image_position = ?,
+                    media_panel_3_image_view = ?,
+                    show_media_panel_4 = ?,
+                    media_panel_4_file_path = ?,
+                    media_panel_4_image_position = ?,
+                    media_panel_4_image_view = ?,
+                    media_rounded_corners = ?,
+                    header_banner_image_position = ?,
+                    header_banner_image_view = ?
+                WHERE id = 1
+                """,
+                (
+                    int(preferences.datetime_panel_border_enabled),
+                    int(preferences.datetime_panel_transparent_background),
+                    preferences.datetime_panel_text_color,
+                    preferences.datetime_panel_font_family,
+                    preferences.datetime_panel_font_size,
+                    preferences.datetime_panel_background_image_path,
+                    preferences.datetime_panel_background_image_view,
+                    preferences.media_panel_image_position,
+                    preferences.media_panel_image_view,
+                    int(preferences.show_media_panel_2),
+                    preferences.media_panel_2_file_path,
+                    preferences.media_panel_2_image_position,
+                    preferences.media_panel_2_image_view,
+                    int(preferences.show_media_panel_3),
+                    preferences.media_panel_3_file_path,
+                    preferences.media_panel_3_image_position,
+                    preferences.media_panel_3_image_view,
+                    int(preferences.show_media_panel_4),
+                    preferences.media_panel_4_file_path,
+                    preferences.media_panel_4_image_position,
+                    preferences.media_panel_4_image_view,
+                    int(preferences.media_rounded_corners),
+                    preferences.header_banner_image_position,
+                    preferences.header_banner_image_view,
                 ),
             )
         return preferences
@@ -1386,19 +1707,21 @@ class ScheduleRepository:
 
     def save_focus_session(self, session: FocusSession) -> FocusSession:
         with self.connect() as connection:
+            session_color = session.color.strip() or self._focus_color_for_title(connection, session.title)
             if session.id is None:
                 cursor = connection.execute(
                     """
                     INSERT INTO focus_sessions
-                      (title, task_id, target_process_name, target_window_title, planned_seconds,
+                      (title, task_id, target_process_name, target_window_title, color, planned_seconds,
                        focused_seconds, paused_seconds, away_seconds, started_at, ended_at, status)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         session.title,
                         session.task_id,
                         normalize_process_name(session.target_process_name) if session.target_process_name else "",
                         session.target_window_title,
+                        session_color,
                         session.planned_seconds,
                         session.focused_seconds,
                         session.paused_seconds,
@@ -1417,6 +1740,7 @@ class ScheduleRepository:
                         task_id = ?,
                         target_process_name = ?,
                         target_window_title = ?,
+                        color = ?,
                         planned_seconds = ?,
                         focused_seconds = ?,
                         paused_seconds = ?,
@@ -1431,6 +1755,7 @@ class ScheduleRepository:
                         session.task_id,
                         normalize_process_name(session.target_process_name) if session.target_process_name else "",
                         session.target_window_title,
+                        session_color,
                         session.planned_seconds,
                         session.focused_seconds,
                         session.paused_seconds,
@@ -1441,6 +1766,7 @@ class ScheduleRepository:
                         session.id,
                     ),
                 )
+            session.color = session_color
         return session
 
     def get_focus_session(self, session_id: int) -> FocusSession | None:
@@ -1471,6 +1797,34 @@ class ScheduleRepository:
         with self.connect() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [self._focus_session_from_row(row) for row in rows]
+
+    def set_focus_session_color(self, session_id: int, color: str) -> bool:
+        normalized_color = color.strip()
+        if not normalized_color:
+            return False
+        with self.connect() as connection:
+            row = connection.execute("SELECT id FROM focus_sessions WHERE id = ?", (session_id,)).fetchone()
+            if row is None:
+                return False
+            connection.execute("UPDATE focus_sessions SET color = ? WHERE id = ?", (normalized_color, session_id))
+        return True
+
+    @staticmethod
+    def _focus_color_for_title(connection: sqlite3.Connection, title: str) -> str:
+        row = connection.execute(
+            """
+            SELECT color FROM focus_sessions
+            WHERE lower(title) = lower(?) AND color <> ''
+            ORDER BY COALESCE(started_at, ended_at) DESC, id DESC
+            LIMIT 1
+            """,
+            (title.strip(),),
+        ).fetchone()
+        if row is not None:
+            color = str(row["color"]).strip()
+            if color:
+                return color
+        return _default_focus_session_color(title)
 
     def save_focus_event(self, event: FocusEvent) -> FocusEvent:
         if event.ended_at <= event.started_at or event.duration_seconds <= 0:
@@ -1628,8 +1982,8 @@ class ScheduleRepository:
                 cursor = connection.execute(
                     """
                     INSERT INTO quick_notes
-                      (body, content_html, created_at, focus_session_id, task_id, folder_id, process_name, window_title)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                      (body, content_html, created_at, focus_session_id, task_id, folder_id, process_name, window_title, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note.body.strip(),
@@ -1640,6 +1994,7 @@ class ScheduleRepository:
                         folder_id,
                         normalize_process_name(note.process_name) if note.process_name else "",
                         note.window_title.strip(),
+                        _dt_exact(note.deleted_at),
                     ),
                 )
                 note.id = int(cursor.lastrowid)
@@ -1654,7 +2009,8 @@ class ScheduleRepository:
                         task_id = ?,
                         folder_id = ?,
                         process_name = ?,
-                        window_title = ?
+                        window_title = ?,
+                        deleted_at = ?
                     WHERE id = ?
                     """,
                     (
@@ -1666,6 +2022,7 @@ class ScheduleRepository:
                         folder_id,
                         normalize_process_name(note.process_name) if note.process_name else "",
                         note.window_title.strip(),
+                        _dt_exact(note.deleted_at),
                         note.id,
                     ),
                 )
@@ -1678,10 +2035,16 @@ class ScheduleRepository:
         end_at: datetime | None = None,
         limit: int | None = None,
         folder_id: int | None = None,
+        include_deleted: bool = False,
+        deleted_only: bool = False,
     ) -> list[QuickNote]:
         query = "SELECT * FROM quick_notes"
         params: list[object] = []
         conditions: list[str] = []
+        if deleted_only:
+            conditions.append("deleted_at IS NOT NULL")
+        elif not include_deleted:
+            conditions.append("deleted_at IS NULL")
         if start_at and end_at:
             conditions.append("created_at >= ? AND created_at < ?")
             params.extend([_dt_exact(start_at), _dt_exact(end_at)])
@@ -1699,17 +2062,48 @@ class ScheduleRepository:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [self._quick_note_from_row(row) for row in rows]
 
+    def list_deleted_quick_notes(self, limit: int | None = None) -> list[QuickNote]:
+        return self.list_quick_notes(limit=limit, deleted_only=True)
+
     def get_quick_note(self, note_id: int) -> QuickNote | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM quick_notes WHERE id = ? AND deleted_at IS NULL",
+                (note_id,),
+            ).fetchone()
+        return self._quick_note_from_row(row) if row else None
+
+    def get_quick_note_any(self, note_id: int) -> QuickNote | None:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM quick_notes WHERE id = ?", (note_id,)).fetchone()
         return self._quick_note_from_row(row) if row else None
 
     def delete_quick_note(self, note_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE quick_notes SET deleted_at = ? WHERE id = ?", (_dt_exact(datetime.now()), note_id))
+
+    def restore_quick_note(self, note_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE quick_notes SET deleted_at = NULL WHERE id = ?", (note_id,))
+
+    def delete_quick_note_permanently(self, note_id: int) -> None:
         attachments = self.list_quick_note_attachments(note_id)
         with self.connect() as connection:
             connection.execute("DELETE FROM quick_notes WHERE id = ?", (note_id,))
         for attachment in attachments:
             self._delete_attachment_file(attachment)
+
+    def purge_expired_quick_notes(self, now: datetime | None = None) -> int:
+        cutoff = (now or datetime.now()) - timedelta(days=7)
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM quick_notes WHERE deleted_at IS NOT NULL AND deleted_at <= ?",
+                (_dt_exact(cutoff),),
+            ).fetchall()
+        note_ids = [int(row["id"]) for row in rows]
+        for note_id in note_ids:
+            self.delete_quick_note_permanently(note_id)
+        return len(note_ids)
 
     def add_quick_note_attachment(self, note_id: int, source_path: Path | str) -> QuickNoteAttachment:
         if self.get_quick_note(note_id) is None:
@@ -1785,6 +2179,24 @@ class ScheduleRepository:
 
         directory = self.db_path.parent / "inline_images"
         directory.mkdir(parents=True, exist_ok=True)
+        safe_stem = _safe_file_stem(source.stem)
+        suffix = source.suffix[:20]
+        target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
+        shutil.copy2(source, target)
+        return str(target)
+
+    def copy_media_asset(self, source_path: Path | str) -> str:
+        source = Path(source_path)
+        if not source.is_file():
+            raise FileNotFoundError(str(source))
+
+        directory = self.db_path.parent / "media"
+        directory.mkdir(parents=True, exist_ok=True)
+        try:
+            if source.resolve().is_relative_to(directory.resolve()):
+                return str(source)
+        except OSError:
+            pass
         safe_stem = _safe_file_stem(source.stem)
         suffix = source.suffix[:20]
         target = directory / f"{uuid.uuid4().hex}_{safe_stem}{suffix}"
@@ -1989,6 +2401,7 @@ class ScheduleRepository:
             task_id=row["task_id"],
             target_process_name=str(row["target_process_name"]),
             target_window_title=str(row["target_window_title"]),
+            color=str(row["color"] or ""),
             planned_seconds=int(row["planned_seconds"]),
             focused_seconds=int(row["focused_seconds"]),
             paused_seconds=int(row["paused_seconds"]),
@@ -2121,6 +2534,7 @@ class ScheduleRepository:
             folder_id=row["folder_id"] if "folder_id" in keys else None,
             process_name=str(row["process_name"]),
             window_title=str(row["window_title"]) if "window_title" in keys else "",
+            deleted_at=_parse_dt(row["deleted_at"]) if "deleted_at" in keys else None,
         )
 
     @staticmethod

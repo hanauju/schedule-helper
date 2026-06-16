@@ -1,27 +1,31 @@
 import json
 import os
 from datetime import datetime, time, timedelta
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QEvent, QPoint, Qt, QTime
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFrame,
     QLabel,
     QListWidget,
+    QMessageBox,
     QPushButton,
     QSizePolicy,
     QSpinBox,
+    QTableWidget,
     QToolButton,
     QWidget,
 )
 
-from app.models import FocusSession, ItemType, LinkFavorite, QuickNote, Task
+from app.models import FocusSession, ItemType, LayoutProfile, LinkFavorite, QuickNote, Task
 from app.services.app_usage import ActiveWindowSnapshot
 from app.storage.database import ScheduleRepository
 from app.ui.main_window import (
@@ -37,14 +41,20 @@ from app.ui.main_window import (
     FavoritesSettingsDialog,
     FocusWidgetDialog,
     ItemTypeSettingsDialog,
+    LayoutProfileLoadDialog,
     MainWindow,
     QuickNoteDetailDialog,
+    QuickNoteFolderNotesDialog,
+    QuickNoteTrashDialog,
     SettingsDialog,
     TodayChecklistWidget,
     TodayTimelineWidget,
     _download_site_icon,
+    _draw_image_viewport,
     _eyedropper_cursor,
+    _fill_time_block_table,
     _format_time,
+    _clip_media_corners,
     _record_items_for_date,
     _today_timeline_blocks,
 )
@@ -74,6 +84,37 @@ def _dashboard_support_items(start_y: int = 8, omit: set[str] | None = None) -> 
         {"key": "datetime", "x": 6, "y": start_y + 9, "w": 3, "h": 1},
     ]
     return [item for item in items if str(item["key"]) not in omitted]
+
+
+def test_main_window_ui_strings_do_not_contain_mojibake() -> None:
+    source = Path("app/ui/main_window.py").read_text(encoding="utf-8")
+    broken_tokens = (
+        "硫",
+        "吏",
+        "諛",
+        "湲",
+        "蹂",
+        "쨌",
+        "氤",
+        "旮",
+        "歃",
+        "凯",
+        "路",
+        "歆",
+        "姤",
+        "彀",
+        "娟",
+        "赴",
+        "偓",
+        "搓",
+        "办",
+        "爼",
+        "半",
+        "掣",
+    )
+    assert not [token for token in broken_tokens if token in source]
+    assert 'QPushButton("날짜별 보기")' in source
+    assert 'setText("재개"' in source
 
 
 def test_time_block_context_uses_viewport_coordinates(tmp_path) -> None:
@@ -186,6 +227,28 @@ def test_undated_completed_checklist_task_stays_out_of_timeline_grid_records_com
     assert task_records[0][2].get("record_kind") == "completed"
 
 
+def test_timeline_deduplicates_same_focus_session_per_slot(tmp_path) -> None:
+    app = _app()
+    selected_date = datetime(2026, 6, 14).date()
+    table = QTableWidget(24, 7)
+    session_payload = {"type": "focus_session", "id": 7, "title": "Multi target focus"}
+    start = datetime(2026, 6, 14, 9, 0)
+    blocks = [
+        (start, start + timedelta(minutes=10), "focus", "집중 Multi target focus", session_payload),
+        (start, start + timedelta(minutes=10), "focus", "집중 Multi target focus", dict(session_payload)),
+    ]
+
+    _fill_time_block_table(table, selected_date, blocks)
+    app.processEvents()
+
+    item = table.item(9, 1)
+    payloads = item.data(Qt.ItemDataRole.UserRole)
+    assert isinstance(payloads, list)
+    assert payloads == [session_payload]
+    assert item.toolTip().count("Multi target focus") == 1
+    assert item.background().color().name().lower() == "#b9a7e8"
+
+
 def test_checklist_edit_dialog_can_select_past_date_time(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -277,8 +340,8 @@ def test_main_feature_titles_are_not_repeated_inside_panels(tmp_path) -> None:
     for feature_key, title in (
         ("pomodoro", "뽀모도로"),
         ("today_checklist", "오늘 체크리스트"),
-        ("today_timeline", "오늘 시간표"),
-        ("quick_memo", "빠른 메모"),
+        ("today_timeline", "시간표"),
+        ("quick_memo", "메모"),
         ("link_favorites", "즐겨찾기"),
     ):
         feature_box = window.feature_boxes[feature_key]
@@ -470,21 +533,106 @@ def test_settings_control_main_window_font_and_size(tmp_path) -> None:
     default_check = dialog.findChild(QCheckBox, "mainFontDefaultCheck")
     font_combo = dialog.findChild(QComboBox, "mainFontCombo")
     size_spin = dialog.findChild(QSpinBox, "mainFontSizeSpin")
+    label_size_spin = dialog.findChild(QSpinBox, "labelFontSizeSpin")
+    content_size_spin = dialog.findChild(QSpinBox, "contentFontSizeSpin")
 
     assert default_check is not None
     assert font_combo is not None
     assert size_spin is not None
+    assert label_size_spin is not None
+    assert content_size_spin is not None
     assert default_check.isChecked()
     assert not font_combo.isEnabled()
     assert size_spin.value() == 13
+    assert label_size_spin.value() == 13
+    assert content_size_spin.value() == 13
 
     default_check.setChecked(False)
     size_spin.setValue(17)
+    label_size_spin.setValue(15)
+    content_size_spin.setValue(18)
     app.processEvents()
 
     preferences = dialog.preferences()
     assert preferences.main_font_family
     assert preferences.main_font_size == 17
+    assert preferences.label_font_size == 15
+    assert preferences.content_font_size == 18
+    dialog.close()
+
+
+def test_settings_control_datetime_panel_style(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.datetime_transparent_check.isChecked()
+    assert not dialog.datetime_border_check.isChecked()
+    assert dialog.use_default_datetime_font_check.isChecked()
+    assert not dialog.datetime_font_combo.isEnabled()
+    assert dialog.datetime_font_size_spin.value() == 24
+
+    dialog.datetime_transparent_check.setChecked(False)
+    dialog.datetime_border_check.setChecked(True)
+    dialog.set_setting_color("datetime_text", "#123456")
+    dialog.use_default_datetime_font_check.setChecked(False)
+    dialog.datetime_font_size_spin.setValue(40)
+    dialog.set_datetime_background_image_path("C:/Images/time.gif")
+    app.processEvents()
+
+    preferences = dialog.preferences()
+    assert not preferences.datetime_panel_transparent_background
+    assert preferences.datetime_panel_border_enabled
+    assert preferences.datetime_panel_text_color == "#123456"
+    assert preferences.datetime_panel_font_family
+    assert preferences.datetime_panel_font_size == 40
+    assert preferences.datetime_panel_background_image_path == "C:/Images/time.gif"
+    dialog.close()
+
+
+def test_settings_hide_banner_size_position_and_save_media_corner_choice(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    labels = [label.text() for label in dialog.findChildren(QLabel)]
+    assert "배너 높이" not in labels
+    assert "배너 위치" not in labels
+    assert not hasattr(dialog, "header_banner_height_spin")
+    assert not hasattr(dialog, "header_banner_position_combo")
+
+    dialog.media_rounded_corners_check.setChecked(False)
+    preferences = dialog.preferences()
+    assert not preferences.media_rounded_corners
+    assert preferences.header_banner_height == 132
+    assert preferences.header_banner_position == "center"
+    dialog.close()
+
+
+def test_layout_profile_load_dialog_deletes_selected_profile(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    repository.save_layout_profile(LayoutProfile(name="작업 화면", data='{"layout":{}}'))
+    repository.save_layout_profile(LayoutProfile(name="저녁 화면", data='{"layout":{"grid":[]}}'))
+
+    dialog = LayoutProfileLoadDialog(repository)
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.profile_list.count() == 2
+    first_item = dialog.profile_list.item(0)
+    dialog.profile_list.setCurrentItem(first_item)
+    deleted_name = first_item.text()
+    dialog.delete_selected_profile(confirm=False)
+    app.processEvents()
+
+    names = [profile.name for profile in repository.list_layout_profiles()]
+    assert deleted_name not in names
+    assert dialog.profile_list.count() == 1
     dialog.close()
 
 
@@ -494,6 +642,8 @@ def test_main_window_applies_configured_font_and_scales_text(tmp_path) -> None:
     preferences = repository.get_preferences()
     preferences.main_font_family = "Arial"
     preferences.main_font_size = 15
+    preferences.label_font_size = 14
+    preferences.content_font_size = 18
     repository.save_preferences(preferences)
 
     window = MainWindow(repository)
@@ -506,6 +656,107 @@ def test_main_window_applies_configured_font_and_scales_text(tmp_path) -> None:
     assert "QWidget {\n                color: #18201b;\n                font-family:" in style
     assert "font-size: 15px;" in style
     assert "QLabel#noteBodyLabel" in style
+    assert "QLabel#sectionTitle," in style
+    assert "font-size: 14px;" in style
+    assert "font-size: 18px;" in style
+    window.close()
+
+
+def test_settings_live_preview_updates_main_window_without_saving(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    dialog.content_font_size_spin.setValue(19)
+    dialog.show_today_checklist_inline_check.setChecked(True)
+    dialog.set_setting_color("accent", "#3366aa")
+    app.processEvents()
+
+    assert window.preferences.content_font_size == 19
+    assert window.preferences.accent_color == "#3366aa"
+    assert window.today_checklist_panel.isVisible()
+    assert "font-size: 19px;" in window.styleSheet()
+    assert repository.get_preferences().content_font_size == 13
+
+    dialog.close()
+    window.close()
+
+
+def test_datetime_panel_live_preview_applies_text_style(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    dialog.set_setting_color("datetime_text", "#123456")
+    dialog.datetime_font_size_spin.setValue(42)
+    dialog.datetime_transparent_check.setChecked(False)
+    dialog.datetime_border_check.setChecked(True)
+    app.processEvents()
+
+    style = window.styleSheet()
+    assert window.preferences.datetime_panel_text_color == "#123456"
+    assert window.preferences.datetime_panel_font_size == 42
+    assert "QLabel#currentTimeLabel" in style
+    assert "color: #123456;" in style
+    assert "font-size: 42px;" in style
+    assert "QWidget#dateTimePanel" in style
+    assert "border: 1px solid" in style
+
+    dialog.close()
+    window.close()
+
+
+def test_main_window_opens_with_datetime_panel_border_enabled(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.datetime_panel_border_enabled = True
+    preferences.datetime_panel_transparent_background = False
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    assert "QWidget#dateTimePanel" in window.styleSheet()
+    assert "border: 1px solid" in window.styleSheet()
+    window.close()
+
+
+def test_settings_cancel_restores_live_preview_changes(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    def reject_after_preview(dialog: SettingsDialog) -> QDialog.DialogCode:
+        dialog.content_font_size_spin.setValue(20)
+        dialog.show_quick_memo_panel_check.setChecked(False)
+        dialog.set_setting_color("accent", "#aa3366")
+        app.processEvents()
+        return QDialog.DialogCode.Rejected
+
+    monkeypatch.setattr(SettingsDialog, "exec", reject_after_preview)
+    window.show_settings_window()
+    app.processEvents()
+
+    assert window.preferences.content_font_size == 13
+    assert window.preferences.accent_color == "#4f8c6b"
+    assert window.memo_panel.isVisible()
+    assert repository.get_preferences().content_font_size == 13
     window.close()
 
 
@@ -594,7 +845,9 @@ def test_focus_panel_stacks_target_controls_when_compact(tmp_path) -> None:
     assert window.focus_ratio_stack.currentIndex() == 1
     assert window.focus_status_label.maximumHeight() <= 34
     assert not window.focus_status_label.wordWrap()
-    assert all(card.isHidden() for card in window.focus_metric_cards)
+    assert all(card.isVisible() for card in window.focus_metric_cards)
+    assert all(card.property("compactMetric") for card in window.focus_metric_cards)
+    assert all(card.maximumHeight() <= 48 for card in window.focus_metric_cards)
     assert window.focus_header_label.text() == ""
     assert window.focus_header_label.isHidden()
     assert "font-size: 34px" in window.remaining_time_label.styleSheet()
@@ -617,7 +870,9 @@ def test_focus_panel_uses_compact_meter_before_it_gets_cramped(tmp_path) -> None
     assert window.focus_ratio_card.maximumHeight() <= 86
     assert window.focus_ratio_stack.currentIndex() == 1
     assert window.focus_status_label.height() <= 34
-    assert all(card.isHidden() for card in window.focus_metric_cards)
+    assert all(card.isVisible() for card in window.focus_metric_cards)
+    assert window.focus_metrics_layout.direction() == QBoxLayout.Direction.LeftToRight
+    assert all(card.property("compactMetric") for card in window.focus_metric_cards)
     window.close()
 
 
@@ -853,8 +1108,13 @@ def test_spin_controls_have_arrows_and_consistent_right_corners(tmp_path) -> Non
     style = window.styleSheet()
     assert "QSpinBox::up-arrow, QTimeEdit::up-arrow" in style
     assert "QSpinBox::down-arrow, QTimeEdit::down-arrow" in style
+    assert "QComboBox::down-arrow" in style
+    assert "__COMBO_DOWN_ARROW__" not in style
     assert "__SPIN_UP_ARROW__" not in style
     assert "__SPIN_DOWN_ARROW__" not in style
+    assert "QSpinBox#focusDurationSpin" in style
+    assert "padding: 4px 22px 4px 10px;" in style
+    assert "width: 18px;" in style
     assert "border-top-right-radius: 11px;" in style
     assert "border-bottom-right-radius: 11px;" in style
     assert "QScrollArea#checklistItemsArea, QScrollArea#favoritesShelfArea" in style
@@ -880,6 +1140,12 @@ def test_timeline_waiting_panel_auto_collapses_when_narrow(tmp_path) -> None:
     assert widget.waiting_auto_collapsed
     assert not widget.waiting_panel.isVisible()
     assert widget.waiting_rail.isVisible()
+
+    widget.set_waiting_panel_pinned(True)
+    app.processEvents()
+    assert not widget.waiting_auto_collapsed
+    assert widget.waiting_panel.isVisible()
+    assert not widget.waiting_rail.isVisible()
 
     widget.resize(920, 620)
     app.processEvents()
@@ -918,6 +1184,13 @@ def test_timeline_ports_filter_segment_buttons(tmp_path) -> None:
     assert len(buttons) == 4
     assert widget.timeline_filter_combo.isHidden()
     assert widget.timeline_filter_buttons["all"].isChecked()
+    assert widget.timeline_stat_strip.isHidden()
+    assert widget.date_label.parentWidget().objectName() == "timelineToolbar"
+    assert all("개" in button.text() for button in widget.timeline_filter_buttons.values())
+    button_positions = [button.geometry().x() for button in widget.timeline_filter_buttons.values()]
+    assert button_positions == sorted(button_positions)
+    assert len(set(button_positions)) == len(button_positions)
+    assert all(button.width() >= 82 for button in widget.timeline_filter_buttons.values())
 
     widget.timeline_filter_buttons["focus"].click()
     app.processEvents()
@@ -930,6 +1203,24 @@ def test_timeline_ports_filter_segment_buttons(tmp_path) -> None:
     assert checked_keys == ["focus"]
     assert widget._current_timeline_filter_key() == "focus"
     assert widget.timeline_filter_combo.currentData() == "focus"
+    widget.close()
+
+
+def test_timeline_uses_compact_filter_combo_when_narrow(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    widget = TodayTimelineWidget(repository)
+    widget.resize(420, 640)
+    widget.show()
+    app.processEvents()
+
+    assert widget.timeline_filter_segment.isHidden()
+    assert widget.timeline_filter_combo.isVisible()
+    assert widget.date_label.text().count("/") == 1
+
+    widget.timeline_filter_combo.setCurrentIndex(widget.timeline_filter_combo.findData("focus"))
+    app.processEvents()
+    assert widget.timeline_filter_key == "focus"
     widget.close()
 
 
@@ -964,9 +1255,13 @@ def test_timeline_ports_stat_chips(tmp_path) -> None:
     widget.show()
     app.processEvents()
 
+    assert widget.timeline_filter_buttons["all"].text() == "전체 3개"
+    assert widget.timeline_filter_buttons["schedule_task"].text() == "항목 1개"
+    assert widget.timeline_filter_buttons["completed"].text() == "완료 1개"
+    assert widget.timeline_filter_buttons["focus"].text() == "집중 1개"
     assert widget.timeline_item_stat_label.text() == "항목 1개"
     assert widget.timeline_completed_stat_label.text() == "완료 1개"
-    assert widget.timeline_focus_stat_label.text() == "집중 기록 1개"
+    assert widget.timeline_focus_stat_label.text() == "집중 1개"
     assert widget.summary_label.isHidden()
     assert widget.summary_label.text() == ""
     widget.close()
@@ -981,7 +1276,9 @@ def test_integrated_widget_layout_and_memo_folder_actions(tmp_path) -> None:
 
     assert window.compact_button.text() == "통합 위젯"
     memo_buttons = {button.text() for button in window.memo_panel.findChildren(QPushButton)}
-    assert {"폴더 보기", "폴더 관리"}.issubset(memo_buttons)
+    assert "폴더 보기" in memo_buttons
+    assert "폴더 관리" not in memo_buttons
+    assert "쓰레기통" in memo_buttons
     assert window.memo_panel.findChild(QWidget, "memoFolderStrip") is None
 
     window.open_compact_widget()
@@ -1017,10 +1314,39 @@ def test_quick_memo_rows_use_timeline_port_style(tmp_path) -> None:
     window.close()
 
 
+def test_quick_memo_rows_keep_three_lines_with_large_content_font(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.content_font_size = 22
+    repository.save_preferences(preferences)
+    repository.save_quick_note(
+        QuickNote(
+            body="첫 줄 두 번째 줄 세 번째 줄 네 번째 줄까지 이어지는 긴 메모입니다.",
+            created_at=datetime(2026, 6, 14, 8, 5),
+        )
+    )
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    window.refresh_notes()
+    app.processEvents()
+
+    item = window.notes_list.item(0)
+    row = window.notes_list.itemWidget(item)
+    body_label = row.findChild(QLabel, "noteBodyLabel") if row is not None else None
+
+    assert body_label is not None
+    assert item.sizeHint().height() >= window._quick_note_body_min_height() + 58
+    assert body_label.minimumHeight() >= window._quick_note_body_min_height()
+    window.close()
+
+
 def test_quick_memo_context_copy_copies_note_body(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
-    repository.save_quick_note(QuickNote("복사할 빠른 메모", datetime(2026, 6, 14, 8, 5)))
+    repository.save_quick_note(QuickNote("복사할 메모", datetime(2026, 6, 14, 8, 5)))
 
     window = MainWindow(repository)
     window.resize(1280, 820)
@@ -1031,7 +1357,78 @@ def test_quick_memo_context_copy_copies_note_body(tmp_path) -> None:
     window.notes_list.setCurrentRow(0)
     window.copy_selected_quick_note()
 
-    assert QApplication.clipboard().text() == "복사할 빠른 메모"
+    assert QApplication.clipboard().text() == "복사할 메모"
+    window.close()
+
+
+def test_note_folder_window_copy_and_refreshes_main_folder_combo(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = QuickNoteFolderNotesDialog(repository, window, on_changed=window.refresh_quick_note_views)
+    dialog.show()
+    app.processEvents()
+
+    monkeypatch.setattr(
+        "app.ui.main_window.QInputDialog.getText",
+        lambda *_args, **_kwargs: ("새 폴더", True),
+    )
+    dialog.add_folder()
+    app.processEvents()
+
+    assert window.quick_note_folder_combo.findText("새 폴더") >= 0
+
+    folder_id = dialog.current_folder_id()
+    note = repository.save_quick_note(
+        QuickNote(
+            body="폴더 보기에서 복사할 메모",
+            created_at=datetime(2026, 6, 14, 9, 0),
+            folder_id=folder_id,
+        )
+    )
+    dialog.refresh()
+    dialog.notes_list.setCurrentRow(0)
+    dialog.copy_notes([int(note.id)])
+
+    assert QApplication.clipboard().text() == "폴더 보기에서 복사할 메모"
+    dialog.close()
+    window.close()
+
+
+def test_note_trash_soft_delete_restore_and_permanent_delete(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    note = repository.save_quick_note(QuickNote(body="버릴 메모", created_at=datetime(2026, 6, 14, 9, 0)))
+    repository.delete_quick_note(note.id)
+
+    window = MainWindow(repository)
+    dialog = QuickNoteTrashDialog(repository, window, on_changed=window.refresh_quick_note_views)
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.trash_list.count() == 1
+    assert repository.list_quick_notes() == []
+
+    dialog.trash_list.setCurrentRow(0)
+    dialog.restore_selected_notes()
+    app.processEvents()
+    assert repository.get_quick_note(note.id) is not None
+
+    repository.delete_quick_note(note.id)
+    dialog.refresh()
+    dialog.trash_list.setCurrentRow(0)
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    dialog.delete_selected_notes_permanently()
+    app.processEvents()
+
+    assert repository.get_quick_note_any(note.id) is None
+    dialog.close()
     window.close()
 
 
@@ -1049,14 +1446,15 @@ def test_quick_memo_editor_ports_compact_header_actions(tmp_path) -> None:
     assert window.memo_save_button.parentWidget() is window.memo_editor_header
     assert window.memo_attach_button.parentWidget() is window.memo_editor_header
     assert window.memo_folder_view_button.parentWidget() is window.memo_history_card
-    assert window.memo_folder_settings_button.parentWidget() is window.memo_history_card
+    assert window.memo_folder_settings_button.parentWidget() is None
+    assert window.memo_trash_button.parentWidget() is window.memo_history_card
     assert window.memo_save_button.maximumWidth() == 76
     assert window.memo_attach_button.maximumWidth() == 76
     assert window.memo_folder_view_button.maximumWidth() <= 86
-    assert window.memo_folder_settings_button.maximumWidth() <= 86
+    assert window.memo_trash_button.maximumWidth() <= 86
     assert window.memo_history_filter_row.indexOf(window.note_filter_combo) == window.memo_history_filter_row.count() - 1
     assert window.memo_history_filter_row.indexOf(window.memo_folder_view_button) < window.memo_history_filter_row.indexOf(window.note_filter_combo)
-    assert window.memo_history_filter_row.indexOf(window.memo_folder_settings_button) < window.memo_history_filter_row.indexOf(window.note_filter_combo)
+    assert window.memo_history_filter_row.indexOf(window.memo_trash_button) < window.memo_history_filter_row.indexOf(window.note_filter_combo)
     assert window.memo_panel.findChild(QWidget, "memoFolderStrip") is None
     assert 40 <= window.quick_note_editor.minimumHeight() <= 64
     splitter_sizes = window.memo_splitter.sizes()
@@ -1115,6 +1513,7 @@ def test_quick_memo_prioritizes_editor_when_tiny(tmp_path) -> None:
     assert window.memo_shortcut_label.isHidden()
     assert window.memo_folder_view_button.isHidden()
     assert window.memo_folder_settings_button.isHidden()
+    assert window.memo_trash_button.isHidden()
     assert window.quick_note_editor.isVisible()
     assert window.quick_note_editor.minimumHeight() == 40
     assert window.memo_save_button.isVisible()
@@ -1282,6 +1681,7 @@ def test_today_checklist_rows_use_compact_task_row_port(tmp_path) -> None:
 
     row = window.today_checklist_widget.findChild(QWidget, "checklistRow")
     checkboxes = window.today_checklist_widget.findChildren(QCheckBox, "checklistItemCheck")
+    checkbox_slot = window.today_checklist_widget.findChild(QWidget, "checklistCheckboxSlot")
     meta_label = window.today_checklist_widget.findChild(QLabel, "checklistItemMeta")
     add_panel = window.today_checklist_widget.findChild(QWidget, "checklistAddPanel")
     checklist_input = window.today_checklist_widget.findChild(QWidget, "checklistInput")
@@ -1291,10 +1691,16 @@ def test_today_checklist_rows_use_compact_task_row_port(tmp_path) -> None:
     assert row.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Maximum
     assert _margins_tuple(row.layout()) == (8, 12, 8, 12)
     assert "QLabel#noteBodyLabel" in window.styleSheet()
-    assert "QLabel#checklistItemTitle {\n                color: #18201b;\n                font-size: 13px;\n                font-weight: 600;" in window.styleSheet()
+    assert "QLabel#noteBodyLabel {\n                color: #18201b;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
+    assert "QLabel#checklistItemTitle {\n                color: #18201b;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
     assert "QLabel#checklistItemMeta, QLabel#checklistItemMetaDone" in window.styleSheet()
     assert "font-size: 11px;" in window.styleSheet()
+    assert "subcontrol-position: center;" in window.styleSheet()
+    assert "QWidget#checklistCheckboxSlot" in window.styleSheet()
     assert any(checkbox.width() == 19 and checkbox.maximumWidth() == 19 for checkbox in checkboxes)
+    assert checkbox_slot is not None
+    assert checkbox_slot.maximumWidth() == 19
+    assert _margins_tuple(checkbox_slot.layout()) == (0, 1, 0, 0)
     assert meta_label is not None
     assert "10:30" in meta_label.text()
     assert "15분" in meta_label.text()
@@ -1362,6 +1768,34 @@ def test_task_folders_are_managed_outside_settings(tmp_path) -> None:
     window.close()
 
 
+def test_task_folder_dialog_moves_checked_tasks(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    source = repository.save_item_type(ItemType("Source", "task"))
+    target = repository.save_item_type(ItemType("Target", "task"))
+    first = repository.save_task(Task("First", 0, item_type_id=source.id))
+    second = repository.save_task(Task("Second", 0, item_type_id=source.id))
+
+    dialog = ItemTypeSettingsDialog(repository)
+    dialog.refresh_types(source.id)
+    dialog.show()
+    app.processEvents()
+
+    assert dialog.type_task_list.count() == 2
+    for row in range(dialog.type_task_list.count()):
+        dialog.type_task_list.item(row).setCheckState(Qt.CheckState.Checked)
+    target_index = dialog.target_type_combo.findData(target.id)
+    assert target_index >= 0
+    dialog.target_type_combo.setCurrentIndex(target_index)
+
+    dialog.move_selected_tasks()
+    app.processEvents()
+
+    assert repository.get_task(first.id).item_type_id == target.id
+    assert repository.get_task(second.id).item_type_id == target.id
+    dialog.close()
+
+
 def test_feature_context_windows_use_new_window_label_and_always_on_top(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -1372,9 +1806,9 @@ def test_feature_context_windows_use_new_window_label_and_always_on_top(tmp_path
     expected_titles = {
         "focus": "집중 새창",
         "pomodoro": "뽀모도로 새창",
-        "quick_memo": "빠른 메모 새창",
+        "quick_memo": "메모 새창",
         "today_checklist": "오늘 체크리스트 새창",
-        "today_timeline": "오늘 시간표 새창",
+        "today_timeline": "시간표 새창",
         "link_favorites": "즐겨찾기 새창",
         "media_panel": "이미지 새창",
     }
@@ -1426,6 +1860,8 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     assert "메인창에서 숨기기" in media_popup_buttons
     assert "이미지 변경" in media_popup_buttons
     assert "비우기" in media_popup_buttons
+    assert "이미지 보기 조정" in media_popup_buttons
+    assert "이미지 보기 초기화" in media_popup_buttons
     assert media_popup.minimumWidth() >= 164
     media_popup.close()
 
@@ -1436,6 +1872,40 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     assert not dialog.preview_label.pixmap().isNull()
 
     dialog.close()
+    window.close()
+
+
+def test_extra_media_panels_copy_assets_and_keep_hidden_images(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "extra.png"
+    pixmap = QPixmap(18, 12)
+    pixmap.fill(Qt.GlobalColor.blue)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_media_panel_2 = True
+    preferences.media_panel_2_file_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    stored_path = Path(window.preferences.media_panel_2_file_path)
+    assert stored_path.parent == tmp_path / "media"
+    assert stored_path.exists()
+    assert window.media_panel_2.isVisible()
+    preview = window.media_preview_labels["media_panel_2"]
+    assert preview.pixmap() is not None
+    assert not preview.pixmap().isNull()
+
+    window.hide_feature_from_main("media_panel_2")
+    app.processEvents()
+    reloaded = repository.get_preferences()
+    assert not reloaded.show_media_panel_2
+    assert reloaded.media_panel_2_file_path == str(stored_path)
+
     window.close()
 
 
@@ -1471,9 +1941,114 @@ def test_header_banner_loads_gif_and_uses_image_context_popup(tmp_path) -> None:
     assert "메인창에서 숨기기" in popup_buttons
     assert "이미지 변경" in popup_buttons
     assert "비우기" in popup_buttons
+    assert "이미지 보기 조정" in popup_buttons
+    assert "이미지 보기 초기화" in popup_buttons
     assert popup.minimumWidth() >= 164
     popup.close()
     window.close()
+
+
+def test_header_banner_uses_label_pixmap_loader_like_media_panel(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "banner.png"
+    pixmap = QPixmap(28, 12)
+    pixmap.fill(Qt.GlobalColor.green)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = True
+    preferences.header_banner_image_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    stored_path = Path(window.preferences.header_banner_image_path)
+    assert stored_path.parent == tmp_path / "media"
+    assert stored_path.exists()
+    assert window.header_banner_widget.pixmap() is not None
+    assert not window.header_banner_widget.pixmap().isNull()
+
+    window.set_header_banner_image_position("right")
+    assert repository.get_preferences().header_banner_image_position == "right"
+    assert bool(window.header_banner_widget.alignment() & Qt.AlignmentFlag.AlignRight)
+    assert repository.get_preferences().header_banner_image_view
+
+    window.close()
+
+
+def test_media_panel_image_position_persists_from_context_action(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "position.png"
+    pixmap = QPixmap(20, 12)
+    pixmap.fill(Qt.GlobalColor.yellow)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.media_panel_file_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.set_media_panel_image_position("media_panel", "left")
+    assert repository.get_preferences().media_panel_image_position == "left"
+    assert bool(window.media_preview_label.alignment() & Qt.AlignmentFlag.AlignLeft)
+    window.set_media_panel_image_view("media_panel", {"zoom": 50, "x": 20, "y": 70})
+    reloaded = repository.get_preferences()
+    assert reloaded.media_panel_image_view == '{"zoom":50,"x":20,"y":70}'
+    assert window.media_preview_label.image_view == {"zoom": 50, "x": 20, "y": 70}
+
+    window.close()
+
+
+def test_media_corner_clip_survives_image_viewport_clip() -> None:
+    _app()
+    widget = QWidget()
+    widget.resize(80, 80)
+
+    source = QPixmap(80, 80)
+    source.fill(Qt.GlobalColor.red)
+    target = QPixmap(80, 80)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    try:
+        _clip_media_corners(widget, painter, True)
+        _draw_image_viewport(widget, painter, source, {"zoom": 100, "x": 50, "y": 50})
+    finally:
+        painter.end()
+
+    image = target.toImage()
+    assert image.pixelColor(0, 0).alpha() == 0
+    assert image.pixelColor(40, 40).red() > 200
+    assert image.pixelColor(40, 40).alpha() > 200
+
+
+def test_media_image_viewport_allows_zooming_out() -> None:
+    _app()
+    widget = QWidget()
+    widget.resize(100, 100)
+
+    source = QPixmap(100, 100)
+    source.fill(Qt.GlobalColor.red)
+    target = QPixmap(100, 100)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    try:
+        _draw_image_viewport(widget, painter, source, {"zoom": 50, "x": 0, "y": 0})
+    finally:
+        painter.end()
+
+    image = target.toImage()
+    assert image.pixelColor(10, 10).red() > 200
+    assert image.pixelColor(10, 10).alpha() > 200
+    assert image.pixelColor(90, 90).alpha() == 0
 
 
 def test_main_window_restores_last_closed_size(tmp_path) -> None:
@@ -1610,6 +2185,139 @@ def test_default_dashboard_layout_is_cleanly_packed(tmp_path) -> None:
     assert positions["pomodoro"] == (9, 3, 3, 4)
     assert positions["media_panel"] == (9, 7, 3, 8)
     assert positions["link_favorites"] == (9, 15, 3, 6)
+    window.close()
+
+
+def test_hidden_header_banner_does_not_block_dashboard_top_space(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = False
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    focus_cell = window.feature_cells["focus"]
+    focus_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(focus_cell)
+    )
+    assert focus_position[:2] == (0, 0)
+
+    window.close()
+
+
+def test_datetime_panel_overlays_other_dashboard_items(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_datetime_panel = True
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    datetime_box = window.feature_boxes["datetime"]
+    assert datetime_box.title_label is None
+    assert datetime_box.move_bar is None
+    assert datetime_box.content_drag_enabled
+
+    window.feature_dashboard_items = [
+        {"key": "datetime", "x": 0, "y": 0, "w": 4, "h": 2},
+        {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 4},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    datetime_cell = window.feature_cells["datetime"]
+    focus_cell = window.feature_cells["focus"]
+    datetime_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(datetime_cell)
+    )
+    focus_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(focus_cell)
+    )
+    assert datetime_position[:2] == (0, 0)
+    assert focus_position[:2] == (0, 0)
+
+    window.close()
+
+
+def test_datetime_overlay_moves_and_resizes_without_repacking_neighbors(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_datetime_panel = True
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    window.feature_dashboard_items = [
+        {"key": "datetime", "x": 0, "y": 0, "w": 3, "h": 1},
+        {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 4},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    column_step = int(window._dashboard_column_width() + DASHBOARD_GRID_GAP)
+    row_step = int(DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP)
+    target = window.feature_grid_container.mapToGlobal(QPoint(column_step * 6, row_step * 5))
+    assert window._move_feature_to_dashboard_position("datetime", target, QPoint(0, 0))
+
+    moved = {
+        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
+        for item in window._current_feature_dashboard_layout()
+    }
+    assert moved["focus"][:2] == (0, 0)
+    assert moved["datetime"][:2] == (6, 5)
+
+    window._resize_feature_dashboard_item("datetime", width=window._dashboard_item_pixel_width(2))
+    resized = {
+        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
+        for item in window._current_feature_dashboard_layout()
+    }
+    assert resized["focus"][:2] == (0, 0)
+    assert resized["datetime"][2] == 2
+
+    window._resize_feature_dashboard_item("datetime", height=window._dashboard_item_pixel_height(2))
+    resized_height = {
+        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
+        for item in window._current_feature_dashboard_layout()
+    }
+    assert resized_height["focus"][:2] == (0, 0)
+    assert resized_height["datetime"][3] == 2
+
+    window.close()
+
+
+def test_header_banner_position_setting_updates_dashboard_slot(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = True
+    preferences.header_banner_position = "right"
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    window.feature_dashboard_items = [
+        {"key": "header_banner", "x": 0, "y": 5, "w": 4, "h": 3},
+        {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 4},
+    ]
+    window.move_header_banner_to_preferred_column()
+    header = next(item for item in window._current_feature_dashboard_layout() if item["key"] == "header_banner")
+    assert (int(header["x"]), int(header["y"]), int(header["w"])) == (8, 0, 4)
+
     window.close()
 
 
@@ -1985,6 +2693,33 @@ def test_dashboard_move_preserves_scroll_position(tmp_path) -> None:
     app.processEvents()
 
     assert scroll_bar.value() == before
+    window.close()
+
+
+def test_dashboard_drag_auto_scrolls_near_viewport_edges(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(980, 420)
+    window.show()
+    app.processEvents()
+
+    window.feature_dashboard_items = [
+        {"key": key, "x": 0, "y": index * 5, "w": 4, "h": 4}
+        for index, key in enumerate(window.feature_boxes)
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    scroll_bar = window.full_scroll_area.verticalScrollBar()
+    assert scroll_bar.maximum() > 0
+    scroll_bar.setValue(0)
+    viewport = window.full_scroll_area.viewport()
+    bottom_global = viewport.mapToGlobal(QPoint(viewport.width() // 2, viewport.height() - 3))
+    window.auto_scroll_feature_drag(bottom_global)
+    app.processEvents()
+
+    assert scroll_bar.value() > 0
     window.close()
 
 

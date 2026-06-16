@@ -84,6 +84,36 @@ def test_repository_manages_item_types(tmp_path) -> None:
     assert repository.get_task(task.id).item_type_id == default_task_type.id
 
 
+def test_repository_moves_tasks_between_item_types(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    source_type = repository.save_item_type(ItemType("Source", "task"))
+    target_type = repository.save_item_type(ItemType("Target", "task"))
+    first = repository.save_task(Task("First", 0, item_type_id=source_type.id))
+    second = repository.save_task(Task("Second", 0, item_type_id=source_type.id))
+
+    moved = repository.move_tasks_to_type([first.id, second.id], target_type.id)
+
+    assert moved == 2
+    assert repository.get_task(first.id).item_type_id == target_type.id
+    assert repository.get_task(second.id).item_type_id == target_type.id
+
+
+def test_repository_reuses_focus_session_color_by_title(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    first = repository.save_focus_session(
+        FocusSession("Deep work", 1500, started_at=datetime(2026, 6, 8, 9, 0))
+    )
+
+    assert first.color.startswith("#")
+    assert repository.set_focus_session_color(first.id, "#123456")
+
+    second = repository.save_focus_session(
+        FocusSession("Deep work", 1500, started_at=datetime(2026, 6, 8, 10, 0))
+    )
+
+    assert second.color == "#123456"
+
+
 def test_repository_migrates_legacy_items_without_item_type(tmp_path) -> None:
     db_path = tmp_path / "legacy_items.sqlite3"
     connection = sqlite3.connect(db_path)
@@ -202,6 +232,13 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_current_date = False
     preferences.show_current_time = True
     preferences.show_current_seconds = True
+    preferences.datetime_panel_border_enabled = True
+    preferences.datetime_panel_transparent_background = False
+    preferences.datetime_panel_text_color = "#abcdef"
+    preferences.datetime_panel_font_family = "Arial"
+    preferences.datetime_panel_font_size = 36
+    preferences.datetime_panel_background_image_path = "C:/Images/time.png"
+    preferences.datetime_panel_background_image_view = '{"zoom":75,"x":20,"y":80}'
     preferences.show_pomodoro_controls = False
     preferences.show_today_timeline_inline = True
     preferences.show_today_timeline_waiting_panel = False
@@ -212,6 +249,21 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.show_link_favorites_panel = False
     preferences.show_media_panel = False
     preferences.media_panel_file_path = "C:/Images/reference.gif"
+    preferences.media_panel_image_position = "right"
+    preferences.media_panel_image_view = '{"zoom":50,"x":80,"y":40}'
+    preferences.show_media_panel_2 = True
+    preferences.media_panel_2_file_path = "C:/Images/reference-2.gif"
+    preferences.media_panel_2_image_position = "left"
+    preferences.media_panel_2_image_view = '{"zoom":120,"x":15,"y":50}'
+    preferences.show_media_panel_3 = True
+    preferences.media_panel_3_file_path = "C:/Images/reference-3.gif"
+    preferences.media_panel_3_image_position = "top"
+    preferences.media_panel_3_image_view = '{"zoom":200,"x":50,"y":0}'
+    preferences.show_media_panel_4 = False
+    preferences.media_panel_4_file_path = "C:/Images/reference-4.gif"
+    preferences.media_panel_4_image_position = "bottom"
+    preferences.media_panel_4_image_view = '{"zoom":220,"x":50,"y":100}'
+    preferences.media_rounded_corners = False
     preferences.show_compact_favorites_panel = True
     preferences.favorite_display_mode = "icon_only"
     preferences.time_format = "12h"
@@ -225,8 +277,12 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.text_color = "#f8f9fa"
     preferences.main_font_family = "Arial"
     preferences.main_font_size = 16
+    preferences.label_font_size = 15
+    preferences.content_font_size = 18
     preferences.show_header_banner = True
     preferences.header_banner_image_path = "C:/Images/banner.png"
+    preferences.header_banner_image_position = "left"
+    preferences.header_banner_image_view = '{"zoom":170,"x":0,"y":45}'
     preferences.header_banner_height = 220
     preferences.header_banner_position = "right"
     preferences.header_banner_span = 3
@@ -246,6 +302,13 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert not reloaded_preferences.show_current_date
     assert reloaded_preferences.show_current_time
     assert reloaded_preferences.show_current_seconds
+    assert reloaded_preferences.datetime_panel_border_enabled
+    assert not reloaded_preferences.datetime_panel_transparent_background
+    assert reloaded_preferences.datetime_panel_text_color == "#abcdef"
+    assert reloaded_preferences.datetime_panel_font_family == "Arial"
+    assert reloaded_preferences.datetime_panel_font_size == 36
+    assert reloaded_preferences.datetime_panel_background_image_path == "C:/Images/time.png"
+    assert reloaded_preferences.datetime_panel_background_image_view == '{"zoom":75,"x":20,"y":80}'
     assert not reloaded_preferences.show_pomodoro_controls
     assert reloaded_preferences.show_today_timeline_inline
     assert not reloaded_preferences.show_today_timeline_waiting_panel
@@ -256,6 +319,21 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert not reloaded_preferences.show_link_favorites_panel
     assert not reloaded_preferences.show_media_panel
     assert reloaded_preferences.media_panel_file_path == "C:/Images/reference.gif"
+    assert reloaded_preferences.media_panel_image_position == "right"
+    assert reloaded_preferences.media_panel_image_view == '{"zoom":50,"x":80,"y":40}'
+    assert reloaded_preferences.show_media_panel_2
+    assert reloaded_preferences.media_panel_2_file_path == "C:/Images/reference-2.gif"
+    assert reloaded_preferences.media_panel_2_image_position == "left"
+    assert reloaded_preferences.media_panel_2_image_view == '{"zoom":120,"x":15,"y":50}'
+    assert reloaded_preferences.show_media_panel_3
+    assert reloaded_preferences.media_panel_3_file_path == "C:/Images/reference-3.gif"
+    assert reloaded_preferences.media_panel_3_image_position == "top"
+    assert reloaded_preferences.media_panel_3_image_view == '{"zoom":200,"x":50,"y":0}'
+    assert not reloaded_preferences.show_media_panel_4
+    assert reloaded_preferences.media_panel_4_file_path == "C:/Images/reference-4.gif"
+    assert reloaded_preferences.media_panel_4_image_position == "bottom"
+    assert reloaded_preferences.media_panel_4_image_view == '{"zoom":220,"x":50,"y":100}'
+    assert not reloaded_preferences.media_rounded_corners
     assert reloaded_preferences.show_compact_favorites_panel
     assert reloaded_preferences.favorite_display_mode == "icon_only"
     assert reloaded_preferences.time_format == "12h"
@@ -269,8 +347,12 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.text_color == "#f8f9fa"
     assert reloaded_preferences.main_font_family == "Arial"
     assert reloaded_preferences.main_font_size == 16
+    assert reloaded_preferences.label_font_size == 15
+    assert reloaded_preferences.content_font_size == 18
     assert reloaded_preferences.show_header_banner
     assert reloaded_preferences.header_banner_image_path == "C:/Images/banner.png"
+    assert reloaded_preferences.header_banner_image_position == "left"
+    assert reloaded_preferences.header_banner_image_view == '{"zoom":170,"x":0,"y":45}'
     assert reloaded_preferences.header_banner_height == 220
     assert reloaded_preferences.header_banner_position == "right"
     assert reloaded_preferences.header_banner_span == 3
@@ -278,6 +360,19 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.last_window_width == 1440
     assert reloaded_preferences.last_window_height == 900
     assert reloaded_preferences.last_layout_state == '{"splitters":{"body":[300,700]}}'
+
+
+def test_repository_copies_media_assets_next_to_database(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    source = tmp_path / "source image.png"
+    source.write_bytes(b"image-bytes")
+
+    stored_path = Path(repository.copy_media_asset(source))
+
+    assert stored_path.parent == tmp_path / "media"
+    assert stored_path.exists()
+    assert stored_path.read_bytes() == b"image-bytes"
+    assert repository.copy_media_asset(stored_path) == str(stored_path)
 
 
 def test_repository_saves_named_layout_profiles(tmp_path) -> None:
@@ -366,6 +461,12 @@ def test_repository_deletes_quick_note(tmp_path) -> None:
     repository.delete_quick_note(note.id)
 
     assert repository.list_quick_notes() == []
+    assert repository.list_deleted_quick_notes()[0].id == note.id
+
+    repository.restore_quick_note(note.id)
+
+    assert repository.list_quick_notes()[0].id == note.id
+    assert repository.list_deleted_quick_notes() == []
 
 
 def test_repository_updates_quick_note_body(tmp_path) -> None:
@@ -418,6 +519,7 @@ def test_repository_migrates_legacy_quick_notes_without_folder_column(tmp_path) 
     assert note.body == "legacy note"
     assert note.folder_id == default_folder.id
     assert note.window_title == ""
+    assert note.deleted_at is None
     with repository.connect() as migrated:
         indexes = {row["name"] for row in migrated.execute("PRAGMA index_list(quick_notes)")}
     assert "idx_quick_notes_folder" in indexes
@@ -510,8 +612,29 @@ def test_repository_manages_quick_note_attachments(tmp_path) -> None:
 
     repository.delete_quick_note(note.id)
 
+    assert repository.list_quick_note_attachments(note.id)[0].id == attachment.id
+    assert any(copied_path.glob("*"))
+
+    repository.delete_quick_note_permanently(note.id)
+
     assert repository.list_quick_note_attachments(note.id) == []
     assert not any(copied_path.glob("*"))
+
+
+def test_repository_purges_expired_deleted_quick_notes(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    old_note = repository.save_quick_note(QuickNote(body="old", created_at=datetime(2026, 6, 1, 12, 0)))
+    fresh_note = repository.save_quick_note(QuickNote(body="fresh", created_at=datetime(2026, 6, 8, 12, 0)))
+    old_note.deleted_at = datetime(2026, 6, 1, 12, 0)
+    fresh_note.deleted_at = datetime(2026, 6, 7, 12, 0)
+    repository.save_quick_note(old_note)
+    repository.save_quick_note(fresh_note)
+
+    purged = repository.purge_expired_quick_notes(datetime(2026, 6, 9, 12, 0))
+
+    assert purged == 1
+    assert repository.get_quick_note_any(old_note.id) is None
+    assert repository.get_quick_note_any(fresh_note.id).id == fresh_note.id
 
 
 def test_repository_manages_link_favorites(tmp_path) -> None:

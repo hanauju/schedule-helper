@@ -57,6 +57,13 @@ class Preference:
     show_current_date: bool = True
     show_current_time: bool = True
     show_current_seconds: bool = False
+    datetime_panel_border_enabled: bool = False
+    datetime_panel_transparent_background: bool = True
+    datetime_panel_text_color: str = ""
+    datetime_panel_font_family: str = ""
+    datetime_panel_font_size: int = 24
+    datetime_panel_background_image_path: str = ""
+    datetime_panel_background_image_view: str = ""
     show_pomodoro_controls: bool = True
     show_today_timeline_inline: bool = True
     show_today_timeline_waiting_panel: bool = True
@@ -67,6 +74,21 @@ class Preference:
     show_link_favorites_panel: bool = True
     show_media_panel: bool = True
     media_panel_file_path: str = ""
+    media_panel_image_position: str = "center"
+    media_panel_image_view: str = ""
+    show_media_panel_2: bool = False
+    media_panel_2_file_path: str = ""
+    media_panel_2_image_position: str = "center"
+    media_panel_2_image_view: str = ""
+    show_media_panel_3: bool = False
+    media_panel_3_file_path: str = ""
+    media_panel_3_image_position: str = "center"
+    media_panel_3_image_view: str = ""
+    show_media_panel_4: bool = False
+    media_panel_4_file_path: str = ""
+    media_panel_4_image_position: str = "center"
+    media_panel_4_image_view: str = ""
+    media_rounded_corners: bool = True
     show_compact_favorites_panel: bool = False
     favorite_display_mode: str = "text"
     time_format: str = "24h"
@@ -80,8 +102,12 @@ class Preference:
     text_color: str = ""
     main_font_family: str = ""
     main_font_size: int = 13
+    label_font_size: int = 13
+    content_font_size: int = 13
     show_header_banner: bool = False
     header_banner_image_path: str = ""
+    header_banner_image_position: str = "center"
+    header_banner_image_view: str = ""
     header_banner_height: int = 132
     header_banner_position: str = "center"
     header_banner_span: int = 1
@@ -156,6 +182,7 @@ class FocusSession:
     task_id: int | None = None
     target_process_name: str = ""
     target_window_title: str = ""
+    color: str = ""
     id: int | None = None
 
     @property
@@ -188,6 +215,7 @@ class QuickNote:
     folder_id: int | None = None
     process_name: str = ""
     window_title: str = ""
+    deleted_at: datetime | None = None
     id: int | None = None
 
 

@@ -75,6 +75,34 @@ def test_focus_timer_accepts_multiple_target_windows(tmp_path) -> None:
     assert saved.away_seconds == 10
 
 
+def test_focus_timer_counts_schedule_helper_child_windows_as_same_app(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    provider = FakeProvider()
+    service = FocusTimerService(repository, provider)
+    start = datetime(2026, 6, 8, 9, 0, 0)
+
+    provider.snapshot = ActiveWindowSnapshot("ScheduleHelperLiveSettingsPreview.exe", "Schedule Helper")
+    session = service.start(
+        "Use app",
+        60,
+        target_windows=[
+            {
+                "process_name": "ScheduleHelperLiveSettingsPreview.exe",
+                "window_title": "Schedule Helper",
+            }
+        ],
+        now=start,
+    )
+
+    provider.snapshot = ActiveWindowSnapshot("ScheduleHelperLiveSettingsPreview.exe", "메모")
+    service.tick(start + timedelta(seconds=12))
+
+    saved = repository.get_focus_session(session.id)
+    assert saved is not None
+    assert saved.focused_seconds == 12
+    assert saved.away_seconds == 0
+
+
 def test_quick_notes_keep_created_time_and_session_link(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     service = FocusTimerService(repository)

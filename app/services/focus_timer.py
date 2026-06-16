@@ -276,4 +276,19 @@ def _matches_focus_target(process_name: str, window_title: str, targets: list[Fo
         target_title = target["window_title"].strip()
         if not target_title or current_title == target_title.casefold():
             return True
+        if _is_schedule_helper_window(current_process, window_title) or _is_schedule_helper_window(
+            target["process_name"],
+            target_title,
+        ):
+            return True
+    return False
+
+
+def _is_schedule_helper_window(process_name: str, window_title: str) -> bool:
+    process = normalize_process_name(process_name)
+    title = window_title.strip().casefold()
+    if process.startswith("schedulehelper"):
+        return True
+    if process in {"python.exe", "pythonw.exe"} and ("schedule helper" in title or "focus desk" in title):
+        return True
     return False
