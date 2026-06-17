@@ -60,6 +60,8 @@ class Preference:
     datetime_panel_border_enabled: bool = False
     datetime_panel_transparent_background: bool = True
     datetime_panel_text_color: str = ""
+    datetime_panel_text_outline_color: str = ""
+    datetime_panel_text_outline_thickness: int = 0
     datetime_panel_font_family: str = ""
     datetime_panel_font_size: int = 24
     datetime_panel_background_image_path: str = ""

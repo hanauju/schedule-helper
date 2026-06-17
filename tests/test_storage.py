@@ -235,6 +235,8 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     preferences.datetime_panel_border_enabled = True
     preferences.datetime_panel_transparent_background = False
     preferences.datetime_panel_text_color = "#abcdef"
+    preferences.datetime_panel_text_outline_color = "#00ff00"
+    preferences.datetime_panel_text_outline_thickness = 4
     preferences.datetime_panel_font_family = "Arial"
     preferences.datetime_panel_font_size = 36
     preferences.datetime_panel_background_image_path = "C:/Images/time.png"
@@ -305,6 +307,8 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.datetime_panel_border_enabled
     assert not reloaded_preferences.datetime_panel_transparent_background
     assert reloaded_preferences.datetime_panel_text_color == "#abcdef"
+    assert reloaded_preferences.datetime_panel_text_outline_color == "#00ff00"
+    assert reloaded_preferences.datetime_panel_text_outline_thickness == 4
     assert reloaded_preferences.datetime_panel_font_family == "Arial"
     assert reloaded_preferences.datetime_panel_font_size == 36
     assert reloaded_preferences.datetime_panel_background_image_path == "C:/Images/time.png"
@@ -360,6 +364,30 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.last_window_width == 1440
     assert reloaded_preferences.last_window_height == 900
     assert reloaded_preferences.last_layout_state == '{"splitters":{"body":[300,700]}}'
+
+
+def test_repository_normalizes_datetime_text_outline(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    defaults = repository.get_preferences()
+    assert defaults.datetime_panel_text_outline_color == ""
+    assert defaults.datetime_panel_text_outline_thickness == 0
+
+    invalid = repository.get_preferences()
+    invalid.datetime_panel_text_outline_color = "not-a-color"
+    invalid.datetime_panel_text_outline_thickness = 99
+    repository.save_preferences(invalid)
+    reloaded_invalid = repository.get_preferences()
+    assert reloaded_invalid.datetime_panel_text_outline_color == ""
+    assert reloaded_invalid.datetime_panel_text_outline_thickness == 12
+
+    edge = repository.get_preferences()
+    edge.datetime_panel_text_outline_color = "#ABCDEF"
+    edge.datetime_panel_text_outline_thickness = -5
+    repository.save_preferences(edge)
+    reloaded_edge = repository.get_preferences()
+    assert reloaded_edge.datetime_panel_text_outline_color == "#abcdef"
+    assert reloaded_edge.datetime_panel_text_outline_thickness == 0
 
 
 def test_repository_copies_media_assets_next_to_database(tmp_path) -> None:

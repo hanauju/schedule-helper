@@ -228,6 +228,10 @@ def _datetime_panel_font_size(value: object) -> int:
     return _window_dimension(value, 24, 12, 72)
 
 
+def _datetime_panel_text_outline_thickness(value: object) -> int:
+    return _window_dimension(value, 0, 0, 12)
+
+
 def _header_banner_height(value: object) -> int:
     return _window_dimension(value, 132, 72, 360)
 
@@ -336,6 +340,8 @@ class ScheduleRepository:
                     datetime_panel_border_enabled INTEGER NOT NULL DEFAULT 0,
                     datetime_panel_transparent_background INTEGER NOT NULL DEFAULT 1,
                     datetime_panel_text_color TEXT NOT NULL DEFAULT '',
+                    datetime_panel_text_outline_color TEXT NOT NULL DEFAULT '',
+                    datetime_panel_text_outline_thickness INTEGER NOT NULL DEFAULT 0,
                     datetime_panel_font_family TEXT NOT NULL DEFAULT '',
                     datetime_panel_font_size INTEGER NOT NULL DEFAULT 24,
                     datetime_panel_background_image_path TEXT NOT NULL DEFAULT '',
@@ -558,6 +564,14 @@ class ScheduleRepository:
                 )
             if "datetime_panel_text_color" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN datetime_panel_text_color TEXT NOT NULL DEFAULT ''")
+            if "datetime_panel_text_outline_color" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_text_outline_color TEXT NOT NULL DEFAULT ''"
+                )
+            if "datetime_panel_text_outline_thickness" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN datetime_panel_text_outline_thickness INTEGER NOT NULL DEFAULT 0"
+                )
             if "datetime_panel_font_family" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN datetime_panel_font_family TEXT NOT NULL DEFAULT ''")
             if "datetime_panel_font_size" not in preference_columns:
@@ -1218,6 +1232,10 @@ class ScheduleRepository:
             datetime_panel_border_enabled=bool(row["datetime_panel_border_enabled"]),
             datetime_panel_transparent_background=bool(row["datetime_panel_transparent_background"]),
             datetime_panel_text_color=_optional_color(row["datetime_panel_text_color"]),
+            datetime_panel_text_outline_color=_optional_color(row["datetime_panel_text_outline_color"]),
+            datetime_panel_text_outline_thickness=_datetime_panel_text_outline_thickness(
+                row["datetime_panel_text_outline_thickness"]
+            ),
             datetime_panel_font_family=str(row["datetime_panel_font_family"] or "").strip(),
             datetime_panel_font_size=_datetime_panel_font_size(row["datetime_panel_font_size"]),
             datetime_panel_background_image_path=str(row["datetime_panel_background_image_path"] or "").strip(),
@@ -1291,6 +1309,10 @@ class ScheduleRepository:
         preferences.label_font_size = _label_font_size(preferences.label_font_size)
         preferences.content_font_size = _content_font_size(preferences.content_font_size)
         preferences.datetime_panel_text_color = _optional_color(preferences.datetime_panel_text_color)
+        preferences.datetime_panel_text_outline_color = _optional_color(preferences.datetime_panel_text_outline_color)
+        preferences.datetime_panel_text_outline_thickness = _datetime_panel_text_outline_thickness(
+            preferences.datetime_panel_text_outline_thickness
+        )
         preferences.datetime_panel_font_family = preferences.datetime_panel_font_family.strip()
         preferences.datetime_panel_font_size = _datetime_panel_font_size(preferences.datetime_panel_font_size)
         preferences.datetime_panel_background_image_path = preferences.datetime_panel_background_image_path.strip()
@@ -1436,6 +1458,8 @@ class ScheduleRepository:
                 SET datetime_panel_border_enabled = ?,
                     datetime_panel_transparent_background = ?,
                     datetime_panel_text_color = ?,
+                    datetime_panel_text_outline_color = ?,
+                    datetime_panel_text_outline_thickness = ?,
                     datetime_panel_font_family = ?,
                     datetime_panel_font_size = ?,
                     datetime_panel_background_image_path = ?,
@@ -1463,6 +1487,8 @@ class ScheduleRepository:
                     int(preferences.datetime_panel_border_enabled),
                     int(preferences.datetime_panel_transparent_background),
                     preferences.datetime_panel_text_color,
+                    preferences.datetime_panel_text_outline_color,
+                    preferences.datetime_panel_text_outline_thickness,
                     preferences.datetime_panel_font_family,
                     preferences.datetime_panel_font_size,
                     preferences.datetime_panel_background_image_path,
