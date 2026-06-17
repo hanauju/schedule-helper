@@ -100,8 +100,8 @@ DASHBOARD_GRID_COLUMNS = 12
 DASHBOARD_GRID_ROW_HEIGHT = 42
 PANEL_CONTROL_HEIGHT = 40
 PANEL_MOVE_BAR_HEIGHT = 10
-PANEL_TITLE_HEIGHT = 18
-PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT + PANEL_TITLE_HEIGHT
+PANEL_HANDLE_CONTENT_GAP = 2
+PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
 DASHBOARD_GRID_GAP = 12
 MEDIA_PANEL_KEYS = ("media_panel", "media_panel_2", "media_panel_3", "media_panel_4")
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
@@ -378,7 +378,7 @@ PASTEL_COLOR_PRESETS = ("#f3d9dc", "#f6e6c8", "#dcebd7", "#d9e7f5", "#e7def5")
 MONOTONE_COLOR_PRESETS = ("#fafafa", "#e9ecef", "#adb5bd", "#495057", "#111315")
 PANEL_RHYTHM_MARGIN = (16, 14, 16, 14)
 PANEL_RHYTHM_COMPACT_MARGIN = (12, 10, 12, 10)
-PANEL_RHYTHM_TINY_MARGIN = (10, 8, 10, 8)
+PANEL_RHYTHM_TINY_MARGIN = (10, 10, 10, 8)
 PANEL_RHYTHM_SPACING = 10
 PANEL_RHYTHM_COMPACT_SPACING = 8
 PANEL_RHYTHM_TINY_SPACING = 7
@@ -1351,6 +1351,7 @@ class DraggableFeatureBox(QWidget):
     ) -> None:
         super().__init__(parent)
         self.feature_key = feature_key
+        self.feature_title = title.strip() or "기능"
         self.swap_callback = swap_callback
         self.widget_callback = widget_callback
         self.hide_callback = hide_callback
@@ -1381,7 +1382,7 @@ class DraggableFeatureBox(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4 if show_title_bar else 0)
+        layout.setSpacing(PANEL_HANDLE_CONTENT_GAP if show_title_bar else 0)
 
         self.move_bar: FeatureMoveBar | None = None
         self.title_label: QLabel | None = None
@@ -1390,7 +1391,7 @@ class DraggableFeatureBox(QWidget):
             header_band = QWidget(self)
             self.header_band = header_band
             header_band.setObjectName("featureHeaderBand")
-            header_band.setFixedHeight(PANEL_HEADER_HEIGHT)
+            header_band.setFixedHeight(PANEL_MOVE_BAR_HEIGHT)
             header_band.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
             header_layout = QVBoxLayout(header_band)
             header_layout.setContentsMargins(0, 0, 0, 0)
@@ -1398,8 +1399,8 @@ class DraggableFeatureBox(QWidget):
 
             bar = FeatureMoveBar(feature_key, header_band)
             self.move_bar = bar
-            bar.setToolTip(title)
-            bar.setAccessibleName(title)
+            bar.setToolTip(self.feature_title)
+            bar.setAccessibleName(self.feature_title)
             bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             bar.customContextMenuRequested.connect(self.show_feature_context_menu)
             bar.installEventFilter(self)
@@ -1408,17 +1409,6 @@ class DraggableFeatureBox(QWidget):
             bar_layout.setSpacing(0)
             bar_layout.addStretch(1)
             header_layout.addWidget(bar)
-
-            title_label = QLabel(title, header_band)
-            self.title_label = title_label
-            title_label.setObjectName("featureMoveTitle")
-            title_label.setToolTip(title)
-            title_label.setContentsMargins(8, 0, 8, 0)
-            title_label.setFixedHeight(PANEL_TITLE_HEIGHT)
-            title_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            title_label.setMinimumWidth(0)
-            title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-            header_layout.addWidget(title_label)
             layout.addWidget(header_band)
 
         self._relax_horizontal_minimums(content)
@@ -1432,13 +1422,13 @@ class DraggableFeatureBox(QWidget):
         self.resize_grip.hide()
 
     def set_title(self, title: str) -> None:
-        if self.title_label is None:
-            return
         title = title.strip() or "기능"
-        self.title_label.setText(title)
-        self.title_label.setToolTip(title)
-        self.title_label.setMinimumWidth(0)
-        self.title_label.setVisible(True)
+        self.feature_title = title
+        if self.title_label is not None:
+            self.title_label.setText(title)
+            self.title_label.setToolTip(title)
+            self.title_label.setMinimumWidth(0)
+            self.title_label.setVisible(False)
         if self.move_bar is not None:
             self.move_bar.setToolTip(title)
             self.move_bar.setAccessibleName(title)
@@ -2341,7 +2331,7 @@ class MainWindow(QMainWindow):
         self.left_splitter.addWidget(self.focus_panel)
         self.pomodoro_panel = self._wrap_feature("pomodoro", "뽀모도로", self._build_pomodoro_panel())
         self.left_splitter.addWidget(self.pomodoro_panel)
-        self.today_checklist_widget = TodayChecklistWidget(self.repository, self.refresh_today, self, show_title=False)
+        self.today_checklist_widget = TodayChecklistWidget(self.repository, self.refresh_today, self, show_title=True)
         self.today_checklist_panel = self._wrap_feature("today_checklist", "오늘 체크리스트", self.today_checklist_widget)
         self.left_splitter.addWidget(self.today_checklist_panel)
 
@@ -2374,7 +2364,7 @@ class MainWindow(QMainWindow):
         self.inline_timeline_widget = TodayTimelineWidget(
             self.repository,
             self,
-            title_text="",
+            title_text="시간표",
             on_changed=self.refresh_today,
             on_focus_task=self.load_task_by_id,
             on_delete_focus_session=self.delete_focus_session_by_id,
@@ -2516,7 +2506,7 @@ class MainWindow(QMainWindow):
         return card
 
     def _wrap_feature(self, feature_key: str, title: str, content: QWidget) -> DraggableFeatureBox:
-        expand_content = feature_key not in {"datetime", "today_checklist"}
+        expand_content = feature_key != "datetime"
         widget_callback = (
             self.open_feature_widget
             if feature_key
@@ -2984,6 +2974,7 @@ class MainWindow(QMainWindow):
     def _build_focus_panel(self) -> QWidget:
         panel = ResizeAwareWidget(self.update_focus_panel_responsive_layout)
         panel.setObjectName("focusPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.focus_content_panel = panel
         panel.setMinimumHeight(0)
         panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
@@ -2998,6 +2989,12 @@ class MainWindow(QMainWindow):
         focus_header.hide()
         self.focus_header_label = focus_header
         layout.addWidget(focus_header)
+
+        focus_title_label = QLabel("집중")
+        focus_title_label.setObjectName("panelTitleLabel")
+        _stabilize_panel_caption(focus_title_label)
+        self.focus_title_label = focus_title_label
+        layout.addWidget(focus_title_label)
 
         form_panel = QWidget()
         form_panel.setObjectName("softControlPanel")
@@ -3020,9 +3017,10 @@ class MainWindow(QMainWindow):
         self.focus_title_edit.setPlaceholderText("지금 집중할 일")
         _stabilize_control(self.focus_title_edit, 120)
         self.focus_title_edit.setMinimumWidth(0)
-        form.addWidget(QLabel("집중"), 0, 0)
+        self.focus_task_label = QLabel("할 일")
+        self.focus_task_label.setObjectName("formLabel")
+        form.addWidget(self.focus_task_label, 0, 0)
         form.addWidget(self.focus_title_edit, 0, 1, 1, 3)
-        self.focus_title_label = form.itemAtPosition(0, 0).widget()
 
         self.target_combo = QComboBox()
         self.target_combo.setObjectName("focusTargetCombo")
@@ -3094,7 +3092,7 @@ class MainWindow(QMainWindow):
         self.planned_minutes_label = form.itemAtPosition(3, 0).widget()
         self.idle_cutoff_label = form.itemAtPosition(3, 2).widget()
         for form_label in (
-            self.focus_title_label,
+            self.focus_task_label,
             self.focus_targets_label,
             self.planned_minutes_label,
             self.idle_cutoff_label,
@@ -3238,6 +3236,7 @@ class MainWindow(QMainWindow):
             "focus_form_panel",
             "focus_form",
             "focus_title_label",
+            "focus_task_label",
             "focus_title_edit",
             "use_focus_target_check",
             "target_combo",
@@ -3299,7 +3298,7 @@ class MainWindow(QMainWindow):
                 form.setColumnStretch(1, 1)
                 form.setColumnStretch(2, 1)
                 form.setColumnStretch(3, 1)
-                form.addWidget(self.focus_title_label, 0, 0, 1, 4)
+                form.addWidget(self.focus_task_label, 0, 0, 1, 4)
                 form.addWidget(self.focus_title_edit, 1, 0, 1, 4)
                 form.addWidget(self.use_focus_target_check, 2, 0, 1, 4)
                 form.addWidget(self.target_combo, 3, 0, 1, 4)
@@ -3319,7 +3318,7 @@ class MainWindow(QMainWindow):
                 form.setColumnStretch(1, 3)
                 form.setColumnStretch(2, 2)
                 form.setColumnStretch(3, 2)
-                form.addWidget(self.focus_title_label, 0, 0)
+                form.addWidget(self.focus_task_label, 0, 0)
                 form.addWidget(self.focus_title_edit, 0, 1, 1, 3)
                 form.addWidget(self.use_focus_target_check, 1, 0)
                 form.addWidget(self.target_combo, 1, 1, 1, 2)
@@ -3348,7 +3347,7 @@ class MainWindow(QMainWindow):
             _apply_panel_rhythm(self.focus_dashboard_layout, "tiny" if tiny else "compact" if compact_rhythm else "normal")
 
         for label in (
-            self.focus_title_label,
+            self.focus_task_label,
             self.focus_targets_label,
             self.planned_minutes_label,
             self.idle_cutoff_label,
@@ -3365,7 +3364,8 @@ class MainWindow(QMainWindow):
         self._focus_responsive_dense = dense
         self.focus_header_label.setVisible(False)
         self.focus_form_panel.setVisible(not micro)
-        self.focus_title_label.setVisible(not tiny)
+        self.focus_title_label.setVisible(True)
+        self.focus_task_label.setVisible(not tiny)
         self.focus_title_edit.setVisible(not micro)
         self.use_focus_target_check.setVisible(not dense)
         for widget in (
@@ -3467,10 +3467,23 @@ class MainWindow(QMainWindow):
     def _build_pomodoro_panel(self) -> QWidget:
         panel = ResizeAwareWidget(self.update_pomodoro_panel_responsive_layout)
         panel.setObjectName("pomodoroPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.pomodoro_panel = panel
         layout = QVBoxLayout(panel)
         self.pomodoro_panel_layout = layout
         _apply_panel_rhythm(layout)
+
+        title = QLabel("뽀모도로")
+        title.setObjectName("panelTitleLabel")
+        _stabilize_panel_caption(title)
+        layout.addWidget(title)
+
+        timer_card = QWidget()
+        timer_card.setObjectName("pomodoroTimerCard")
+        timer_card_layout = QVBoxLayout(timer_card)
+        self.pomodoro_timer_card_layout = timer_card_layout
+        timer_card_layout.setContentsMargins(16, 14, 16, 14)
+        timer_card_layout.setSpacing(10)
 
         heading_row = QHBoxLayout()
         heading_row.setSpacing(8)
@@ -3486,25 +3499,27 @@ class MainWindow(QMainWindow):
         self.pomodoro_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         heading_row.addWidget(self.pomodoro_status_label)
         heading_row.addStretch(1)
-        heading_row.addWidget(self.pomodoro_time_label)
-        layout.addLayout(heading_row)
+        timer_card_layout.addLayout(heading_row)
+        timer_card_layout.addWidget(self.pomodoro_time_label)
 
         self.pomodoro_progress = QProgressBar()
         self.pomodoro_progress.setObjectName("pomodoroProgress")
         self.pomodoro_progress.setRange(0, 1000)
         self.pomodoro_progress.setTextVisible(False)
-        layout.addWidget(self.pomodoro_progress)
+        timer_card_layout.addWidget(self.pomodoro_progress)
 
         self.pomodoro_detail_label = QLabel()
         self.pomodoro_detail_label.setObjectName("pomodoroDetail")
+        self.pomodoro_detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pomodoro_detail_label.setWordWrap(True)
-        layout.addWidget(self.pomodoro_detail_label)
+        timer_card_layout.addWidget(self.pomodoro_detail_label)
+        layout.addWidget(timer_card)
 
         controls_panel = QWidget()
         controls_panel.setObjectName("pomodoroControlsPanel")
         controls_layout = QVBoxLayout(controls_panel)
         self.pomodoro_controls_layout = controls_layout
-        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setContentsMargins(14, 12, 14, 12)
         controls_layout.setSpacing(8)
         input_row = QHBoxLayout()
         self.pomodoro_input_row = input_row
@@ -3564,6 +3579,7 @@ class MainWindow(QMainWindow):
         required = (
             "pomodoro_panel",
             "pomodoro_panel_layout",
+            "pomodoro_timer_card_layout",
             "pomodoro_input_row",
             "pomodoro_button_row",
             "pomodoro_status_label",
@@ -3577,12 +3593,26 @@ class MainWindow(QMainWindow):
         compact = (width > 0 and width < 380) or (height > 0 and height < 190)
         tiny = width > 0 and width < 260
         _apply_panel_rhythm(self.pomodoro_panel_layout, "tiny" if tiny else "compact" if compact else "normal")
+        timer_horizontal_margin = 12 if tiny else 14 if compact else 16
+        timer_vertical_margin = 12 if compact else 14
+        self.pomodoro_timer_card_layout.setContentsMargins(
+            timer_horizontal_margin,
+            timer_vertical_margin,
+            timer_horizontal_margin,
+            timer_vertical_margin,
+        )
+        self.pomodoro_timer_card_layout.setSpacing(7 if tiny else 10)
         direction = QBoxLayout.Direction.TopToBottom if tiny else QBoxLayout.Direction.LeftToRight
         self.pomodoro_input_row.setDirection(direction)
         self.pomodoro_button_row.setDirection(direction)
         self.pomodoro_detail_label.setVisible(not tiny)
         self.pomodoro_status_label.setVisible(not tiny)
-        self.pomodoro_time_label.setStyleSheet("font-size: 20px;" if tiny else "")
+        if tiny:
+            self.pomodoro_time_label.setStyleSheet("font-size: 22px;")
+        elif compact:
+            self.pomodoro_time_label.setStyleSheet("font-size: 28px;")
+        else:
+            self.pomodoro_time_label.setStyleSheet("")
 
     def _build_today_panel(self) -> QWidget:
         panel = QWidget()
@@ -3593,7 +3623,7 @@ class MainWindow(QMainWindow):
 
         heading_row = QHBoxLayout()
         heading = QLabel("오늘 흐름")
-        heading.setObjectName("sectionTitle")
+        heading.setObjectName("panelTitleLabel")
         heading_row.addWidget(heading)
         heading_row.addStretch(1)
         timeline_button = QPushButton("시간표")
@@ -3691,10 +3721,17 @@ class MainWindow(QMainWindow):
     def _build_memo_panel(self) -> QWidget:
         panel = ResizeAwareWidget(self.update_memo_panel_responsive_layout)
         panel.setObjectName("plainPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.memo_content_panel = panel
         layout = QVBoxLayout(panel)
         self.memo_panel_layout = layout
         _apply_panel_rhythm(layout)
+
+        memo_editor_title = QLabel("메모")
+        memo_editor_title.setObjectName("panelTitleLabel")
+        _stabilize_panel_caption(memo_editor_title)
+        self.memo_editor_title = memo_editor_title
+        layout.addWidget(memo_editor_title)
 
         self.memo_splitter = QSplitter(Qt.Orientation.Vertical)
         self.memo_splitter.setObjectName("memoSplitter")
@@ -3713,11 +3750,6 @@ class MainWindow(QMainWindow):
         memo_editor_header = QHBoxLayout(memo_editor_header_widget)
         memo_editor_header.setContentsMargins(0, 0, 0, 0)
         memo_editor_header.setSpacing(6)
-        memo_editor_title = QLabel("메모 작성")
-        memo_editor_title.setObjectName("eyebrowLabel")
-        _stabilize_panel_caption(memo_editor_title)
-        self.memo_editor_title = memo_editor_title
-        memo_editor_header.addWidget(memo_editor_title)
         self.quick_note_folder_combo = QComboBox()
         self.quick_note_folder_combo.setObjectName("quickNoteFolderCombo")
         _stabilize_control(self.quick_note_folder_combo, 118)
@@ -3865,7 +3897,7 @@ class MainWindow(QMainWindow):
         self.memo_folder_settings_button.setVisible(False)
         if hasattr(self, "memo_trash_button"):
             self.memo_trash_button.setVisible(not tiny)
-        self.memo_editor_title.setVisible(not tiny)
+        self.memo_editor_title.setVisible(True)
         self.memo_shortcut_label.setVisible(not compact)
         self.memo_saved_notes_label.setVisible(not tiny)
         self.note_filter_combo.setVisible(not tiny)
@@ -3885,12 +3917,17 @@ class MainWindow(QMainWindow):
         self.link_favorites_columns = 1
         self.link_favorite_buttons_by_id: dict[int, QWidget] = {}
         self._link_favorites_stretch_rows = 0
-        panel.setObjectName("plainPanel")
+        panel.setObjectName("favoritesPanel")
+        panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(panel)
         self.link_favorites_panel_layout = layout
         _apply_panel_rhythm(layout)
 
         heading_row = QHBoxLayout()
+        title = QLabel("즐겨찾기")
+        title.setObjectName("panelTitleLabel")
+        _stabilize_panel_caption(title)
+        heading_row.addWidget(title)
         heading_row.addStretch(1)
         favorites_settings_button = QPushButton("설정")
         self.favorites_settings_button = favorites_settings_button
@@ -4196,6 +4233,13 @@ class MainWindow(QMainWindow):
                 font-weight: 600;
                 letter-spacing: 1px;
             }
+            QLabel#panelTitleLabel {
+                color: #1b1b20;
+                font-family: __MAIN_FONT_FAMILY__;
+                font-size: 15px;
+                font-weight: 650;
+                letter-spacing: 0px;
+            }
             QWidget#headerFocusCard {
                 background: #ffffff;
                 border: 1px solid #e7e7ec;
@@ -4230,6 +4274,16 @@ class MainWindow(QMainWindow):
                 background: #f4f4f6;
                 border: 1px solid #f0f0f3;
                 border-radius: 18px;
+            }
+            QWidget#pomodoroTimerCard {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 18px;
+            }
+            QWidget#pomodoroControlsPanel {
+                background: #f4f4f6;
+                border: 1px solid #f0f0f3;
+                border-radius: 14px;
             }
             QWidget#focusDashboardCard QWidget#metricCard {
                 background: #f4f4f6;
@@ -4376,8 +4430,12 @@ class MainWindow(QMainWindow):
                 color: #5c5c66;
             }
             QLabel#pomodoroStatus {
+                background: rgba(90, 90, 214, 0.10);
+                border: 1px solid #5a5ad6;
+                border-radius: 9px;
                 color: #5a5ad6;
                 font-weight: 600;
+                padding: 5px 10px;
             }
             QFrame#pomodoroStatusDot {
                 background: #5a5ad6;
@@ -4386,7 +4444,7 @@ class MainWindow(QMainWindow):
             QLabel#pomodoroTime {
                 color: #1b1b20;
                 font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
-                font-size: 24px;
+                font-size: 34px;
                 font-weight: 600;
             }
             QLabel#pomodoroDetail {
@@ -4398,13 +4456,13 @@ class MainWindow(QMainWindow):
             QProgressBar#pomodoroProgress {
                 background: #e9e9ef;
                 border: none;
-                border-radius: 4px;
-                max-height: 8px;
-                min-height: 8px;
+                border-radius: 5px;
+                max-height: 10px;
+                min-height: 10px;
             }
             QProgressBar#pomodoroProgress::chunk {
                 background: #5a5ad6;
-                border-radius: 4px;
+                border-radius: 5px;
             }
             QLabel#currentDateLabel {
                 color: __DATETIME_TEXT__;
@@ -4442,6 +4500,11 @@ class MainWindow(QMainWindow):
                 background: #f4f4f6;
                 border: 1px solid #f0f0f3;
                 border-radius: 13px;
+            }
+            QWidget#timelineTimePanel {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
             }
             QWidget#timelineFilterSegment {
                 background: #e9e9ef;
@@ -4516,8 +4579,15 @@ class MainWindow(QMainWindow):
                 background: #5a5ad6;
                 border-radius: 5px;
             }
-            QWidget#focusPanel, QWidget#pomodoroPanel, QWidget#timelinePanel, QWidget#checklistPanel,
-            QWidget#plainPanel, QWidget#compactFavoritesPanel {
+            QWidget#focusPanel, QWidget#plainPanel, QWidget#compactFavoritesPanel {
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
+                border-radius: 16px;
+            }
+            QWidget#pomodoroPanel,
+            QWidget#timelinePanel,
+            QWidget#checklistPanel,
+            QWidget#favoritesPanel {
                 background: #ffffff;
                 border: 1px solid #e7e7ec;
                 border-radius: 16px;
@@ -4592,7 +4662,7 @@ class MainWindow(QMainWindow):
                 border-radius: 4px;
             }
             QSplitter#bodySplitter, QSplitter#leftFeatureSplitter, QSplitter#centerFeatureSplitter, QSplitter#rightFeatureSplitter,
-            QSplitter#lowerFeatureSplitter, QSplitter#timelineContentSplitter, QWidget#timelineTimePanel {
+            QSplitter#lowerFeatureSplitter, QSplitter#timelineContentSplitter {
                 background: transparent;
             }
             QWidget#featureMoveBar {
@@ -4621,11 +4691,6 @@ class MainWindow(QMainWindow):
                 color: #7a7a86;
                 font-size: 12px;
                 font-weight: 600;
-            }
-            QLabel#featureMoveTitle {
-                color: #1b1b20;
-                font-size: 13px;
-                font-weight: 700;
             }
             QWidget#themeSegment {
                 background: #f4f4f6;
@@ -5488,7 +5553,7 @@ class MainWindow(QMainWindow):
                 border-radius: 5px;
             }
             QLabel#sectionTitle,
-            QLabel#featureMoveTitle,
+            QLabel#panelTitleLabel,
             QLabel#eyebrowLabel,
             QLabel#mutedLabel,
             QLabel#formLabel,
@@ -8706,6 +8771,7 @@ class MainWindow(QMainWindow):
                 int(item.get("x", 0)),
                 height,
                 width,
+                Qt.AlignmentFlag.AlignTop,
             )
             cell.show()
             widget.show()
@@ -13033,6 +13099,7 @@ class TodayChecklistWidget(QWidget):
         self.on_changed = on_changed
         self._refreshing = False
         self.setObjectName("checklistPanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(0)
 
         layout = QVBoxLayout(self)
@@ -13041,9 +13108,11 @@ class TodayChecklistWidget(QWidget):
         _apply_panel_rhythm(layout)
 
         title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         if show_title:
             title = QLabel("오늘 체크리스트")
-            title.setObjectName("sectionTitle")
+            title.setObjectName("panelTitleLabel")
             _stabilize_panel_caption(title)
             title_row.addWidget(title)
         title_row.addStretch(1)
@@ -13123,6 +13192,15 @@ class TodayChecklistWidget(QWidget):
         layout.addWidget(self.items_area, 1)
 
         self.refresh_checklist()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.update_panel_rhythm()
+
+    def update_panel_rhythm(self) -> None:
+        width = self.width()
+        mode = "tiny" if width > 0 and width < 260 else "compact" if width > 0 and width < 380 else "normal"
+        _apply_panel_rhythm(self.panel_rhythm_layout, mode)
 
     def select_checklist_folder_from_index(self, model_index) -> None:
         if not model_index.isValid():
@@ -13540,6 +13618,7 @@ class TodayTimelineWidget(QWidget):
         self.waiting_manual_expand_override = False
         self.on_waiting_pinned_changed = on_waiting_pinned_changed
         self.setObjectName("timelinePanel")
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(0)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
@@ -13548,9 +13627,11 @@ class TodayTimelineWidget(QWidget):
         _apply_panel_rhythm(layout)
 
         title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(8)
         if title_text:
             title = QLabel(title_text)
-            title.setObjectName("sectionTitle")
+            title.setObjectName("panelTitleLabel")
             _stabilize_panel_caption(title)
             title_row.addWidget(title)
         title_row.addStretch(1)
@@ -14437,9 +14518,15 @@ class TodayTimelineWidget(QWidget):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
+        self.update_panel_rhythm()
         self._apply_waiting_panel_layout()
         self._resize_time_columns()
         self._update_timeline_toolbar_mode()
+
+    def update_panel_rhythm(self) -> None:
+        width = self.width()
+        mode = "tiny" if width > 0 and width < 260 else "compact" if width > 0 and width < 380 else "normal"
+        _apply_panel_rhythm(self.panel_rhythm_layout, mode)
 
     def _update_timeline_toolbar_mode(self) -> None:
         narrow = self.width() < 660

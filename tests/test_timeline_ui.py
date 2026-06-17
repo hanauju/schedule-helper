@@ -5,7 +5,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, Qt, QTime
+from PySide6.QtCore import QDate, QEvent, QPoint, QRect, Qt, QTime
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,9 +33,9 @@ from app.ui.main_window import (
     DASHBOARD_GRID_COLUMNS,
     DASHBOARD_GRID_ROW_HEIGHT,
     PANEL_CONTROL_HEIGHT,
+    PANEL_HANDLE_CONTENT_GAP,
     PANEL_HEADER_HEIGHT,
     PANEL_MOVE_BAR_HEIGHT,
-    PANEL_TITLE_HEIGHT,
     ChecklistItemEditDialog,
     CompletedAtEditDialog,
     FavoritesSettingsDialog,
@@ -329,7 +329,7 @@ def test_focus_target_checkbox_selects_first_detected_window(tmp_path) -> None:
     window.close()
 
 
-def test_main_feature_titles_are_not_repeated_inside_panels(tmp_path) -> None:
+def test_main_feature_titles_live_inside_panels_not_under_handles(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -345,12 +345,7 @@ def test_main_feature_titles_are_not_repeated_inside_panels(tmp_path) -> None:
         ("link_favorites", "즐겨찾기"),
     ):
         feature_box = window.feature_boxes[feature_key]
-        assert feature_box.title_label.text() == title
-        assert not feature_box.title_label.isHidden()
-        assert feature_box.title_label.isVisibleTo(feature_box)
-        assert feature_box.title_label.minimumWidth() == 0
-        assert feature_box.title_label.minimumHeight() == PANEL_TITLE_HEIGHT
-        assert feature_box.title_label.maximumHeight() == PANEL_TITLE_HEIGHT
+        assert feature_box.title_label is None
         assert feature_box.header_band is not None
         assert feature_box.header_band.minimumHeight() == PANEL_HEADER_HEIGHT
         assert feature_box.header_band.maximumHeight() == PANEL_HEADER_HEIGHT
@@ -358,12 +353,12 @@ def test_main_feature_titles_are_not_repeated_inside_panels(tmp_path) -> None:
         assert feature_box.move_bar.minimumHeight() == PANEL_MOVE_BAR_HEIGHT
         assert feature_box.move_bar.maximumHeight() == PANEL_MOVE_BAR_HEIGHT
         assert feature_box.move_bar.toolTip() == title
-        repeated_titles = [
+        internal_titles = [
             label.text()
             for label in feature_box.findChildren(QLabel)
-            if label.objectName() == "sectionTitle" and label.text() == title
+            if label.text() == title and label.isVisibleTo(feature_box)
         ]
-        assert repeated_titles == []
+        assert internal_titles
     assert window.feature_boxes["media_panel"].title_label is None
     favorites_inner_labels = [
         label.text()
@@ -375,7 +370,7 @@ def test_main_feature_titles_are_not_repeated_inside_panels(tmp_path) -> None:
     window.close()
 
 
-def test_side_by_side_feature_titles_share_same_baseline(tmp_path) -> None:
+def test_side_by_side_feature_handles_share_same_baseline(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -391,11 +386,11 @@ def test_side_by_side_feature_titles_share_same_baseline(tmp_path) -> None:
     window._render_feature_dashboard()
     app.processEvents()
 
-    title_tops = {
-        key: window.feature_boxes[key].title_label.mapTo(window, QPoint(0, 0)).y()
+    handle_tops = {
+        key: window.feature_boxes[key].move_bar.mapTo(window, QPoint(0, 0)).y()
         for key in ("today_timeline", "quick_memo", "link_favorites")
     }
-    assert len(set(title_tops.values())) == 1
+    assert len(set(handle_tops.values())) == 1
 
     window.close()
 
@@ -458,11 +453,11 @@ def test_feature_panel_controls_share_consistent_alignment_metrics(tmp_path) -> 
     window.show()
     app.processEvents()
 
-    title_heights = [
-        window.feature_boxes[key].title_label.maximumHeight()
+    header_heights = [
+        window.feature_boxes[key].header_band.maximumHeight()
         for key in ("focus", "today_checklist", "pomodoro", "quick_memo", "link_favorites")
     ]
-    assert set(title_heights) == {PANEL_TITLE_HEIGHT}
+    assert set(header_heights) == {PANEL_HEADER_HEIGHT}
 
     controls = [
         window.focus_title_edit,
@@ -482,6 +477,134 @@ def test_feature_panel_controls_share_consistent_alignment_metrics(tmp_path) -> 
     assert all(control is not None for control in controls)
     assert {control.minimumHeight() for control in controls} == {PANEL_CONTROL_HEIGHT}
     assert {control.maximumHeight() for control in controls} == {PANEL_CONTROL_HEIGHT}
+    window.close()
+
+
+def test_feature_panel_titles_share_internal_title_style(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    titles = [
+        window.focus_title_label,
+        window.memo_editor_title,
+        window.today_checklist_widget.findChild(QLabel, "panelTitleLabel"),
+        window.inline_timeline_widget.findChild(QLabel, "panelTitleLabel"),
+        window.pomodoro_panel.findChild(QLabel, "panelTitleLabel"),
+        window.link_favorites_content_panel.findChild(QLabel, "panelTitleLabel"),
+    ]
+    assert all(title is not None for title in titles)
+    assert {title.objectName() for title in titles} == {"panelTitleLabel"}
+    assert {title.minimumHeight() for title in titles} == {PANEL_CONTROL_HEIGHT}
+    assert {title.maximumHeight() for title in titles} == {PANEL_CONTROL_HEIGHT}
+    assert "QLabel#panelTitleLabel" in window.styleSheet()
+    pomodoro_content_panel = window.feature_boxes["pomodoro"].findChild(QWidget, "pomodoroPanel")
+    assert pomodoro_content_panel is not None
+    card_panels = [
+        window.focus_content_panel,
+        window.memo_content_panel,
+        window.today_checklist_widget,
+        window.inline_timeline_widget,
+        pomodoro_content_panel,
+        window.link_favorites_content_panel,
+    ]
+    assert {panel.objectName() for panel in card_panels} == {
+        "focusPanel",
+        "plainPanel",
+        "checklistPanel",
+        "timelinePanel",
+        "pomodoroPanel",
+        "favoritesPanel",
+    }
+    assert all(panel.testAttribute(Qt.WidgetAttribute.WA_StyledBackground) for panel in card_panels)
+    assert "QWidget#favoritesPanel" in window.styleSheet()
+    window.close()
+
+
+def test_card_panel_borders_fit_dashboard_grid_rhythm(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = True
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = True
+    window.preferences.show_today_checklist_inline = True
+    window.preferences.show_link_favorites_panel = True
+
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 3, "h": 7},
+        {"key": "quick_memo", "x": 3, "y": 0, "w": 3, "h": 5},
+        {"key": "today_checklist", "x": 6, "y": 0, "w": 3, "h": 6},
+        {"key": "pomodoro", "x": 9, "y": 0, "w": 3, "h": 4},
+        {"key": "link_favorites", "x": 0, "y": 7, "w": 3, "h": 4},
+        {"key": "today_timeline", "x": 3, "y": 7, "w": 3, "h": 8},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    card_widgets = {
+        "focus": window.focus_content_panel,
+        "quick_memo": window.memo_content_panel,
+        "today_checklist": window.today_checklist_widget,
+        "pomodoro": window.feature_boxes["pomodoro"].findChild(QWidget, "pomodoroPanel"),
+        "link_favorites": window.link_favorites_content_panel,
+        "today_timeline": window.inline_timeline_widget,
+    }
+    assert all(widget is not None for widget in card_widgets.values())
+
+    heights = {
+        "focus": 7,
+        "quick_memo": 5,
+        "today_checklist": 6,
+        "pomodoro": 4,
+        "link_favorites": 4,
+        "today_timeline": 8,
+    }
+    title_offsets = []
+    handle_to_card_offsets = []
+    for key, widget in card_widgets.items():
+        title = widget.findChild(QLabel, "panelTitleLabel")
+        assert title is not None
+        rect = QRect(widget.mapTo(window, QPoint(0, 0)), widget.size())
+        expected_card_height = (
+            window._dashboard_item_pixel_height(heights[key])
+            - PANEL_HEADER_HEIGHT
+            - PANEL_HANDLE_CONTENT_GAP
+        )
+        assert rect.height() == expected_card_height
+        move_bar = window.feature_boxes[key].move_bar
+        assert move_bar is not None
+        handle_to_card_offsets.append(rect.top() - move_bar.mapTo(window, QPoint(0, 0)).y())
+        title_offsets.append(title.mapTo(widget, QPoint(0, 0)).y())
+
+    assert set(handle_to_card_offsets) == {PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP}
+    assert len(set(title_offsets)) == 1
+
+    first_row_tops = {
+        card_widgets[key].mapTo(window, QPoint(0, 0)).y()
+        for key in ("focus", "quick_memo", "today_checklist", "pomodoro")
+    }
+    second_row_tops = {
+        card_widgets[key].mapTo(window, QPoint(0, 0)).y()
+        for key in ("link_favorites", "today_timeline")
+    }
+    assert len(first_row_tops) == 1
+    assert all(top > next(iter(first_row_tops)) for top in second_row_tops)
+    assert "border-radius: 16px;" in window.styleSheet()
     window.close()
 
 
@@ -1048,11 +1171,17 @@ def test_same_size_feature_panels_share_inner_rhythm(tmp_path) -> None:
 
     assert window.pomodoro_input_row.direction() == QBoxLayout.Direction.LeftToRight
     assert window.pomodoro_button_row.direction() == QBoxLayout.Direction.LeftToRight
+    assert window.pomodoro_panel.findChild(QWidget, "pomodoroTimerCard") is not None
+    assert window.pomodoro_panel.findChild(QWidget, "pomodoroControlsPanel") is not None
+    assert _margins_tuple(window.pomodoro_timer_card_layout) == (16, 14, 16, 14)
+    assert "QWidget#pomodoroTimerCard" in window.styleSheet()
+    assert "QWidget#pomodoroControlsPanel" in window.styleSheet()
 
     window.pomodoro_panel.setFixedSize(240, 220)
     window.update_pomodoro_panel_responsive_layout()
     assert window.pomodoro_input_row.direction() == QBoxLayout.Direction.TopToBottom
     assert window.pomodoro_button_row.direction() == QBoxLayout.Direction.TopToBottom
+    assert _margins_tuple(window.pomodoro_timer_card_layout) == (12, 12, 12, 12)
     window.close()
 
 
