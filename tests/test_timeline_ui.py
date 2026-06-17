@@ -2004,6 +2004,65 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     window.close()
 
 
+def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "panel.png"
+    pixmap = QPixmap(24, 16)
+    pixmap.fill(Qt.GlobalColor.magenta)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.media_panel_file_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = False
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = False
+    window.preferences.show_media_panel = True
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = False
+    window.preferences.show_today_checklist_inline = False
+    window.preferences.show_link_favorites_panel = False
+
+    window.feature_dashboard_items = [
+        {"key": "media_panel", "x": 0, "y": 0, "w": 3, "h": 5},
+        {"key": "pomodoro", "x": 3, "y": 0, "w": 3, "h": 5},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    media_box = window.feature_boxes["media_panel"]
+    preview = window.media_preview_label
+    pomodoro_box = window.feature_boxes["pomodoro"]
+    pomodoro_content = pomodoro_box.findChild(QWidget, "pomodoroPanel")
+    assert preview is not None
+    assert pomodoro_content is not None
+
+    expected_offset = PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP
+    assert preview.mapTo(media_box, QPoint(0, 0)).y() == expected_offset
+    assert pomodoro_content.mapTo(pomodoro_box, QPoint(0, 0)).y() == expected_offset
+
+    assert media_box.mapTo(window, QPoint(0, 0)).y() == pomodoro_box.mapTo(window, QPoint(0, 0)).y()
+    assert preview.mapTo(window, QPoint(0, 0)).y() == pomodoro_content.mapTo(window, QPoint(0, 0)).y()
+
+    assert preview.height() == media_box.height() - expected_offset
+
+    assert preview.pixmap() is not None
+    assert not preview.pixmap().isNull()
+
+    window.close()
+
+
 def test_extra_media_panels_copy_assets_and_keep_hidden_images(tmp_path) -> None:
     app = _app()
     image_path = tmp_path / "extra.png"

@@ -3987,7 +3987,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setObjectName("mediaPanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setContentsMargins(0, PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP, 0, 0)
         layout.setSpacing(0)
 
         preview = MediaPreviewLabel()
