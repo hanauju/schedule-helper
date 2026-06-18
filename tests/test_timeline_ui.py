@@ -5,7 +5,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QRect, Qt, QTime
+from PySide6.QtCore import QDate, QEvent, QPoint, QRect, QSize, Qt, QTime
 from PySide6.QtGui import QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -36,6 +36,8 @@ from app.ui.main_window import (
     PANEL_HANDLE_CONTENT_GAP,
     PANEL_HEADER_HEIGHT,
     PANEL_MOVE_BAR_HEIGHT,
+    WINDOW_RESIZE_MARGIN,
+    AppChromeBar,
     ChecklistItemEditDialog,
     CompletedAtEditDialog,
     FavoritesSettingsDialog,
@@ -49,6 +51,10 @@ from app.ui.main_window import (
     SettingsDialog,
     TodayChecklistWidget,
     TodayTimelineWidget,
+    WindowControlButton,
+    _cursor_for_resize_edges,
+    _is_resize_eligible_widget,
+    _resize_edges_for_point,
     _download_site_icon,
     _draw_image_viewport,
     _eyedropper_cursor,
@@ -58,6 +64,7 @@ from app.ui.main_window import (
     _record_items_for_date,
     _today_timeline_blocks,
 )
+from app.ui.orot_brand import OROT_RING_COLOR
 
 
 def _app() -> QApplication:
@@ -622,6 +629,11 @@ def test_app_bar_ports_title_and_focus_status_card(tmp_path) -> None:
 
     assert window.windowTitle() == "안녕"
     assert window.chrome_title_label.text() == "안녕"
+    orot_mark = window.findChild(QWidget, "orotMark")
+    assert orot_mark is not None
+    orot_wordmark = window.findChild(QLabel, "orotWordmark")
+    assert orot_wordmark is not None
+    assert orot_wordmark.text() == "OROT"
     assert window.header_focus_card.isHidden()
     assert window.header_focus_status_label.text() == "대기 중"
     assert window.header_focus_time_label.text() == "25:00"
@@ -629,6 +641,154 @@ def test_app_bar_ports_title_and_focus_status_card(tmp_path) -> None:
     assert not window.findChildren(QWidget, "themeSegment")
     assert not hasattr(window, "light_theme_button")
     assert not hasattr(window, "dark_theme_button")
+    window.close()
+
+
+def test_app_bar_shows_default_orot_branding(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    assert repository.get_preferences().app_title == "오롯"
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    assert window.windowTitle() == "오롯"
+    assert window.chrome_title_label.text() == "오롯"
+    assert window.findChild(QWidget, "orotMark") is not None
+    orot_wordmark = window.findChild(QLabel, "orotWordmark")
+    assert orot_wordmark is not None
+    assert orot_wordmark.text() == "OROT"
+    style = window.styleSheet()
+    chrome_bar_style = style[style.index("QWidget#appChromeBar {") : style.index("QWidget#featureGrid")]
+    assert "background: #ffffff;" in chrome_bar_style
+    chrome_title_style = style[style.index("QLabel#chromeTitle {") : style.index("QLabel#eyebrowLabel")]
+    assert "color: #6fa8e0;" in chrome_title_style
+    assert OROT_RING_COLOR == "#6fa8e0"
+    assert window.orot_mark._color.name() == "#6fa8e0"
+    assert window.compact_button.objectName() == "topBarButton"
+    top_button_style = style[style.index("QPushButton#topBarButton {") : style.index("QPushButton#topBarAccentButton")]
+    assert "background: #ffffff;" in top_button_style
+    assert "__BUTTON_BG__" not in top_button_style
+    pin_style = style[style.index("QCheckBox#pinCheck {") : style.index("QCheckBox#pinCheck::indicator")]
+    assert "background: #ffffff;" in pin_style
+    assert "__BUTTON_BG__" not in pin_style
+    window.close()
+
+
+def test_app_bar_has_custom_window_chrome(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # Native OS chrome is hidden; the OROT header bar IS the title bar.
+    assert window.windowFlags() & Qt.WindowType.FramelessWindowHint
+    assert isinstance(window.findChild(QWidget, "appChromeBar"), AppChromeBar)
+
+    # Vertical divider with reference geometry sits before the controls.
+    divider = window.findChild(QFrame, "chromeDivider")
+    assert divider is not None
+    assert divider.width() == 1
+    assert divider.height() == 22
+
+    # Three custom controls with stable object names and a 34x34 hit area.
+    minimize = window.findChild(QPushButton, "windowMinButton")
+    maximize = window.findChild(QPushButton, "windowMaxButton")
+    close_button = window.findChild(QPushButton, "windowCloseButton")
+    assert minimize is not None
+    assert maximize is not None
+    assert close_button is not None
+    for control in (minimize, maximize, close_button):
+        assert isinstance(control, WindowControlButton)
+        assert control.size().width() == 34
+        assert control.size().height() == 34
+        # Real painted shapes, never a text glyph or emoji.
+        assert control.text() == ""
+
+    # Compact widget button stays a normal menu button, not a chrome control.
+    assert window.compact_button.objectName() == "topBarButton"
+
+    # Divider + control QSS is present (and theme-substituted, no raw placeholders).
+    style = window.styleSheet()
+    assert "QFrame#chromeDivider {" in style
+    assert "QPushButton#windowCloseButton {" in style
+
+    # Maximize control toggles between maximize and restore with window state.
+    assert window.window_maximize_button.control_kind() == "maximize"
+    window.toggle_max_restore()
+    app.processEvents()
+    assert window.isMaximized()
+    assert window.window_maximize_button.control_kind() == "restore"
+    window.toggle_max_restore()
+    app.processEvents()
+    assert not window.isMaximized()
+    assert window.window_maximize_button.control_kind() == "maximize"
+
+    window.close()
+
+
+def test_frameless_window_edge_resize(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(900, 640)
+    window.show()
+    app.processEvents()
+
+    # Pure edge detector: each border within the margin maps to its edge, adjacent
+    # borders combine into corners, and the interior reports no edge.
+    size = QSize(900, 640)
+    inset = WINDOW_RESIZE_MARGIN - 2
+    assert _resize_edges_for_point(QPoint(inset, 300), size) == Qt.Edge.LeftEdge
+    assert _resize_edges_for_point(QPoint(900 - inset, 300), size) == Qt.Edge.RightEdge
+    assert _resize_edges_for_point(QPoint(400, inset), size) == Qt.Edge.TopEdge
+    assert _resize_edges_for_point(QPoint(400, 640 - inset), size) == Qt.Edge.BottomEdge
+    assert _resize_edges_for_point(QPoint(inset, inset), size) == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge)
+    assert _resize_edges_for_point(QPoint(900 - inset, 640 - inset), size) == (Qt.Edge.BottomEdge | Qt.Edge.RightEdge)
+    assert _resize_edges_for_point(QPoint(900 - inset, inset), size) == (Qt.Edge.TopEdge | Qt.Edge.RightEdge)
+    assert _resize_edges_for_point(QPoint(inset, 640 - inset), size) == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge)
+    assert not _resize_edges_for_point(QPoint(450, 320), size)
+
+    # Cursor mapping for each edge and corner; interior maps to no cursor.
+    assert _cursor_for_resize_edges(Qt.Edge.LeftEdge) == Qt.CursorShape.SizeHorCursor
+    assert _cursor_for_resize_edges(Qt.Edge.RightEdge) == Qt.CursorShape.SizeHorCursor
+    assert _cursor_for_resize_edges(Qt.Edge.TopEdge) == Qt.CursorShape.SizeVerCursor
+    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge) == Qt.CursorShape.SizeVerCursor
+    assert _cursor_for_resize_edges(Qt.Edge.TopEdge | Qt.Edge.LeftEdge) == Qt.CursorShape.SizeFDiagCursor
+    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge | Qt.Edge.RightEdge) == Qt.CursorShape.SizeFDiagCursor
+    assert _cursor_for_resize_edges(Qt.Edge.TopEdge | Qt.Edge.RightEdge) == Qt.CursorShape.SizeBDiagCursor
+    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge | Qt.Edge.LeftEdge) == Qt.CursorShape.SizeBDiagCursor
+    assert _cursor_for_resize_edges(_resize_edges_for_point(QPoint(450, 320), size)) is None
+
+    # Interactive controls are never resize handles; plain chrome surfaces are.
+    assert not _is_resize_eligible_widget(window.window_close_button)
+    assert not _is_resize_eligible_widget(window.main_always_on_top_check)
+    assert _is_resize_eligible_widget(window.findChild(QWidget, "appChromeBar"))
+
+    # The resize event filter is installed on the central surface (mouse tracking on),
+    # and the window helper reports edges: true at an edge, false in content.
+    central = window.centralWidget()
+    assert central.hasMouseTracking()
+    actual = window.size()
+    edge_global = window.mapToGlobal(QPoint(3, actual.height() // 2))
+    content_global = window.mapToGlobal(QPoint(actual.width() // 2, actual.height() // 2))
+    assert window._resize_edges_at_global(central, edge_global) == Qt.Edge.LeftEdge
+    assert not window._resize_edges_at_global(central, content_global)
+    # Even at an edge position, an interactive control is not treated as a handle.
+    assert not window._resize_edges_at_global(window.window_close_button, edge_global)
+
+    # A maximized window is not edge-resizable.
+    window.showMaximized()
+    app.processEvents()
+    assert not window._resize_edges_at_global(central, window.mapToGlobal(QPoint(0, 0)))
+    window.showNormal()
+    app.processEvents()
+
     window.close()
 
 

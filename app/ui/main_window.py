@@ -14,7 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
 
-from PySide6.QtCore import QDate, QEvent, QMimeData, QPoint, QRectF, QSize, Qt, QTime, QTimer, QUrl
+from PySide6.QtCore import QDate, QEvent, QMimeData, QPoint, QPointF, QRectF, QSize, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import (
     QColor,
     QCursor,
@@ -34,7 +34,9 @@ from PySide6.QtGui import (
     QTextImageFormat,
 )
 from PySide6.QtWidgets import (
+    QAbstractButton,
     QAbstractItemView,
+    QAbstractSlider,
     QAbstractSpinBox,
     QApplication,
     QBoxLayout,
@@ -83,6 +85,7 @@ from PySide6.QtWidgets import (
 from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorite, Preference, QuickNote, QuickNoteFolder, Task
 from app.services.app_usage import WindowsActiveWindowProvider
 from app.services.focus_timer import FocusTimerService, decode_focus_targets
+from app.ui.orot_brand import OROT_RING_COLOR, build_orot_brand
 from app.storage.database import (
     ScheduleRepository,
     default_database_path,
@@ -2216,6 +2219,171 @@ class RichNoteEditor(QWidget):
         return None, None
 
 
+WINDOW_RESIZE_MARGIN = 7
+
+_INTERACTIVE_RESIZE_EXCLUSIONS = (
+    QAbstractButton,
+    QLineEdit,
+    QTextEdit,
+    QPlainTextEdit,
+    QComboBox,
+    QAbstractSpinBox,
+    QAbstractSlider,
+    QAbstractItemView,
+    QCalendarWidget,
+)
+
+
+def _resize_edges_for_point(point: QPoint, size: QSize, margin: int = WINDOW_RESIZE_MARGIN) -> Qt.Edge:
+    """Return the window edges a point sits on, within ``margin`` px of the border.
+
+    Adjacent edges combine into corners (e.g. ``TopEdge | LeftEdge``); an interior
+    point yields an empty ``Qt.Edge``.
+    """
+    edges = Qt.Edge(0)
+    if point.x() <= margin:
+        edges |= Qt.Edge.LeftEdge
+    elif point.x() >= size.width() - margin:
+        edges |= Qt.Edge.RightEdge
+    if point.y() <= margin:
+        edges |= Qt.Edge.TopEdge
+    elif point.y() >= size.height() - margin:
+        edges |= Qt.Edge.BottomEdge
+    return edges
+
+
+def _cursor_for_resize_edges(edges: Qt.Edge) -> Qt.CursorShape | None:
+    """Map resize edges to the matching diagonal/horizontal/vertical resize cursor."""
+    left = bool(edges & Qt.Edge.LeftEdge)
+    right = bool(edges & Qt.Edge.RightEdge)
+    top = bool(edges & Qt.Edge.TopEdge)
+    bottom = bool(edges & Qt.Edge.BottomEdge)
+    if (top and left) or (bottom and right):
+        return Qt.CursorShape.SizeFDiagCursor
+    if (top and right) or (bottom and left):
+        return Qt.CursorShape.SizeBDiagCursor
+    if left or right:
+        return Qt.CursorShape.SizeHorCursor
+    if top or bottom:
+        return Qt.CursorShape.SizeVerCursor
+    return None
+
+
+def _is_resize_eligible_widget(widget: QWidget) -> bool:
+    """A surface is a resize handle only when it is not an interactive control."""
+    return not isinstance(widget, _INTERACTIVE_RESIZE_EXCLUSIONS)
+
+
+class WindowControlButton(QPushButton):
+    """Custom frameless-window control: minimize, maximize/restore, or close.
+
+    QSS owns the 34x34 hit area background, 8px radius, and hover wash; the glyph
+    itself is painted as real vector shapes (never a text glyph or emoji) in a
+    fixed chrome grey so it reads the same across themes, matching the min/max/
+    close marks in header-reference.html.
+    """
+
+    _GLYPH_COLOR = "#9a9a9e"
+
+    def __init__(self, control_kind: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._control_kind = control_kind
+        self.setFixedSize(34, 34)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def control_kind(self) -> str:
+        return self._control_kind
+
+    def set_control_kind(self, control_kind: str) -> None:
+        if control_kind != self._control_kind:
+            self._control_kind = control_kind
+            self.update()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        color = QColor(self._GLYPH_COLOR)
+        center_x = self.width() / 2.0
+        center_y = self.height() / 2.0
+        if self._control_kind == "minimize":
+            pen = QPen(color)
+            pen.setWidthF(1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            painter.drawLine(QPointF(center_x - 6.0, center_y), QPointF(center_x + 6.0, center_y))
+        elif self._control_kind == "maximize":
+            pen = QPen(color)
+            pen.setWidthF(1.4)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(center_x - 5.5, center_y - 5.5, 11.0, 11.0), 2.0, 2.0)
+        elif self._control_kind == "restore":
+            pen = QPen(color)
+            pen.setWidthF(1.4)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRoundedRect(QRectF(center_x - 2.5, center_y - 5.5, 8.0, 8.0), 2.0, 2.0)
+            painter.drawRoundedRect(QRectF(center_x - 5.5, center_y - 2.5, 8.0, 8.0), 2.0, 2.0)
+        elif self._control_kind == "close":
+            pen = QPen(color)
+            pen.setWidthF(1.6)
+            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+            painter.setPen(pen)
+            offset = 4.95
+            painter.drawLine(QPointF(center_x - offset, center_y - offset), QPointF(center_x + offset, center_y + offset))
+            painter.drawLine(QPointF(center_x - offset, center_y + offset), QPointF(center_x + offset, center_y - offset))
+        painter.end()
+
+
+class AppChromeBar(QWidget):
+    """Frameless-window chrome strip that doubles as the title-bar drag area.
+
+    Interactive children (menu buttons, the pin checkbox, the window controls)
+    consume their own mouse presses, so a drag only begins on the empty bar or the
+    brand lockup. Double-clicking the empty area toggles maximize, like a native
+    title bar.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._drag_offset: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:
+        window = self.window()
+        if event.button() == Qt.MouseButton.LeftButton and not window.isMaximized():
+            handle = window.windowHandle()
+            if handle is not None and handle.startSystemMove():
+                self._drag_offset = None
+                event.accept()
+                return
+            self._drag_offset = event.globalPosition().toPoint() - window.frameGeometry().topLeft()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None and event.buttons() & Qt.MouseButton.LeftButton:
+            self.window().move(event.globalPosition().toPoint() - self._drag_offset)
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        self._drag_offset = None
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            toggle = getattr(self.window(), "toggle_max_restore", None)
+            if callable(toggle):
+                toggle()
+                event.accept()
+                return
+        super().mouseDoubleClickEvent(event)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, repository: ScheduleRepository) -> None:
         super().__init__()
@@ -2256,12 +2424,15 @@ class MainWindow(QMainWindow):
         self.quick_note_trash_window: QDialog | None = None
         self.compact_widget_window: QDialog | None = None
         self.startup_refresh_pending = False
+        self._resize_cursor_widget: QWidget | None = None
 
         self.setWindowTitle(self.preferences.app_title)
         self.setMinimumSize(QSize(430, 320))
+        self.setWindowFlag(Qt.WindowType.FramelessWindowHint, True)
         self.setStatusBar(QStatusBar(self))
         self._initialize_focus_timer()
         self._build_ui()
+        self._install_window_resize_filter()
         self.restore_last_window_size()
         self.apply_preferences(refresh_content=False)
         self.restore_last_layout_state()
@@ -2423,62 +2594,90 @@ class MainWindow(QMainWindow):
         return scroll
 
     def _build_app_bar(self) -> QWidget:
-        bar = QWidget()
+        bar = AppChromeBar()
         bar.setObjectName("appChromeBar")
-        bar.setFixedHeight(50)
+        bar.setFixedHeight(56)
         layout = QHBoxLayout(bar)
-        layout.setContentsMargins(16, 0, 16, 0)
+        layout.setContentsMargins(16, 0, 8, 0)
         layout.setSpacing(12)
 
-        dots = QWidget()
-        dots_layout = QHBoxLayout(dots)
-        dots_layout.setContentsMargins(0, 0, 0, 0)
-        dots_layout.setSpacing(7)
-        for _index in range(3):
-            dot = QFrame()
-            dot.setObjectName("windowDot")
-            dot.setFixedSize(11, 11)
-            dots_layout.addWidget(dot)
-        layout.addWidget(dots)
-
-        self.chrome_title_label = QLabel(self.preferences.app_title or "Schedule Helper")
-        self.chrome_title_label.setObjectName("chromeTitle")
-        self.chrome_title_label.setMinimumWidth(0)
-        layout.addWidget(self.chrome_title_label)
+        brand, self.chrome_title_label, self.orot_mark = build_orot_brand(
+            self.preferences.app_title or "오롯"
+        )
+        layout.addWidget(brand)
         self.header_focus_card = self._build_header_focus_card()
         layout.addWidget(self.header_focus_card)
         self.header_focus_card.hide()
         layout.addStretch(1)
 
+        actions = QWidget()
+        actions.setObjectName("appBarActions")
+        actions_layout = QHBoxLayout(actions)
+        actions_layout.setContentsMargins(0, 0, 0, 0)
+        actions_layout.setSpacing(8)
+
         date_review_button = QPushButton("날짜별 보기")
         date_review_button.setObjectName("topBarButton")
         _stabilize_control(date_review_button, 106)
         date_review_button.clicked.connect(self.show_date_review_window)
-        layout.addWidget(date_review_button)
+        actions_layout.addWidget(date_review_button)
 
         task_folder_button = QPushButton("할 일 폴더")
         task_folder_button.setObjectName("topBarButton")
         _stabilize_control(task_folder_button, 104)
         task_folder_button.clicked.connect(self.show_task_folder_settings)
-        layout.addWidget(task_folder_button)
+        actions_layout.addWidget(task_folder_button)
 
         settings_button = QPushButton("설정")
         settings_button.setObjectName("topBarButton")
         _stabilize_control(settings_button, 78)
         settings_button.clicked.connect(self.show_settings_window)
-        layout.addWidget(settings_button)
+        actions_layout.addWidget(settings_button)
 
         self.main_always_on_top_check = QCheckBox("항상 위")
         self.main_always_on_top_check.setObjectName("pinCheck")
         self.main_always_on_top_check.setChecked(self.preferences.main_always_on_top)
         self.main_always_on_top_check.toggled.connect(lambda enabled: self.set_main_always_on_top(enabled, persist=True))
-        layout.addWidget(self.main_always_on_top_check)
+        actions_layout.addWidget(self.main_always_on_top_check)
 
         self.compact_button = QPushButton("통합 위젯")
         self.compact_button.setObjectName("topBarButton")
         _stabilize_control(self.compact_button, 94)
         self.compact_button.clicked.connect(self.open_compact_widget)
-        layout.addWidget(self.compact_button)
+        actions_layout.addWidget(self.compact_button)
+
+        layout.addWidget(actions)
+
+        divider = QFrame()
+        divider.setObjectName("chromeDivider")
+        divider.setFixedSize(1, 22)
+        layout.addWidget(divider, 0, Qt.AlignmentFlag.AlignVCenter)
+
+        controls = QWidget()
+        controls.setObjectName("windowControls")
+        controls_layout = QHBoxLayout(controls)
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.setSpacing(2)
+
+        self.window_minimize_button = WindowControlButton("minimize")
+        self.window_minimize_button.setObjectName("windowMinButton")
+        self.window_minimize_button.setToolTip("최소화")
+        self.window_minimize_button.clicked.connect(self.showMinimized)
+        controls_layout.addWidget(self.window_minimize_button)
+
+        self.window_maximize_button = WindowControlButton("maximize")
+        self.window_maximize_button.setObjectName("windowMaxButton")
+        self.window_maximize_button.setToolTip("최대화")
+        self.window_maximize_button.clicked.connect(self.toggle_max_restore)
+        controls_layout.addWidget(self.window_maximize_button)
+
+        self.window_close_button = WindowControlButton("close")
+        self.window_close_button.setObjectName("windowCloseButton")
+        self.window_close_button.setToolTip("닫기")
+        self.window_close_button.clicked.connect(self.close)
+        controls_layout.addWidget(self.window_close_button)
+
+        layout.addWidget(controls)
         return bar
 
     def _build_header_focus_card(self) -> QWidget:
@@ -4207,7 +4406,7 @@ class MainWindow(QMainWindow):
                 background: #fbfbfc;
             }
             QWidget#appChromeBar {
-                background: #fbfbfc;
+                background: #ffffff;
                 border-bottom: 1px solid #f0f0f3;
             }
             QWidget#featureGrid {
@@ -4222,7 +4421,7 @@ class MainWindow(QMainWindow):
                 border-radius: 3px;
             }
             QLabel#chromeTitle {
-                color: #1b1b20;
+                color: #6fa8e0;
                 font-size: 13px;
                 font-weight: 600;
             }
@@ -4232,6 +4431,13 @@ class MainWindow(QMainWindow):
                 font-size: 10px;
                 font-weight: 600;
                 letter-spacing: 1px;
+            }
+            QLabel#orotWordmark {
+                color: #9c9ca6;
+                font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
+                font-size: 10px;
+                font-weight: 600;
+                letter-spacing: 2px;
             }
             QLabel#panelTitleLabel {
                 color: #1b1b20;
@@ -5004,13 +5210,58 @@ class MainWindow(QMainWindow):
                 color: #9c9ca6;
             }
             QPushButton#topBarButton {
-                background: __BUTTON_BG__;
-                border: 1px solid __BUTTON_BORDER__;
+                background: #ffffff;
+                border: 1px solid #e7e7ec;
                 border-radius: 9px;
-                color: __BUTTON_TEXT__;
+                color: #5c5c66;
                 font-size: 12px;
                 min-height: 26px;
                 padding: 4px 11px;
+            }
+            QPushButton#topBarButton:hover {
+                background: #f4f4f6;
+                border-color: #e7e7ec;
+                color: #1b1b20;
+            }
+            QPushButton#topBarAccentButton {
+                background: __ACTION_BUTTON_BG__;
+                border: 1px solid __ACTION_BUTTON_BORDER__;
+                border-radius: 9px;
+                color: __ACTION_BUTTON_TEXT__;
+                font-size: 12px;
+                min-height: 26px;
+                padding: 4px 11px;
+            }
+            QPushButton#topBarAccentButton:hover {
+                background: __ACTION_BUTTON_HOVER_BG__;
+                border-color: __ACTION_BUTTON_HOVER_BG__;
+                color: __ACTION_BUTTON_TEXT__;
+            }
+            QPushButton#topBarAccentButton:disabled {
+                background: #e9e9ef;
+                border-color: #e9e9ef;
+                color: #9c9ca6;
+            }
+            QFrame#chromeDivider {
+                background: #e7e7ec;
+                border: none;
+            }
+            QPushButton#windowMinButton,
+            QPushButton#windowMaxButton,
+            QPushButton#windowCloseButton {
+                background: transparent;
+                border: none;
+                border-radius: 8px;
+                min-width: 34px;
+                max-width: 34px;
+                min-height: 34px;
+                max-height: 34px;
+                padding: 0px;
+            }
+            QPushButton#windowMinButton:hover,
+            QPushButton#windowMaxButton:hover,
+            QPushButton#windowCloseButton:hover {
+                background: #f4f4f6;
             }
             QPushButton#segmentButton {
                 background: transparent;
@@ -5138,7 +5389,7 @@ class MainWindow(QMainWindow):
                 color: __BUTTON_HOVER_TEXT__;
             }
             QCheckBox#pinCheck {
-                background: transparent;
+                background: #ffffff;
                 border: 1px solid #e7e7ec;
                 border-radius: 9px;
                 color: #5c5c66;
@@ -5150,7 +5401,8 @@ class MainWindow(QMainWindow):
             }
             QCheckBox#pinCheck:hover {
                 color: #1b1b20;
-                border-color: #9c9ca6;
+                background: #f4f4f6;
+                border-color: #e7e7ec;
             }
             QCheckBox#pinCheck:checked {
                 background: rgba(90, 90, 214, 0.10);
@@ -5681,6 +5933,8 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self, "focus_ratio_ring"):
             self.focus_ratio_ring.set_theme(accent, palette["track"], palette["text"])
+        if hasattr(self, "orot_mark"):
+            self.orot_mark.set_color(OROT_RING_COLOR)
         if hasattr(self, "header_banner_widget"):
             self.header_banner_widget.set_theme(accent, palette["border"], palette["surface_2"])
         self.update_focus_rate_display_mode()
@@ -7081,8 +7335,8 @@ class MainWindow(QMainWindow):
         if self.stack.currentWidget() == self.full_page:
             self.setWindowTitle(self.preferences.app_title)
         if hasattr(self, "chrome_title_label"):
-            self.chrome_title_label.setText(self.preferences.app_title or "Schedule Helper")
-            self.chrome_title_label.setToolTip(self.preferences.app_title or "Schedule Helper")
+            self.chrome_title_label.setText(self.preferences.app_title or "오롯")
+            self.chrome_title_label.setToolTip(self.preferences.app_title or "오롯")
         self.set_main_always_on_top(self.preferences.main_always_on_top, persist=False)
         self._sync_always_on_top_checks()
         if hasattr(self, "datetime_panel"):
@@ -7250,6 +7504,89 @@ class MainWindow(QMainWindow):
             if was_visible and not self.closing:
                 self.show()
         self._sync_always_on_top_checks()
+
+    def toggle_max_restore(self) -> None:
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self._sync_max_restore_button()
+
+    def _sync_max_restore_button(self) -> None:
+        button = getattr(self, "window_maximize_button", None)
+        if isinstance(button, WindowControlButton):
+            button.set_control_kind("restore" if self.isMaximized() else "maximize")
+            button.setToolTip("이전 크기로" if self.isMaximized() else "최대화")
+
+    def changeEvent(self, event) -> None:
+        super().changeEvent(event)
+        if event.type() == QEvent.Type.WindowStateChange:
+            self._sync_max_restore_button()
+
+    def _install_window_resize_filter(self) -> None:
+        surfaces: list[QWidget] = []
+        central = self.centralWidget()
+        if central is not None:
+            surfaces.append(central)
+            surfaces.extend(central.findChildren(QWidget))
+        status_bar = self.statusBar()
+        if status_bar is not None:
+            surfaces.append(status_bar)
+        for surface in surfaces:
+            if _is_resize_eligible_widget(surface):
+                surface.setMouseTracking(True)
+                surface.installEventFilter(self)
+
+    def eventFilter(self, watched, event) -> bool:
+        if isinstance(watched, QWidget) and self._handle_window_resize_event(watched, event):
+            return True
+        return super().eventFilter(watched, event)
+
+    def _handle_window_resize_event(self, watched: QWidget, event) -> bool:
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress:
+            return self._begin_window_resize(watched, event)
+        if event_type == QEvent.Type.MouseMove:
+            self._update_resize_cursor(watched, event)
+            return False
+        if event_type == QEvent.Type.Leave:
+            self._clear_resize_cursor()
+            return False
+        return False
+
+    def _resize_edges_at_global(self, watched: QWidget, global_point: QPoint) -> Qt.Edge:
+        if self.isMaximized() or self.isFullScreen():
+            return Qt.Edge(0)
+        if not _is_resize_eligible_widget(watched):
+            return Qt.Edge(0)
+        return _resize_edges_for_point(self.mapFromGlobal(global_point), self.size())
+
+    def _update_resize_cursor(self, watched: QWidget, event) -> None:
+        edges = self._resize_edges_at_global(watched, event.globalPosition().toPoint())
+        cursor_shape = _cursor_for_resize_edges(edges)
+        if cursor_shape is None:
+            self._clear_resize_cursor()
+            return
+        if self._resize_cursor_widget is not None and self._resize_cursor_widget is not watched:
+            self._resize_cursor_widget.unsetCursor()
+        watched.setCursor(cursor_shape)
+        self._resize_cursor_widget = watched
+
+    def _clear_resize_cursor(self) -> None:
+        if self._resize_cursor_widget is not None:
+            self._resize_cursor_widget.unsetCursor()
+            self._resize_cursor_widget = None
+
+    def _begin_window_resize(self, watched: QWidget, event) -> bool:
+        if event.button() != Qt.MouseButton.LeftButton:
+            return False
+        edges = self._resize_edges_at_global(watched, event.globalPosition().toPoint())
+        if not edges:
+            return False
+        handle = self.windowHandle()
+        if handle is None:
+            return False
+        return bool(handle.startSystemResize(edges))
 
     def hide_feature_from_main(self, feature_key: str) -> None:
         attribute = self._feature_visibility_attribute(feature_key)
@@ -15942,7 +16279,7 @@ class SettingsDialog(QDialog):
 
         self.app_title_edit = QLineEdit()
         self.app_title_edit.setText(preferences.app_title)
-        self.app_title_edit.setPlaceholderText("예: Focus Desk")
+        self.app_title_edit.setPlaceholderText("예: 오롯")
         general_form.addRow("창 제목", self.app_title_edit)
 
         current_database_path = Path(getattr(getattr(parent, "repository", None), "db_path", default_database_path()))
@@ -16591,7 +16928,7 @@ class SettingsDialog(QDialog):
             break_minutes=self._source.break_minutes,
             strategy=self._source.strategy,
             week_start_day=int(self.week_start_combo.currentData()),
-            app_title=self.app_title_edit.text().strip() or "Focus Desk",
+            app_title=self.app_title_edit.text().strip() or "오롯",
             main_always_on_top=self._source.main_always_on_top,
             time_format=str(self.time_format_combo.currentData()),
             show_datetime_panel=self.show_datetime_panel_check.isChecked(),
