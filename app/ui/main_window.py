@@ -633,23 +633,50 @@ class FeatureMoveBar(QWidget):
             self.set_dragging(False)
         super().leaveEvent(event)
 
+    def _grip_marks(self) -> list[QRectF]:
+        width = float(self.width())
+        height = float(self.height())
+        mark_count = 3
+        mark_width = 3.0
+        mark_gap = 4.0
+        cluster_width = mark_count * mark_width + (mark_count - 1) * mark_gap
+        mark_height = max(2.0, height - 4.0)
+        if width <= cluster_width + 4.0 or mark_height <= 0.0:
+            return []
+        start_x = (width - cluster_width) / 2.0
+        top = (height - mark_height) / 2.0
+        return [
+            QRectF(start_x + index * (mark_width + mark_gap), top, mark_width, mark_height)
+            for index in range(mark_count)
+        ]
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if not self.property("hovering") and not self.property("dragging"):
+        hovering = bool(self.property("hovering"))
+        dragging = bool(self.property("dragging"))
+        if not hovering and not dragging:
             return
         accent = "#4f8c6b"
         window = self.window()
         preferences = getattr(window, "preferences", None)
-        if isinstance(preferences, Preference):
+        if not isinstance(preferences, Preference):
+            preferences = None
+        else:
             accent = _normalize_accent_color(preferences.accent_color)
+        palette = _resolved_theme_palette(preferences)
         red, green, blue = _accent_rgb(accent)
-        color = QColor(red, green, blue)
-        color.setAlpha(255 if self.property("dragging") else 70)
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(color)
+        wash = QColor(red, green, blue)
+        wash.setAlpha(255 if dragging else 70)
+        painter.setBrush(wash)
         painter.drawRoundedRect(self.rect().adjusted(0, 1, 0, -1), 5, 5)
+        grip = QColor(palette["surface"]) if dragging else QColor(red, green, blue)
+        grip.setAlpha(230 if dragging else 165)
+        painter.setBrush(grip)
+        for mark in self._grip_marks():
+            painter.drawRoundedRect(mark, 1.5, 1.5)
         painter.end()
 
 
@@ -2321,6 +2348,19 @@ HTBOTTOMRIGHT = 17
 
 _WM_NCCALCSIZE = 0x0083
 _WM_NCHITTEST = 0x0084
+_ABM_GETAUTOHIDEBAREX = 0x0000000B
+_AUTO_HIDE_TASKBAR_GAP = 1
+
+_ABE_LEFT = 0
+_ABE_TOP = 1
+_ABE_RIGHT = 2
+_ABE_BOTTOM = 3
+_APPBAR_TO_QT_EDGE: dict[int, Qt.Edge] = {
+    _ABE_LEFT: Qt.Edge.LeftEdge,
+    _ABE_TOP: Qt.Edge.TopEdge,
+    _ABE_RIGHT: Qt.Edge.RightEdge,
+    _ABE_BOTTOM: Qt.Edge.BottomEdge,
+}
 
 _INTERACTIVE_RESIZE_EXCLUSIONS = (
     QAbstractButton,
@@ -2548,6 +2588,26 @@ class _WINDOWPLACEMENT(ctypes.Structure):
     ]
 
 
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+class _APPBARDATA(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("hWnd", wintypes.HWND),
+        ("uCallbackMessage", wintypes.UINT),
+        ("uEdge", wintypes.UINT),
+        ("rc", wintypes.RECT),
+        ("lParam", wintypes.LPARAM),
+    ]
+
+
 class _WindowsChromeApi:
     """Thin ctypes wrapper over the Win32/DWM calls the frameless chrome needs.
 
@@ -2570,13 +2630,16 @@ class _WindowsChromeApi:
     SM_CYSIZEFRAME = 33
     SM_CXPADDEDBORDER = 92
     SW_SHOWMAXIMIZED = 3
+    SW_RESTORE = 9
     DWMWA_WINDOW_CORNER_PREFERENCE = 33
     DWMWA_BORDER_COLOR = 34
     DWMWCP_ROUND = 2
+    MONITOR_DEFAULTTONEAREST = 2
 
     def __init__(self) -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        shell32 = ctypes.WinDLL("shell32", use_last_error=True)
         user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
         user32.GetWindowLongW.restype = wintypes.LONG
         user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
@@ -2595,16 +2658,25 @@ class _WindowsChromeApi:
             wintypes.UINT,
         ]
         user32.SetWindowPos.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
         user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
         user32.GetWindowRect.restype = wintypes.BOOL
         user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(_WINDOWPLACEMENT)]
         user32.GetWindowPlacement.restype = wintypes.BOOL
         user32.GetSystemMetrics.argtypes = [ctypes.c_int]
         user32.GetSystemMetrics.restype = ctypes.c_int
+        user32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+        user32.MonitorFromWindow.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(_MONITORINFO)]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
         dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
         dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        shell32.SHAppBarMessage.argtypes = [wintypes.DWORD, ctypes.POINTER(_APPBARDATA)]
+        shell32.SHAppBarMessage.restype = ctypes.c_void_p
         self._user32 = user32
         self._dwmapi = dwmapi
+        self._shell32 = shell32
 
     def restore_window_styles(self, hwnd: int) -> None:
         """Re-add the styles Qt's frameless hint strips (resize + snap + animations)."""
@@ -2624,6 +2696,14 @@ class _WindowsChromeApi:
         if not class_style & self.CS_DBLCLKS:
             self._user32.SetClassLongW(handle, self.GCL_STYLE, class_style | self.CS_DBLCLKS)
         self._user32.SetWindowPos(handle, None, 0, 0, 0, 0, self.SWP_FRAMECHANGED)
+
+    def maximize_window(self, hwnd: int) -> None:
+        """Maximize through Win32 so frameless chrome keeps the native appbar contract."""
+        self._user32.ShowWindow(wintypes.HWND(hwnd), self.SW_SHOWMAXIMIZED)
+
+    def restore_window(self, hwnd: int) -> None:
+        """Restore through Win32 so SW_SHOWMAXIMIZED placement is actually cleared."""
+        self._user32.ShowWindow(wintypes.HWND(hwnd), self.SW_RESTORE)
 
     def apply_rounded_frame(self, hwnd: int, border_color: str) -> None:
         """Round the corners (Win11) and paint a subtle neutral DWM border."""
@@ -2660,6 +2740,27 @@ class _WindowsChromeApi:
             thickness_x if thickness_x > 0 else fallback,
             thickness_y if thickness_y > 0 else fallback,
         )
+
+    def auto_hide_taskbar_edges(self, hwnd: int) -> Qt.Edge:
+        monitor_info = _MONITORINFO()
+        monitor_info.cbSize = ctypes.sizeof(_MONITORINFO)
+        monitor = self._user32.MonitorFromWindow(wintypes.HWND(hwnd), self.MONITOR_DEFAULTTONEAREST)
+        if not monitor or not self._user32.GetMonitorInfoW(monitor, ctypes.byref(monitor_info)):
+            return Qt.Edge(0)
+
+        appbar_data = _APPBARDATA()
+        appbar_data.cbSize = ctypes.sizeof(_APPBARDATA)
+        appbar_data.rc.left = monitor_info.rcMonitor.left
+        appbar_data.rc.top = monitor_info.rcMonitor.top
+        appbar_data.rc.right = monitor_info.rcMonitor.right
+        appbar_data.rc.bottom = monitor_info.rcMonitor.bottom
+
+        edges = Qt.Edge(0)
+        for appbar_edge, qt_edge in _APPBAR_TO_QT_EDGE.items():
+            appbar_data.uEdge = appbar_edge
+            if self._shell32.SHAppBarMessage(_ABM_GETAUTOHIDEBAREX, ctypes.byref(appbar_data)):
+                edges |= qt_edge
+        return edges
 
 
 _WINDOWS_CHROME_API: _WindowsChromeApi | None = None
@@ -5180,20 +5281,20 @@ class MainWindow(QMainWindow):
             }
             QWidget#featureMoveBar {
                 background: transparent;
-                border: none;
+                border: 1px solid transparent;
                 border-radius: 5px;
             }
             QWidget#featureMoveBar:hover {
                 background: rgba(90, 90, 214, 0.16);
-                border: none;
+                border: 1px solid rgba(90, 90, 214, 0.16);
             }
             QWidget#featureMoveBar[hovering="true"] {
                 background: rgba(90, 90, 214, 0.16);
-                border: none;
+                border: 1px solid rgba(90, 90, 214, 0.16);
             }
             QWidget#featureMoveBar[dragging="true"] {
                 background: #5a5ad6;
-                border: none;
+                border: 1px solid #5a5ad6;
             }
             QWidget#columnDropZone {
                 background: rgba(90, 90, 214, 0.05);
@@ -7834,8 +7935,16 @@ class MainWindow(QMainWindow):
             self._restore_normal_window_size()
         else:
             self._remember_normal_window_size()
-            self.showMaximized()
+            self._show_native_maximized()
         self._sync_max_restore_button()
+
+    def _show_native_maximized(self) -> None:
+        api = _windows_chrome_api()
+        hwnd = self._native_window_handle()
+        if api is not None and hwnd:
+            api.maximize_window(hwnd)
+            return
+        self.showMaximized()
 
     def _sync_max_restore_button(self) -> None:
         button = getattr(self, "window_maximize_button", None)
@@ -7886,11 +7995,10 @@ class MainWindow(QMainWindow):
         target = self._normal_window_size
         self._suppress_normal_size_tracking = True
         try:
-            if self._is_native_maximized() and not self.isMaximized():
-                # Qt thinks the frameless window is normal while the Win32 placement
-                # is maximized; sync Qt up so showNormal() issues a real SW_SHOWNORMAL
-                # and actually clears the native maximized placement.
-                self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+            api = _windows_chrome_api()
+            hwnd = self._native_window_handle()
+            if api is not None and hwnd and api.is_maximized(hwnd):
+                api.restore_window(hwnd)
             self.showNormal()
             if target is not None:
                 self.resize(target.width(), target.height())
@@ -7965,6 +8073,15 @@ class MainWindow(QMainWindow):
             client.right -= thickness_x
             client.top += thickness_y
             client.bottom -= thickness_y
+            auto_hide_edges = api.auto_hide_taskbar_edges(hwnd)
+            if auto_hide_edges & Qt.Edge.LeftEdge:
+                client.left += _AUTO_HIDE_TASKBAR_GAP
+            if auto_hide_edges & Qt.Edge.RightEdge:
+                client.right -= _AUTO_HIDE_TASKBAR_GAP
+            if auto_hide_edges & Qt.Edge.TopEdge:
+                client.top += _AUTO_HIDE_TASKBAR_GAP
+            if auto_hide_edges & Qt.Edge.BottomEdge:
+                client.bottom -= _AUTO_HIDE_TASKBAR_GAP
         return 0
 
     def _native_nchittest(self, api: _WindowsChromeApi, hwnd: int, msg) -> int | None:
@@ -7988,7 +8105,7 @@ class MainWindow(QMainWindow):
             physical_size,
             margin=margin,
             on_caption=self._point_is_caption(logical_point),
-            resizable=not self.isMaximized(),
+            resizable=not (self.isMaximized() or api.is_maximized(hwnd)),
         )
         return None if result == HTCLIENT else result
 

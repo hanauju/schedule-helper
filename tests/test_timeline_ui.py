@@ -435,8 +435,10 @@ def test_feature_move_bar_uses_accent_when_dragging(tmp_path) -> None:
     assert move_bar.hasMouseTracking()
     assert "QWidget#featureMoveBar:hover" in window.styleSheet()
     assert "rgba(79, 140, 107, 0.18)" in window.styleSheet()
+    assert "border: 1px solid rgba(79, 140, 107, 0.18)" in window.styleSheet()
     assert "QWidget#featureMoveBar[dragging=\"true\"]" in window.styleSheet()
     assert "background: #4f8c6b" in window.styleSheet()
+    assert "border: 1px solid #4f8c6b" in window.styleSheet()
 
     QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Enter))
     assert move_bar.property("hovering") is True
@@ -468,6 +470,48 @@ def test_feature_move_bar_uses_accent_when_dragging(tmp_path) -> None:
     assert handled is False
     assert move_bar.property("hovering") is False
     assert move_bar.property("dragging") is False
+    window.close()
+
+
+def test_feature_move_bar_shows_central_grip_affordance(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    move_bar = window.feature_boxes["focus"].move_bar
+    assert move_bar is not None
+
+    # The handle is more than a flat filled strip: it renders a central multi-mark grip.
+    grip_marks = move_bar._grip_marks()
+    assert len(grip_marks) >= 2
+    bar_width = move_bar.width()
+    bar_height = move_bar.height()
+    assert bar_width > 0 and bar_height > 0
+    assert all(0.0 <= mark.left() and mark.right() <= bar_width for mark in grip_marks)
+    assert all(0.0 <= mark.top() and mark.bottom() <= bar_height for mark in grip_marks)
+
+    # The grip is a compact central cluster, not a full-width fill.
+    cluster_span = grip_marks[-1].right() - grip_marks[0].left()
+    assert cluster_span < bar_width / 2
+    cluster_center = (grip_marks[0].left() + grip_marks[-1].right()) / 2
+    assert abs(cluster_center - bar_width / 2) <= 1.5
+
+    # On hover the central grip paints more prominently than the surrounding accent wash.
+    QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Enter))
+    assert move_bar.property("hovering") is True
+    pixmap = QPixmap(move_bar.size())
+    pixmap.fill(Qt.GlobalColor.transparent)
+    move_bar.render(pixmap)
+    image = pixmap.toImage()
+    grip_pixel = image.pixelColor(bar_width // 2, bar_height // 2)
+    wash_pixel = image.pixelColor(max(2, int(bar_width * 0.2)), bar_height // 2)
+    assert grip_pixel.alpha() > 0
+    assert wash_pixel.alpha() > 0
+    assert grip_pixel.alpha() > wash_pixel.alpha()
+    QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Leave))
     window.close()
 
 
@@ -789,6 +833,40 @@ def test_toggle_max_restore_returns_to_tracked_normal_size(tmp_path) -> None:
     window.close()
 
 
+def test_toggle_max_restore_uses_native_maximize_when_hwnd_exists(tmp_path, monkeypatch) -> None:
+    class NativeMaximizeApi:
+        def __init__(self) -> None:
+            self.maximized_hwnd: int | None = None
+
+        def is_maximized(self, hwnd: int) -> bool:
+            return self.maximized_hwnd == hwnd
+
+        def maximize_window(self, hwnd: int) -> None:
+            self.maximized_hwnd = hwnd
+
+    class NoQtMaximizeWindow(MainWindow):
+        def showMaximized(self) -> None:
+            raise AssertionError("native Windows chrome must not use Qt fullscreen-like maximize")
+
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = NoQtMaximizeWindow(repository)
+    window.show()
+    app.processEvents()
+
+    fake_api = NativeMaximizeApi()
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", fake_api)
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+    monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
+
+    window.toggle_max_restore()
+    app.processEvents()
+
+    assert fake_api.maximized_hwnd == 4242
+    assert window.window_maximize_button.control_kind() == "restore"
+    window.close()
+
+
 def test_frameless_window_native_hit_test(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -859,6 +937,10 @@ def test_native_message_handler_does_not_reenter_winid(tmp_path, monkeypatch) ->
             raise AssertionError("native message handling must use the message hWnd")
 
     class FakeChromeApi:
+        def is_maximized(self, hwnd: int) -> bool:
+            assert hwnd == 12345
+            return False
+
         def window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
             assert hwnd == 12345
             return 0, 0, 900, 640
@@ -885,6 +967,75 @@ def test_native_message_handler_does_not_reenter_winid(tmp_path, monkeypatch) ->
     result = window._handle_windows_native_message(MessagePointer(ctypes.addressof(message)))
 
     assert result == HTLEFT
+    window.close()
+
+
+def test_native_hit_test_blocks_resize_when_win32_reports_maximized(tmp_path) -> None:
+    class FakeMaximizedChromeApi:
+        def is_maximized(self, hwnd: int) -> bool:
+            assert hwnd == 12345
+            return True
+
+        def window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
+            assert hwnd == 12345
+            return 0, 0, 900, 640
+
+    class Message:
+        lParam = (300 << 16) | 3
+
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(900, 640)
+    window.show()
+    app.processEvents()
+
+    assert not window.isMaximized()
+
+    result = window._native_nchittest(FakeMaximizedChromeApi(), 12345, Message())
+
+    assert result is None
+    window.close()
+
+
+def test_native_nccalcsize_reserves_auto_hide_taskbar_edge(tmp_path) -> None:
+    class FakeChromeApi:
+        def is_maximized(self, hwnd: int) -> bool:
+            assert hwnd == 12345
+            return True
+
+        def resize_border_thickness(self, device_pixel_ratio: float) -> tuple[int, int]:
+            assert device_pixel_ratio > 0
+            return 8, 8
+
+        def auto_hide_taskbar_edges(self, hwnd: int) -> Qt.Edge:
+            assert hwnd == 12345
+            return Qt.Edge.BottomEdge
+
+    class Message:
+        wParam = 1
+
+        def __init__(self, address: int) -> None:
+            self.lParam = address
+
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+
+    params = main_window_module._NCCALCSIZE_PARAMS()
+    client = params.rgrc[0]
+    client.left = 0
+    client.top = 0
+    client.right = 900
+    client.bottom = 640
+
+    result = window._native_nccalcsize(FakeChromeApi(), 12345, Message(ctypes.addressof(params)))
+
+    assert result == 0
+    assert client.left == 8
+    assert client.top == 8
+    assert client.right == 892
+    assert client.bottom == 631
     window.close()
 
 
@@ -938,8 +1089,14 @@ def test_native_maximized_state_detected_when_qt_reports_normal(tmp_path, monkey
 
 def test_toggle_max_restore_restores_from_native_maximized(tmp_path, monkeypatch) -> None:
     class FakeMaximizedChromeApi:
+        def __init__(self) -> None:
+            self.restored_hwnd: int | None = None
+
         def is_maximized(self, hwnd: int) -> bool:
-            return True
+            return self.restored_hwnd != hwnd
+
+        def restore_window(self, hwnd: int) -> None:
+            self.restored_hwnd = hwnd
 
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -951,7 +1108,8 @@ def test_toggle_max_restore_restores_from_native_maximized(tmp_path, monkeypatch
     app.processEvents()
     assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
 
-    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", FakeMaximizedChromeApi())
+    fake_api = FakeMaximizedChromeApi()
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", fake_api)
     monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
     monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
 
@@ -965,6 +1123,8 @@ def test_toggle_max_restore_restores_from_native_maximized(tmp_path, monkeypatch
     # maximized, returning to the tracked normal size instead of re-maximizing.
     window.toggle_max_restore()
     app.processEvents()
+    assert fake_api.restored_hwnd == 4242
+    assert not window._is_effectively_maximized()
     assert (window.width(), window.height()) == (1010, 620)
     assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
 
@@ -3646,6 +3806,99 @@ def test_dashboard_drag_guides_show_preview(tmp_path) -> None:
 
     window._hide_dashboard_drag_guides()
     assert not overlay.isVisible()
+    window.close()
+
+
+def _dashboard_slot(item: dict[str, object]) -> tuple[int, int, int, int]:
+    return (
+        int(item.get("x", 0)),
+        int(item.get("y", 0)),
+        int(item.get("w", 1)),
+        int(item.get("h", 1)),
+    )
+
+
+def test_show_dashboard_drag_guides_preserves_layout_and_matches_preview(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    target_cell = window.feature_cells["today_timeline"]
+    target_global = target_cell.mapToGlobal(target_cell.rect().center())
+
+    layout_before = [dict(item) for item in window._current_feature_dashboard_layout()]
+    stored_before = [dict(item) for item in getattr(window, "feature_dashboard_items", [])]
+
+    window._show_dashboard_drag_guides("focus", target_global)
+    app.processEvents()
+
+    # Showing guides must not mutate the live dashboard layout (preview is non-destructive).
+    assert [dict(item) for item in window._current_feature_dashboard_layout()] == layout_before
+    assert [dict(item) for item in getattr(window, "feature_dashboard_items", [])] == stored_before
+
+    overlay = window.dashboard_guide_overlay
+    assert overlay.isVisible()
+
+    # preview_rect mirrors the previewed final position of the dragged source panel.
+    preview_item = window._dashboard_preview_item("focus", target_global)
+    assert preview_item is not None
+    assert overlay.preview_rect == window._dashboard_item_rect(preview_item)
+
+    # impact_rects correspond exactly to the non-source panels whose slots change.
+    preview_layout = window._dashboard_preview_layout("focus", target_global)
+    current_slots = {
+        str(item.get("key", "")): _dashboard_slot(item)
+        for item in window._current_feature_dashboard_layout()
+    }
+    changed_keys = []
+    for item in preview_layout:
+        key = str(item.get("key", ""))
+        if not key or key == "focus":
+            continue
+        if current_slots.get(key) != _dashboard_slot(item):
+            changed_keys.append(key)
+    assert changed_keys
+    assert overlay.impact_rects == window._dashboard_preview_impact_rects("focus", preview_layout)
+    assert len(overlay.impact_rects) == len(changed_keys)
+
+    window._hide_dashboard_drag_guides()
+    window.close()
+
+
+def test_hide_dashboard_drag_guides_clears_state_and_preserves_layout(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    target_cell = window.feature_cells["today_timeline"]
+    target_global = target_cell.mapToGlobal(target_cell.rect().center())
+
+    layout_before = [dict(item) for item in window._current_feature_dashboard_layout()]
+    stored_before = [dict(item) for item in getattr(window, "feature_dashboard_items", [])]
+
+    window._show_dashboard_drag_guides("focus", target_global)
+    app.processEvents()
+    overlay = window.dashboard_guide_overlay
+    assert overlay.preview_rect.isValid()
+    assert overlay.impact_rects
+
+    window._hide_dashboard_drag_guides()
+
+    # Cancelling clears the preview/impact state...
+    assert not overlay.isVisible()
+    assert not overlay.preview_rect.isValid()
+    assert overlay.preview_rect.isNull()
+    assert overlay.impact_rects == []
+    # ...and the abandoned drag preserves the prior layout untouched.
+    assert [dict(item) for item in window._current_feature_dashboard_layout()] == layout_before
+    assert [dict(item) for item in getattr(window, "feature_dashboard_items", [])] == stored_before
+
     window.close()
 
 
