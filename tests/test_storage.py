@@ -13,12 +13,34 @@ from app.models import (
     ItemType,
     LinkFavorite,
     LayoutProfile,
+    Preference,
     QuickNote,
     QuickNoteFolder,
     Task,
     TrackedProgram,
 )
 from app.storage.database import ScheduleRepository
+
+
+def test_default_app_title_is_orot(tmp_path) -> None:
+    assert Preference().app_title == "오롯"
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    assert repository.get_preferences().app_title == "오롯"
+
+    preferences = repository.get_preferences()
+    preferences.app_title = "   "
+    repository.save_preferences(preferences)
+    assert repository.get_preferences().app_title == "오롯"
+
+    preferences.app_title = "Focus Desk"
+    repository.save_preferences(preferences)
+    assert repository.get_preferences().app_title == "오롯"
+
+    legacy_repository = ScheduleRepository(tmp_path / "legacy.sqlite3")
+    with legacy_repository.connect() as connection:
+        connection.execute("UPDATE preferences SET app_title = 'Focus Desk' WHERE id = 1")
+    assert legacy_repository.get_preferences().app_title == "오롯"
 
 
 def test_repository_persists_tasks_and_events(tmp_path) -> None:

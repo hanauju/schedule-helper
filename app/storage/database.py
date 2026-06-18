@@ -38,6 +38,15 @@ _FOCUS_SESSION_COLOR_PALETTE = (
     "#8ac7d7",
     "#c1d982",
 )
+_DEFAULT_APP_TITLE = "오롯"
+_LEGACY_DEFAULT_APP_TITLE = "Focus Desk"
+
+
+def _app_title(value: object) -> str:
+    title = str(value or "").strip()
+    if not title or title == _LEGACY_DEFAULT_APP_TITLE:
+        return _DEFAULT_APP_TITLE
+    return title
 
 
 def default_database_path() -> Path:
@@ -330,7 +339,7 @@ class ScheduleRepository:
                     break_minutes INTEGER NOT NULL,
                     strategy TEXT NOT NULL,
                     week_start_day INTEGER NOT NULL DEFAULT 0,
-                    app_title TEXT NOT NULL DEFAULT 'Focus Desk',
+                    app_title TEXT NOT NULL DEFAULT '오롯',
                     main_always_on_top INTEGER NOT NULL DEFAULT 0,
                     show_focus_panel INTEGER NOT NULL DEFAULT 1,
                     show_datetime_panel INTEGER NOT NULL DEFAULT 1,
@@ -541,7 +550,7 @@ class ScheduleRepository:
             if "week_start_day" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN week_start_day INTEGER NOT NULL DEFAULT 0")
             if "app_title" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN app_title TEXT NOT NULL DEFAULT 'Focus Desk'")
+                connection.execute("ALTER TABLE preferences ADD COLUMN app_title TEXT NOT NULL DEFAULT '오롯'")
             if "main_always_on_top" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_always_on_top INTEGER NOT NULL DEFAULT 0")
             if "show_focus_panel" not in preference_columns:
@@ -789,7 +798,7 @@ class ScheduleRepository:
                        show_header_banner, header_banner_image_path,
                        header_banner_height, header_banner_position, header_banner_span,
                        focus_rate_display)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, 'Focus Desk', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 13, 13, 0, '', 132, 'center', 1, 'ring')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, '오롯', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 13, 13, 0, '', 132, 'center', 1, 'ring')
                     """
                 )
 
@@ -1222,7 +1231,7 @@ class ScheduleRepository:
             break_minutes=int(row["break_minutes"]),
             strategy=str(row["strategy"]),
             week_start_day=int(row["week_start_day"]),
-            app_title=str(row["app_title"]).strip() or "Focus Desk",
+            app_title=_app_title(row["app_title"]),
             main_always_on_top=bool(row["main_always_on_top"]),
             show_focus_panel=bool(row["show_focus_panel"]),
             show_datetime_panel=bool(row["show_datetime_panel"]),
@@ -1336,7 +1345,7 @@ class ScheduleRepository:
         preferences.header_banner_position = _header_banner_position(preferences.header_banner_position)
         preferences.header_banner_span = _header_banner_span(preferences.header_banner_span)
         preferences.focus_rate_display = _focus_rate_display(preferences.focus_rate_display)
-        preferences.app_title = preferences.app_title.strip() or "Focus Desk"
+        preferences.app_title = _app_title(preferences.app_title)
         preferences.last_window_width = _window_dimension(preferences.last_window_width, 1280, 430, 4000)
         preferences.last_window_height = _window_dimension(preferences.last_window_height, 820, 320, 3000)
         with self.connect() as connection:

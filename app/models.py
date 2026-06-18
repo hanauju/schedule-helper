@@ -50,7 +50,7 @@ class Preference:
     break_minutes: int = 10
     strategy: str = "deadline_priority"
     week_start_day: int = 0
-    app_title: str = "Focus Desk"
+    app_title: str = "오롯"
     main_always_on_top: bool = False
     show_focus_panel: bool = True
     show_datetime_panel: bool = True
