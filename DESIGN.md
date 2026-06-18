@@ -169,10 +169,25 @@ The main window is frameless, so the header supplies its own controls.
   `MainWindow.nativeEvent`. An 8px (`WINDOW_RESIZE_MARGIN`) border maps to the Win32 resize codes
   (`HTLEFT` / `HTTOP` / `HTTOPLEFT` ...) so Windows drives the resize cursor, the native resize loop,
   and Aero Snap; the non-interactive chrome bar maps to `HTCAPTION` for native move + snap-to-top.
+  The custom maximize control uses Win32 `ShowWindow(SW_SHOWMAXIMIZED)`, not Qt `showMaximized()`, so
+  the frameless window enters real native maximize instead of a fullscreen-like state.
   `WM_NCCALCSIZE` hides the OS title bar while keeping that behaviour. Interactive controls and a
-  maximized window never become resize/caption surfaces. The pure mapping
+  maximized window never become resize/caption surfaces. When a Windows taskbar is set to auto-hide,
+  maximized `WM_NCCALCSIZE` leaves a 1px appbar edge on the detected auto-hide side so the hidden
+  taskbar can still reveal from the screen edge. The pure mapping
   (`_resize_edges_for_point` -> `_hit_test_for_edges` -> `_window_hit_test_result`) is unit-tested
   without a live HWND; non-Windows falls back to `startSystemMove()` via `AppChromeBar`.
+
+### Dashboard panel move handle
+
+- **Move handle** (`FeatureMoveBar#featureMoveBar`): the slim header strip stays as the only default
+  panel drag target. Hover uses an accent-tinted wash, a subtle accent border, and a centered three-mark
+  grip so the strip reads as grabbable without adding another button. During drag the strip switches to
+  solid accent with light grip marks and a closed-hand cursor.
+- **Drag preview** (`DashboardGridGuideOverlay#dashboardGridGuideOverlay`): dashboard moves render a
+  non-mutating preview of the source panel's final slot plus dashed impact cards for neighbors that would
+  move. Hiding/cancelling the guides clears only the overlay state; the stored dashboard layout is unchanged
+  until the drop finishes.
 
 ## 6. Motion & Interaction
 
