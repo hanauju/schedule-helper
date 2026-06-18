@@ -105,8 +105,8 @@ The window is **frameless** (native OS title bar hidden); this 56px bar IS the t
 - Left lockup (`orotBrand`): `[ring 22px] (10) [오롯] (8) [OROT]`, internal margins 0.
 - Right action cluster: bordered menu buttons + pin, gap `8px`, then a `1px x 22px`
   `chromeDivider`, then the window controls (minimize / maximize-restore / close). - NEW (OROT)
-- The empty bar/brand area is the drag surface (system move + OS snap); double-click toggles
-  maximize. A 7px border around the whole window is the edge/corner resize handle. - NEW (OROT)
+- The empty bar/brand area is the drag surface (native caption / Aero Snap); double-click toggles
+  maximize. An 8px border around the whole window is the native edge/corner resize handle. - NEW (OROT)
 
 ### Rules
 
@@ -164,12 +164,15 @@ The main window is frameless, so the header supplies its own controls.
   or emoji. They invoke `showMinimized`, `toggle_max_restore`, and `close`.
 - **Maximize/restore**: `windowMaxButton` swaps its glyph between the single square (maximize) and
   the offset double square (restore) as the window state changes, kept in sync by `changeEvent`.
-- **Edge resize** - NEW (OROT): with the native frame gone, a 7px (`WINDOW_RESIZE_MARGIN`) border
-  around the window is the resize handle. A `MainWindow` event filter on the non-interactive chrome
-  surfaces detects the edge/corner under the cursor, shows the matching resize cursor
-  (`SizeHor` / `SizeVer` / `SizeFDiag` / `SizeBDiag`), and on left-press starts a native resize via
-  `windowHandle().startSystemResize(edges)`. Interactive controls and a maximized window are never
-  resize handles.
+- **Native hit testing** - NEW (OROT): on Windows the frameless window keeps its native behaviour by
+  re-adding `WS_THICKFRAME | WS_CAPTION | WS_MAXIMIZEBOX` and answering `WM_NCHITTEST` from
+  `MainWindow.nativeEvent`. An 8px (`WINDOW_RESIZE_MARGIN`) border maps to the Win32 resize codes
+  (`HTLEFT` / `HTTOP` / `HTTOPLEFT` ...) so Windows drives the resize cursor, the native resize loop,
+  and Aero Snap; the non-interactive chrome bar maps to `HTCAPTION` for native move + snap-to-top.
+  `WM_NCCALCSIZE` hides the OS title bar while keeping that behaviour. Interactive controls and a
+  maximized window never become resize/caption surfaces. The pure mapping
+  (`_resize_edges_for_point` -> `_hit_test_for_edges` -> `_window_hit_test_result`) is unit-tested
+  without a live HWND; non-Windows falls back to `startSystemMove()` via `AppChromeBar`.
 
 ## 6. Motion & Interaction
 
@@ -202,6 +205,10 @@ Strategy: **borders + tonal-shift** (committed; no shadows anywhere).
 - No `box-shadow`. Separation is a border, a tonal step, or both.
 - The header bar reads as `surface-card` (white) with a single `border-subtle` bottom divider.
 - The window is frameless (`FramelessWindowHint`); native OS chrome is hidden and the OROT header
-  bar is the only title bar, providing brand, actions, drag-to-move, and min/max/close. Window move
-  and edge resize go through `startSystemMove()` / `startSystemResize()` so OS snap and Aero still
-  work, with a manual `move()` fallback. - NEW (OROT)
+  bar is the only title bar, providing brand, actions, drag-to-move, and min/max/close. On Windows,
+  move/resize/Aero-Snap go through native `WM_NCHITTEST` hit testing (caption + resize borders) in
+  `MainWindow.nativeEvent`, not a manual move/resize loop. - NEW (OROT)
+- The frameless window keeps a single subtle 1px `#d4d4da` outline (`WINDOW_FRAME_BORDER_COLOR`) with
+  native-ish 8px rounded corners (`WINDOW_FRAME_CORNER_RADIUS`): a Qt border on `appShell` plus the
+  Windows 11 DWM rounded corners + matching border drawn in `_apply_windows_native_chrome`. This is
+  the one window-edge frame; the internal "no shadow" rule still governs cards and panels. - NEW (OROT)
