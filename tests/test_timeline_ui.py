@@ -1,12 +1,14 @@
+import ctypes
 import json
 import os
+from ctypes import wintypes
 from datetime import datetime, time, timedelta
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QRect, QSize, Qt, QTime
-from PySide6.QtGui import QPainter, QPixmap
+from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QSize, Qt, QTime
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -28,23 +30,39 @@ from PySide6.QtWidgets import (
 from app.models import FocusSession, ItemType, LayoutProfile, LinkFavorite, QuickNote, Task
 from app.services.app_usage import ActiveWindowSnapshot
 from app.storage.database import ScheduleRepository
+from app.ui import main_window as main_window_module
 from app.ui.main_window import (
     DASHBOARD_GRID_GAP,
     DASHBOARD_GRID_COLUMNS,
     DASHBOARD_GRID_ROW_HEIGHT,
     PANEL_CONTROL_HEIGHT,
+    PANEL_CORNER_RADIUS,
     PANEL_HANDLE_CONTENT_GAP,
     PANEL_HEADER_HEIGHT,
     PANEL_MOVE_BAR_HEIGHT,
     WINDOW_RESIZE_MARGIN,
+    WINDOW_FRAME_BORDER_COLOR,
+    WINDOW_FRAME_CORNER_RADIUS,
+    HTBOTTOM,
+    HTBOTTOMLEFT,
+    HTBOTTOMRIGHT,
+    HTCAPTION,
+    HTCLIENT,
+    HTLEFT,
+    HTRIGHT,
+    HTTOP,
+    HTTOPLEFT,
+    HTTOPRIGHT,
     AppChromeBar,
     ChecklistItemEditDialog,
     CompletedAtEditDialog,
+    DraggableFeatureBox,
     FavoritesSettingsDialog,
     FocusWidgetDialog,
     ItemTypeSettingsDialog,
     LayoutProfileLoadDialog,
     MainWindow,
+    OutlinedTextLabel,
     QuickNoteDetailDialog,
     QuickNoteFolderNotesDialog,
     QuickNoteTrashDialog,
@@ -52,9 +70,10 @@ from app.ui.main_window import (
     TodayChecklistWidget,
     TodayTimelineWidget,
     WindowControlButton,
-    _cursor_for_resize_edges,
+    _hit_test_for_edges,
     _is_resize_eligible_widget,
     _resize_edges_for_point,
+    _window_hit_test_result,
     _download_site_icon,
     _draw_image_viewport,
     _eyedropper_cursor,
@@ -718,6 +737,15 @@ def test_app_bar_has_custom_window_chrome(tmp_path) -> None:
     assert "QFrame#chromeDivider {" in style
     assert "QPushButton#windowCloseButton {" in style
 
+    # The frameless window keeps a subtle visible border with native-ish rounded
+    # corners; the chrome bar's top corners are rounded to match.
+    appshell_style = style[style.index("QWidget#appShell {") : style.index("QWidget#appBody")]
+    assert f"border: 1px solid {WINDOW_FRAME_BORDER_COLOR};" in appshell_style
+    assert f"border-radius: {WINDOW_FRAME_CORNER_RADIUS}px;" in appshell_style
+    chrome_bar_style = style[style.index("QWidget#appChromeBar {") : style.index("QWidget#featureGrid")]
+    assert f"border-top-left-radius: {WINDOW_FRAME_CORNER_RADIUS}px;" in chrome_bar_style
+    assert f"border-top-right-radius: {WINDOW_FRAME_CORNER_RADIUS}px;" in chrome_bar_style
+
     # Maximize control toggles between maximize and restore with window state.
     assert window.window_maximize_button.control_kind() == "maximize"
     window.toggle_max_restore()
@@ -732,7 +760,36 @@ def test_app_bar_has_custom_window_chrome(tmp_path) -> None:
     window.close()
 
 
-def test_frameless_window_edge_resize(tmp_path) -> None:
+def test_toggle_max_restore_returns_to_tracked_normal_size(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.resize(1180, 760)
+    app.processEvents()
+    tracked = window._normal_window_size
+    assert tracked is not None
+    assert (tracked.width(), tracked.height()) == (1180, 760)
+
+    window.toggle_max_restore()
+    app.processEvents()
+    assert window.isMaximized()
+    # Maximizing must never overwrite the tracked normal size.
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1180, 760)
+
+    window.toggle_max_restore()
+    app.processEvents()
+    assert not window.isMaximized()
+    # Restore returns to the tracked normal size, not a maximized-sized geometry.
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1180, 760)
+    assert (window.width(), window.height()) == (1180, 760)
+
+    window.close()
+
+
+def test_frameless_window_native_hit_test(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -754,40 +811,197 @@ def test_frameless_window_edge_resize(tmp_path) -> None:
     assert _resize_edges_for_point(QPoint(inset, 640 - inset), size) == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge)
     assert not _resize_edges_for_point(QPoint(450, 320), size)
 
-    # Cursor mapping for each edge and corner; interior maps to no cursor.
-    assert _cursor_for_resize_edges(Qt.Edge.LeftEdge) == Qt.CursorShape.SizeHorCursor
-    assert _cursor_for_resize_edges(Qt.Edge.RightEdge) == Qt.CursorShape.SizeHorCursor
-    assert _cursor_for_resize_edges(Qt.Edge.TopEdge) == Qt.CursorShape.SizeVerCursor
-    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge) == Qt.CursorShape.SizeVerCursor
-    assert _cursor_for_resize_edges(Qt.Edge.TopEdge | Qt.Edge.LeftEdge) == Qt.CursorShape.SizeFDiagCursor
-    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge | Qt.Edge.RightEdge) == Qt.CursorShape.SizeFDiagCursor
-    assert _cursor_for_resize_edges(Qt.Edge.TopEdge | Qt.Edge.RightEdge) == Qt.CursorShape.SizeBDiagCursor
-    assert _cursor_for_resize_edges(Qt.Edge.BottomEdge | Qt.Edge.LeftEdge) == Qt.CursorShape.SizeBDiagCursor
-    assert _cursor_for_resize_edges(_resize_edges_for_point(QPoint(450, 320), size)) is None
+    # Each edge/corner maps to its Win32 WM_NCHITTEST border code so Windows owns
+    # the native resize loop and resize cursors; the interior maps to nothing.
+    assert _hit_test_for_edges(Qt.Edge.LeftEdge) == HTLEFT
+    assert _hit_test_for_edges(Qt.Edge.RightEdge) == HTRIGHT
+    assert _hit_test_for_edges(Qt.Edge.TopEdge) == HTTOP
+    assert _hit_test_for_edges(Qt.Edge.BottomEdge) == HTBOTTOM
+    assert _hit_test_for_edges(Qt.Edge.TopEdge | Qt.Edge.LeftEdge) == HTTOPLEFT
+    assert _hit_test_for_edges(Qt.Edge.TopEdge | Qt.Edge.RightEdge) == HTTOPRIGHT
+    assert _hit_test_for_edges(Qt.Edge.BottomEdge | Qt.Edge.LeftEdge) == HTBOTTOMLEFT
+    assert _hit_test_for_edges(Qt.Edge.BottomEdge | Qt.Edge.RightEdge) == HTBOTTOMRIGHT
+    assert _hit_test_for_edges(Qt.Edge(0)) is None
+    assert _hit_test_for_edges(_resize_edges_for_point(QPoint(450, 320), size)) is None
 
-    # Interactive controls are never resize handles; plain chrome surfaces are.
+    # Composite hit test: resize borders win over the caption so corners stay
+    # grabbable; the caption strip maps to HTCAPTION (native move + Aero Snap);
+    # the body falls through to HTCLIENT so Qt still delivers the child event.
+    margin = WINDOW_RESIZE_MARGIN
+    assert _window_hit_test_result(QPoint(inset, inset), size, margin=margin, on_caption=True, resizable=True) == HTTOPLEFT
+    assert _window_hit_test_result(QPoint(450, inset), size, margin=margin, on_caption=True, resizable=True) == HTTOP
+    assert _window_hit_test_result(QPoint(450, 28), size, margin=margin, on_caption=True, resizable=True) == HTCAPTION
+    assert _window_hit_test_result(QPoint(450, 320), size, margin=margin, on_caption=False, resizable=True) == HTCLIENT
+    # A maximized window is never resizable; borders fall back to caption/client.
+    assert _window_hit_test_result(QPoint(inset, inset), size, margin=margin, on_caption=True, resizable=False) == HTCAPTION
+    assert _window_hit_test_result(QPoint(inset, inset), size, margin=margin, on_caption=False, resizable=False) == HTCLIENT
+
+    # Interactive controls are never caption/resize surfaces; plain chrome is.
     assert not _is_resize_eligible_widget(window.window_close_button)
     assert not _is_resize_eligible_widget(window.main_always_on_top_check)
     assert _is_resize_eligible_widget(window.findChild(QWidget, "appChromeBar"))
 
-    # The resize event filter is installed on the central surface (mouse tracking on),
-    # and the window helper reports edges: true at an edge, false in content.
-    central = window.centralWidget()
-    assert central.hasMouseTracking()
-    actual = window.size()
-    edge_global = window.mapToGlobal(QPoint(3, actual.height() // 2))
-    content_global = window.mapToGlobal(QPoint(actual.width() // 2, actual.height() // 2))
-    assert window._resize_edges_at_global(central, edge_global) == Qt.Edge.LeftEdge
-    assert not window._resize_edges_at_global(central, content_global)
-    # Even at an edge position, an interactive control is not treated as a handle.
-    assert not window._resize_edges_at_global(window.window_close_button, edge_global)
+    # The brand lockup is a live caption (drag) surface, but the window controls
+    # are not, so they keep receiving their own clicks instead of starting a move.
+    title_label = window.chrome_title_label
+    title_point = title_label.mapTo(window, QPoint(title_label.width() // 2, title_label.height() // 2))
+    assert window._point_is_caption(title_point)
+    close_button = window.window_close_button
+    close_point = close_button.mapTo(window, QPoint(close_button.width() // 2, close_button.height() // 2))
+    assert not window._point_is_caption(close_point)
 
-    # A maximized window is not edge-resizable.
-    window.showMaximized()
+    window.close()
+
+
+def test_native_message_handler_does_not_reenter_winid(tmp_path, monkeypatch) -> None:
+    class NoReentrantWinIdWindow(MainWindow):
+        def winId(self):
+            raise AssertionError("native message handling must use the message hWnd")
+
+    class FakeChromeApi:
+        def window_rect(self, hwnd: int) -> tuple[int, int, int, int]:
+            assert hwnd == 12345
+            return 0, 0, 900, 640
+
+    class MessagePointer:
+        def __init__(self, address: int) -> None:
+            self._address = address
+
+        def __int__(self) -> int:
+            return self._address
+
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = NoReentrantWinIdWindow(repository)
+
+    message = wintypes.MSG()
+    message.hWnd = 12345
+    message.message = main_window_module._WM_NCHITTEST
+    message.lParam = (300 << 16) | 3
+
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", FakeChromeApi())
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+
+    result = window._handle_windows_native_message(MessagePointer(ctypes.addressof(message)))
+
+    assert result == HTLEFT
+    window.close()
+
+
+def test_native_maximized_state_detected_when_qt_reports_normal(tmp_path, monkeypatch) -> None:
+    class FakeMaximizedChromeApi:
+        def is_maximized(self, hwnd: int) -> bool:
+            assert hwnd == 4242
+            return True
+
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
     app.processEvents()
-    assert not window._resize_edges_at_global(central, window.mapToGlobal(QPoint(0, 0)))
-    window.showNormal()
+
+    window.resize(1010, 620)
     app.processEvents()
+    assert window._normal_window_size is not None
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    # Simulate the real Windows frameless-chrome bug: the Win32 placement is
+    # maximized while Qt still reports a normal window. The stubbed handle keeps
+    # winId() out of the path entirely.
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", FakeMaximizedChromeApi())
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+    monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
+
+    assert not window.isMaximized()
+    assert window._is_native_maximized()
+    assert window._is_effectively_maximized()
+
+    # The maximize/restore control reflects the native maximized state.
+    window._sync_max_restore_button()
+    assert window.window_maximize_button.control_kind() == "restore"
+
+    # A resize arriving while natively maximized must not overwrite the tracked
+    # normal size with the maximized geometry.
+    window.resize(2560, 1440)
+    app.processEvents()
+    window._remember_normal_window_size()
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    # Saving while natively maximized persists the tracked normal size.
+    window.save_last_window_size()
+    saved = repository.get_preferences()
+    assert saved.last_window_width == 1010
+    assert saved.last_window_height == 620
+
+    window.close()
+
+
+def test_toggle_max_restore_restores_from_native_maximized(tmp_path, monkeypatch) -> None:
+    class FakeMaximizedChromeApi:
+        def is_maximized(self, hwnd: int) -> bool:
+            return True
+
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.resize(1010, 620)
+    app.processEvents()
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", FakeMaximizedChromeApi())
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+    monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
+
+    # Stand in for the maximized geometry while Qt still reports a normal window.
+    window.resize(2560, 1440)
+    app.processEvents()
+    assert not window.isMaximized()
+    assert window._is_effectively_maximized()
+
+    # The toggle must take the RESTORE branch because the window is natively
+    # maximized, returning to the tracked normal size instead of re-maximizing.
+    window.toggle_max_restore()
+    app.processEvents()
+    assert (window.width(), window.height()) == (1010, 620)
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    window.close()
+
+
+def test_toggle_max_restore_restores_from_fullscreen_state(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.resize(1010, 620)
+    app.processEvents()
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    # On real Windows the frameless showMaximized() lands the window in Qt's
+    # WindowFullScreen state with isMaximized() False; showFullScreen() reproduces
+    # that exact state offscreen.
+    window.showFullScreen()
+    app.processEvents()
+    assert window.isFullScreen()
+    assert not window.isMaximized()
+    assert window._is_effectively_maximized()
+
+    # The fullscreen geometry must not overwrite the tracked normal size.
+    window._remember_normal_window_size()
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
+
+    # The restore branch collapses the window back to the tracked normal size.
+    window.toggle_max_restore()
+    app.processEvents()
+    assert not window.isFullScreen()
+    assert not window.isMaximized()
+    assert (window.width(), window.height()) == (1010, 620)
+    assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
 
     window.close()
 
@@ -851,15 +1065,21 @@ def test_settings_control_datetime_panel_style(tmp_path) -> None:
     dialog.show()
     app.processEvents()
 
+    outline_thickness_spin = dialog.findChild(QSpinBox, "datetimeTextOutlineThicknessSpin")
+    assert outline_thickness_spin is not None
     assert dialog.datetime_transparent_check.isChecked()
     assert not dialog.datetime_border_check.isChecked()
     assert dialog.use_default_datetime_font_check.isChecked()
     assert not dialog.datetime_font_combo.isEnabled()
     assert dialog.datetime_font_size_spin.value() == 24
+    assert dialog.datetime_text_outline_color == ""
+    assert outline_thickness_spin.value() == 0
 
     dialog.datetime_transparent_check.setChecked(False)
     dialog.datetime_border_check.setChecked(True)
     dialog.set_setting_color("datetime_text", "#123456")
+    dialog.set_setting_color("datetime_text_outline", "#abcdef")
+    outline_thickness_spin.setValue(5)
     dialog.use_default_datetime_font_check.setChecked(False)
     dialog.datetime_font_size_spin.setValue(40)
     dialog.set_datetime_background_image_path("C:/Images/time.gif")
@@ -869,6 +1089,8 @@ def test_settings_control_datetime_panel_style(tmp_path) -> None:
     assert not preferences.datetime_panel_transparent_background
     assert preferences.datetime_panel_border_enabled
     assert preferences.datetime_panel_text_color == "#123456"
+    assert preferences.datetime_panel_text_outline_color == "#abcdef"
+    assert preferences.datetime_panel_text_outline_thickness == 5
     assert preferences.datetime_panel_font_family
     assert preferences.datetime_panel_font_size == 40
     assert preferences.datetime_panel_background_image_path == "C:/Images/time.gif"
@@ -935,7 +1157,9 @@ def test_main_window_applies_configured_font_and_scales_text(tmp_path) -> None:
     app.processEvents()
 
     style = window.styleSheet()
-    assert 'font-family: "Arial", "Pretendard", "Segoe UI", "Malgun Gothic", sans-serif;' in style
+    assert 'font-family: "Arial", ' in style
+    assert '"Malgun Gothic"' in style
+    assert '"Segoe UI"' in style
     assert "QWidget {\n                color: #18201b;\n                font-family:" in style
     assert "font-size: 15px;" in style
     assert "QLabel#noteBodyLabel" in style
@@ -978,11 +1202,20 @@ def test_datetime_panel_live_preview_applies_text_style(tmp_path) -> None:
     window.show()
     app.processEvents()
 
+    assert isinstance(window.current_date_label, OutlinedTextLabel)
+    assert isinstance(window.current_time_label, OutlinedTextLabel)
+    assert not window.current_time_label.outline_enabled()
+
     dialog = SettingsDialog(repository.get_preferences(), window)
     dialog.show()
     app.processEvents()
 
+    outline_thickness_spin = dialog.findChild(QSpinBox, "datetimeTextOutlineThicknessSpin")
+    assert outline_thickness_spin is not None
+
     dialog.set_setting_color("datetime_text", "#123456")
+    dialog.set_setting_color("datetime_text_outline", "#ff8800")
+    outline_thickness_spin.setValue(6)
     dialog.datetime_font_size_spin.setValue(42)
     dialog.datetime_transparent_check.setChecked(False)
     dialog.datetime_border_check.setChecked(True)
@@ -990,15 +1223,57 @@ def test_datetime_panel_live_preview_applies_text_style(tmp_path) -> None:
 
     style = window.styleSheet()
     assert window.preferences.datetime_panel_text_color == "#123456"
+    assert window.preferences.datetime_panel_text_outline_color == "#ff8800"
+    assert window.preferences.datetime_panel_text_outline_thickness == 6
     assert window.preferences.datetime_panel_font_size == 42
     assert "QLabel#currentTimeLabel" in style
     assert "color: #123456;" in style
     assert "font-size: 42px;" in style
     assert "QWidget#dateTimePanel" in style
     assert "border: 1px solid" in style
+    assert window.current_time_label.outline_color == "#ff8800"
+    assert window.current_time_label.outline_thickness == 6
+    assert window.current_time_label.outline_enabled()
+    assert window.current_date_label.outline_color == "#ff8800"
 
     dialog.close()
     window.close()
+
+
+def test_outlined_text_label_renders_real_outline_pixels() -> None:
+    _app()
+    label = OutlinedTextLabel()
+    label.setText("12:34")
+    label.resize(220, 90)
+    font = label.font()
+    font.setPointSize(44)
+    label.setFont(font)
+    label.set_text_fill_color("#000000")
+
+    def _render() -> QImage:
+        target = QPixmap(label.size())
+        target.fill(Qt.GlobalColor.black)
+        label.render(target)
+        return target.toImage()
+
+    def _has_outline_pixel(image: QImage) -> bool:
+        for y in range(0, image.height(), 2):
+            for x in range(0, image.width(), 2):
+                color = image.pixelColor(x, y)
+                if color.green() > 130 and color.red() < 90 and color.blue() < 90:
+                    return True
+        return False
+
+    plain = _render()
+    assert not label.outline_enabled()
+    assert not _has_outline_pixel(plain)
+
+    label.set_text_outline("#00aa00", 6)
+    assert label.outline_enabled()
+    assert label.outline_color == "#00aa00"
+    assert label.outline_thickness == 6
+    outlined = _render()
+    assert _has_outline_pixel(outlined)
 
 
 def test_main_window_opens_with_datetime_panel_border_enabled(tmp_path) -> None:
@@ -1119,9 +1394,13 @@ def test_focus_panel_stacks_target_controls_when_compact(tmp_path) -> None:
     assert window.target_combo.isVisible()
     assert window.focus_targets_list.isVisible()
     assert not window.remove_target_button.isVisible()
-    assert combo_position[:4] == (3, 0, 1, 4)
-    assert actions_position[:4] == (4, 0, 1, 4)
-    assert list_position[:4] == (6, 0, 1, 4)
+    assert window.focus_task_label.text() == ""
+    assert window.focus_task_label.isHidden()
+    assert window.focus_targets_label.text() == ""
+    assert window.focus_targets_label.isHidden()
+    assert combo_position[:4] == (2, 0, 1, 4)
+    assert actions_position[:4] == (3, 0, 1, 4)
+    assert list_position[:4] == (4, 0, 1, 4)
     assert window.focus_detail_label.isHidden()
     assert window.focus_ratio_card.isVisible()
     assert window.focus_ratio_card.maximumHeight() <= 86
@@ -1283,7 +1562,8 @@ def test_pomodoro_panel_ports_widget_progress_card(tmp_path) -> None:
     app.processEvents()
 
     assert window.pomodoro_progress.value() == 0
-    assert window.pomodoro_detail_label.text() == "집중 25분 · 휴식 5분"
+    assert window.pomodoro_detail_label.text() == ""
+    assert window.pomodoro_detail_label.isHidden()
 
     window.pomodoro_mode = "focus"
     window.pomodoro_total_seconds = 1500
@@ -1294,7 +1574,8 @@ def test_pomodoro_panel_ports_widget_progress_card(tmp_path) -> None:
     assert window.pomodoro_status_label.text() == "집중 중"
     assert window.pomodoro_time_label.text() == "15:00"
     assert window.pomodoro_progress.value() == 400
-    assert window.pomodoro_detail_label.text() == "집중 · 남은 15:00 / 전체 25:00"
+    assert window.pomodoro_detail_label.text() == ""
+    assert window.pomodoro_detail_label.isHidden()
     window.close()
 
 
@@ -2212,10 +2493,18 @@ def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
     assert preview.mapTo(media_box, QPoint(0, 0)).y() == expected_offset
     assert pomodoro_content.mapTo(pomodoro_box, QPoint(0, 0)).y() == expected_offset
 
-    assert media_box.mapTo(window, QPoint(0, 0)).y() == pomodoro_box.mapTo(window, QPoint(0, 0)).y()
-    assert preview.mapTo(window, QPoint(0, 0)).y() == pomodoro_content.mapTo(window, QPoint(0, 0)).y()
+    media_box_top = media_box.mapTo(window, QPoint(0, 0)).y()
+    pomodoro_box_top = pomodoro_box.mapTo(window, QPoint(0, 0)).y()
+    assert media_box_top == pomodoro_box_top
+    assert media_box_top + media_box.height() == pomodoro_box_top + pomodoro_box.height()
+
+    preview_top = preview.mapTo(window, QPoint(0, 0)).y()
+    pomodoro_content_top = pomodoro_content.mapTo(window, QPoint(0, 0)).y()
+    assert preview_top == pomodoro_content_top
+    assert preview_top + preview.height() == pomodoro_content_top + pomodoro_content.height()
 
     assert preview.height() == media_box.height() - expected_offset
+    assert preview_top + preview.height() == media_box_top + media_box.height()
 
     assert preview.pixmap() is not None
     assert not preview.pixmap().isNull()
@@ -2318,6 +2607,8 @@ def test_header_banner_uses_label_pixmap_loader_like_media_panel(tmp_path) -> No
     assert stored_path.exists()
     assert window.header_banner_widget.pixmap() is not None
     assert not window.header_banner_widget.pixmap().isNull()
+    assert f"border-radius: {PANEL_CORNER_RADIUS}px;" in window.header_banner_widget.styleSheet()
+    assert "border-radius: 18px;" not in window.header_banner_widget.styleSheet()
 
     window.set_header_banner_image_position("right")
     assert repository.get_preferences().header_banner_image_position == "right"
@@ -2377,6 +2668,33 @@ def test_media_corner_clip_survives_image_viewport_clip() -> None:
     assert image.pixelColor(40, 40).alpha() > 200
 
 
+def test_media_corner_clip_uses_panel_radius() -> None:
+    _app()
+    widget = QWidget()
+    widget.resize(80, 80)
+
+    source = QPixmap(80, 80)
+    source.fill(Qt.GlobalColor.red)
+    target = QPixmap(80, 80)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    try:
+        _clip_media_corners(widget, painter, True)
+        _draw_image_viewport(widget, painter, source, {"zoom": 100, "x": 50, "y": 50})
+    finally:
+        painter.end()
+
+    image = target.toImage()
+    # The very corner is always clipped away.
+    assert image.pixelColor(0, 0).alpha() == 0
+    # A 16px panel-matching radius leaves these edge samples fully opaque (255);
+    # the old 18px radius clipped them to ~219 alpha, leaving a visible step
+    # against the neighbouring cards. Threshold sits between the two regimes.
+    assert image.pixelColor(16, 0).alpha() >= 240
+    assert image.pixelColor(0, 16).alpha() >= 240
+
+
 def test_media_image_viewport_allows_zooming_out() -> None:
     _app()
     widget = QWidget()
@@ -2427,6 +2745,35 @@ def test_main_window_restores_last_closed_size(tmp_path) -> None:
     assert restored.width() == 1234
     assert restored.height() == 678
     restored.close()
+
+
+def test_main_window_persists_normal_size_when_closing_maximized(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.last_window_width = 1180
+    preferences.last_window_height = 760
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.resize(1234, 678)
+    app.processEvents()
+
+    window.showMaximized()
+    app.processEvents()
+    assert window.isMaximized()
+
+    window.close()
+    app.processEvents()
+
+    saved = repository.get_preferences()
+    # Closing while maximized must persist the tracked normal size, not the
+    # maximized geometry.
+    assert saved.last_window_width == 1234
+    assert saved.last_window_height == 678
 
 
 def test_main_window_restores_last_feature_sizes(tmp_path) -> None:
@@ -3167,6 +3514,107 @@ def test_feature_resize_edges_work_without_visible_corner_grip(tmp_path) -> None
     assert focus_box._is_resize_edge(QPoint(20, focus_box.height() // 2))
     assert focus_box._is_resize_edge(QPoint(focus_box.width() - 20, focus_box.height() // 2))
     assert focus_box._is_height_resize_edge(QPoint(focus_box.width() // 2, focus_box.height() - 22))
+    window.close()
+
+
+def test_feature_box_resize_band_ignores_interactive_children(tmp_path) -> None:
+    app = _app()
+
+    combo = QComboBox()
+    combo.addItem("항목")
+    combo.setCursor(Qt.CursorShape.PointingHandCursor)
+    box = DraggableFeatureBox("today_checklist", "체크리스트", combo, lambda *_args: None)
+    box.height_callback = lambda *_args: None
+    box.resize_edge_callback = lambda *_args: None
+    box.resize_callback = lambda *_args: None
+    box.resize(320, 240)
+    app.processEvents()
+
+    # Given: an interactive child whose mapped position sits in the box resize bands.
+    assert box._is_interactive_child(combo)
+    height_band = QPoint(box.width() // 2, box.height() - 4)
+    width_band = QPoint(box.width() - 4, box.height() // 2)
+    assert box._is_height_resize_edge(height_band)
+    assert box._resize_edge_at(width_band) == "right"
+
+    def _mouse_event(event_type, box_point, button):
+        return QMouseEvent(
+            event_type,
+            QPointF(combo.mapFrom(box, box_point)),
+            QPointF(box.mapToGlobal(box_point)),
+            button,
+            button,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+    # When: hovering the child inside the height/width bands.
+    # Then: the resize cursors never overwrite the child's own cursor.
+    box._handle_filtered_mouse_move(
+        combo, _mouse_event(QEvent.Type.MouseMove, height_band, Qt.MouseButton.NoButton)
+    )
+    assert combo.cursor().shape() == Qt.CursorShape.PointingHandCursor
+    box._handle_filtered_mouse_move(
+        combo, _mouse_event(QEvent.Type.MouseMove, width_band, Qt.MouseButton.NoButton)
+    )
+    assert combo.cursor().shape() == Qt.CursorShape.PointingHandCursor
+
+    # When: pressing the child inside the height/width bands.
+    # Then: panel resizing must not begin.
+    height_press = box._handle_filtered_mouse_press(
+        combo, _mouse_event(QEvent.Type.MouseButtonPress, height_band, Qt.MouseButton.LeftButton)
+    )
+    assert height_press is False
+    assert box.resizing_height is False
+    assert box.resizing_span is False
+
+    width_press = box._handle_filtered_mouse_press(
+        combo, _mouse_event(QEvent.Type.MouseButtonPress, width_band, Qt.MouseButton.LeftButton)
+    )
+    assert width_press is False
+    assert box.resizing_height is False
+    assert box.resizing_span is False
+
+    box.deleteLater()
+    app.processEvents()
+
+
+def test_panel_inputs_and_dropdowns_use_intent_cursors(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    ibeam = Qt.CursorShape.IBeamCursor
+    pointer = Qt.CursorShape.PointingHandCursor
+    timeline = window.inline_timeline_widget
+    checklist = window.today_checklist_widget
+
+    text_inputs = {
+        "focus_title_edit": window.focus_title_edit,
+        "quick_note_editor": window.quick_note_editor,
+        "new_task_edit": checklist.new_task_edit,
+        "timeline_event_edit": timeline.timeline_event_edit,
+    }
+    for name, widget in text_inputs.items():
+        assert widget.cursor().shape() == ibeam, name
+
+    dropdowns = {
+        "quick_note_folder_combo": window.quick_note_folder_combo,
+        "note_filter_combo": window.note_filter_combo,
+        "target_combo": window.target_combo,
+        "new_task_type_combo": checklist.new_task_type_combo,
+        "timeline_filter_combo": timeline.timeline_filter_combo,
+        "timeline_event_type_combo": timeline.timeline_event_type_combo,
+    }
+    for name, combo in dropdowns.items():
+        assert combo.cursor().shape() == pointer, name
+        assert combo.view().cursor().shape() == pointer, f"{name} view"
+
+    assert timeline.block_table.cursor().shape() == pointer
+    assert timeline.block_table.viewport().cursor().shape() == pointer
+
     window.close()
 
 

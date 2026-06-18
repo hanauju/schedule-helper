@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import re
 import shutil
+import sys
 import webbrowser
+from ctypes import wintypes
 from dataclasses import replace
 from html.parser import HTMLParser
 from collections.abc import Callable
@@ -20,6 +23,7 @@ from PySide6.QtGui import (
     QCursor,
     QDrag,
     QFont,
+    QFontDatabase,
     QGuiApplication,
     QIcon,
     QKeySequence,
@@ -105,9 +109,19 @@ PANEL_CONTROL_HEIGHT = 40
 PANEL_MOVE_BAR_HEIGHT = 10
 PANEL_HANDLE_CONTENT_GAP = 2
 PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
+PANEL_CORNER_RADIUS = 16  # keep in sync with normal card "border-radius: 16px" in the stylesheet
 DASHBOARD_GRID_GAP = 12
 MEDIA_PANEL_KEYS = ("media_panel", "media_panel_2", "media_panel_3", "media_panel_4")
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
+KOREAN_FONT_FILES = (
+    "malgun.ttf",
+    "malgunbd.ttf",
+    "NotoSansKR-VF.ttf",
+    "gulim.ttc",
+    "batang.ttc",
+)
+_loaded_korean_font_families: tuple[str, ...] = ()
+_korean_font_load_attempted = False
 
 
 def _image_alignment(value: object) -> Qt.AlignmentFlag:
@@ -226,7 +240,7 @@ def _clip_media_corners(widget: QWidget, painter: QPainter, rounded: bool) -> No
     rect = QRectF(widget.contentsRect())
     if rect.width() <= 0 or rect.height() <= 0:
         return
-    radius = min(18.0, rect.width() / 2, rect.height() / 2)
+    radius = min(float(PANEL_CORNER_RADIUS), rect.width() / 2, rect.height() / 2)
     path = QPainterPath()
     path.addRoundedRect(rect, radius, radius)
     painter.setClipPath(path)
@@ -939,7 +953,7 @@ class HeaderBannerWidget(QLabel):
             "QLabel#headerBannerPreview {"
             "background: transparent;"
             "border: none;"
-            "border-radius: 18px;"
+            f"border-radius: {PANEL_CORNER_RADIUS}px;"
             "padding: 0px;"
             "}"
         )
@@ -1219,6 +1233,65 @@ class DateTimePanelWidget(QWidget):
         _draw_image_viewport(self, painter, source, self.image_view)
 
 
+class OutlinedTextLabel(QLabel):
+    """QLabel that can paint a solid outline around its text.
+
+    With no outline configured it defers to the base QLabel paint path, so the
+    existing object-name stylesheet (color, font family/size/weight, alignment)
+    keeps applying unchanged. The outline uses Qt's normal text fallback path so
+    Korean glyphs keep rendering when the selected UI font is Latin-only.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.outline_color = ""
+        self.outline_thickness = 0
+        self._fill_color = ""
+
+    def set_text_outline(self, color: str, thickness: int) -> None:
+        normalized_color = _normalize_optional_color(color)
+        normalized_thickness = _normalize_datetime_text_outline_thickness(thickness)
+        if normalized_color == self.outline_color and normalized_thickness == self.outline_thickness:
+            return
+        self.outline_color = normalized_color
+        self.outline_thickness = normalized_thickness
+        self.update()
+
+    def set_text_fill_color(self, color: str) -> None:
+        normalized = _normalize_optional_color(color)
+        if normalized == self._fill_color:
+            return
+        self._fill_color = normalized
+        if self.outline_enabled():
+            self.update()
+
+    def outline_enabled(self) -> bool:
+        return bool(self.outline_color) and self.outline_thickness > 0
+
+    def paintEvent(self, event) -> None:
+        text = self.text()
+        if not self.outline_enabled() or not text:
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        thickness = self.outline_thickness
+        rect = QRectF(self.contentsRect()).adjusted(thickness, thickness, -thickness, -thickness)
+        alignment = self.alignment()
+        fill = self._fill_color or self.palette().color(QPalette.ColorRole.WindowText).name()
+        painter.setFont(self.font())
+        painter.setPen(QColor(self.outline_color))
+        for dy in range(-thickness, thickness + 1):
+            for dx in range(-thickness, thickness + 1):
+                if dx == 0 and dy == 0:
+                    continue
+                if dx * dx + dy * dy <= thickness * thickness:
+                    painter.drawText(rect.translated(dx, dy), alignment, text)
+        painter.setPen(QColor(fill))
+        painter.drawText(rect, alignment, text)
+
+
 class SwitchCheckBox(QCheckBox):
     def __init__(self, text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(text, parent)
@@ -1488,16 +1561,21 @@ class DraggableFeatureBox(QWidget):
             event.accept()
             return True
         box_position = self._map_event_position(watched, event)
-        if self._is_height_resize_edge(box_position) and self.height_callback is not None:
+        interactive = self._is_interactive_child(watched)
+        if (
+            not interactive
+            and self._is_height_resize_edge(box_position)
+            and self.height_callback is not None
+        ):
             self._begin_height_resize(event.globalPosition().toPoint().y())
             event.accept()
             return True
         resize_edge = self._resize_edge_at(box_position)
-        if resize_edge and self._can_resize_width() and not self._is_interactive_child(watched):
+        if resize_edge and self._can_resize_width() and not interactive:
             self._begin_span_resize(event.globalPosition().toPoint().x(), resize_edge)
             event.accept()
             return True
-        if isinstance(watched, FeatureMoveBar) or self._is_interactive_child(watched):
+        if isinstance(watched, FeatureMoveBar) or interactive:
             return False
         if not self.content_drag_enabled:
             return False
@@ -1523,11 +1601,16 @@ class DraggableFeatureBox(QWidget):
         ):
             event.accept()
             return True
-        if self._is_height_resize_edge(box_position) and self.height_callback is not None:
+        interactive = self._is_interactive_child(watched)
+        if (
+            not interactive
+            and self._is_height_resize_edge(box_position)
+            and self.height_callback is not None
+        ):
             watched.setCursor(Qt.CursorShape.SizeVerCursor)
-        elif self._resize_edge_at(box_position) and self._can_resize_width():
+        elif not interactive and self._resize_edge_at(box_position) and self._can_resize_width():
             watched.setCursor(Qt.CursorShape.SizeHorCursor)
-        elif self.content_drag_enabled and not self._is_interactive_child(watched):
+        elif self.content_drag_enabled and not interactive:
             watched.setCursor(Qt.CursorShape.OpenHandCursor)
         elif self._should_reset_cursor(watched):
             watched.unsetCursor()
@@ -2219,7 +2302,25 @@ class RichNoteEditor(QWidget):
         return None, None
 
 
-WINDOW_RESIZE_MARGIN = 7
+WINDOW_RESIZE_MARGIN = 8
+WINDOW_FRAME_BORDER_COLOR = "#d4d4da"  # subtle 1px window outline (paired with the native DWM border)
+WINDOW_FRAME_CORNER_RADIUS = 8  # matches the Windows 11 DWM rounded-corner radius
+
+# Win32 WM_NCHITTEST result codes. Plain ints so the hit-test mapping stays a pure
+# function that can be unit-tested without a live HWND.
+HTCLIENT = 1
+HTCAPTION = 2
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+
+_WM_NCCALCSIZE = 0x0083
+_WM_NCHITTEST = 0x0084
 
 _INTERACTIVE_RESIZE_EXCLUSIONS = (
     QAbstractButton,
@@ -2252,25 +2353,73 @@ def _resize_edges_for_point(point: QPoint, size: QSize, margin: int = WINDOW_RES
     return edges
 
 
-def _cursor_for_resize_edges(edges: Qt.Edge) -> Qt.CursorShape | None:
-    """Map resize edges to the matching diagonal/horizontal/vertical resize cursor."""
-    left = bool(edges & Qt.Edge.LeftEdge)
-    right = bool(edges & Qt.Edge.RightEdge)
-    top = bool(edges & Qt.Edge.TopEdge)
-    bottom = bool(edges & Qt.Edge.BottomEdge)
-    if (top and left) or (bottom and right):
-        return Qt.CursorShape.SizeFDiagCursor
-    if (top and right) or (bottom and left):
-        return Qt.CursorShape.SizeBDiagCursor
-    if left or right:
-        return Qt.CursorShape.SizeHorCursor
-    if top or bottom:
-        return Qt.CursorShape.SizeVerCursor
-    return None
+_RESIZE_EDGE_HIT_TESTS: dict[Qt.Edge, int] = {
+    Qt.Edge.TopEdge | Qt.Edge.LeftEdge: HTTOPLEFT,
+    Qt.Edge.TopEdge | Qt.Edge.RightEdge: HTTOPRIGHT,
+    Qt.Edge.BottomEdge | Qt.Edge.LeftEdge: HTBOTTOMLEFT,
+    Qt.Edge.BottomEdge | Qt.Edge.RightEdge: HTBOTTOMRIGHT,
+    Qt.Edge.LeftEdge: HTLEFT,
+    Qt.Edge.RightEdge: HTRIGHT,
+    Qt.Edge.TopEdge: HTTOP,
+    Qt.Edge.BottomEdge: HTBOTTOM,
+}
+
+
+def _hit_test_for_edges(edges: Qt.Edge) -> int | None:
+    """Map resize edges to the matching Win32 WM_NCHITTEST border code.
+
+    The interior (no edges) returns ``None`` so the caller can fall back to the
+    caption/client decision. Letting Windows own the border codes means the OS
+    paints the resize cursor and drives the native resize/snap loop for us.
+    """
+    return _RESIZE_EDGE_HIT_TESTS.get(edges)
+
+
+def _window_hit_test_result(
+    point: QPoint,
+    size: QSize,
+    *,
+    margin: int,
+    on_caption: bool,
+    resizable: bool,
+) -> int:
+    """Pure WM_NCHITTEST mapping for a point in window-local pixels.
+
+    Resize borders win over the caption so window corners stay grabbable; the
+    caption drag strip maps to ``HTCAPTION`` (native move + Aero Snap), and
+    everything else falls through to ``HTCLIENT`` so Qt still delivers the event
+    to the child widget underneath.
+    """
+    if resizable:
+        border = _hit_test_for_edges(_resize_edges_for_point(point, size, margin))
+        if border is not None:
+            return border
+    return HTCAPTION if on_caption else HTCLIENT
+
+
+def _screen_point_from_lparam(lparam: int) -> tuple[int, int]:
+    """Unpack the signed 16-bit screen x/y a WM_NCHITTEST packs into ``lParam``."""
+    low = lparam & 0xFFFF
+    high = (lparam >> 16) & 0xFFFF
+    x = low - 0x10000 if low >= 0x8000 else low
+    y = high - 0x10000 if high >= 0x8000 else high
+    return x, y
+
+
+def _native_message_address(message) -> int:
+    """Return the pointer address carried by PySide's native-event message."""
+    to_int = getattr(message, "__int__", None)
+    if callable(to_int):
+        return to_int()
+    return int(message)
+
+
+def _is_windows_native_event_type(event_type) -> bool:
+    return event_type in ("windows_generic_MSG", b"windows_generic_MSG", b"windows_dispatcher_MSG")
 
 
 def _is_resize_eligible_widget(widget: QWidget) -> bool:
-    """A surface is a resize handle only when it is not an interactive control."""
+    """A surface is a caption/resize handle only when it is not an interactive control."""
     return not isinstance(widget, _INTERACTIVE_RESIZE_EXCLUSIONS)
 
 
@@ -2384,6 +2533,149 @@ class AppChromeBar(QWidget):
         super().mouseDoubleClickEvent(event)
 
 
+class _NCCALCSIZE_PARAMS(ctypes.Structure):
+    _fields_ = [("rgrc", wintypes.RECT * 3), ("lppos", ctypes.c_void_p)]
+
+
+class _WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", wintypes.UINT),
+        ("flags", wintypes.UINT),
+        ("showCmd", wintypes.UINT),
+        ("ptMinPosition", wintypes.POINT),
+        ("ptMaxPosition", wintypes.POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
+
+
+class _WindowsChromeApi:
+    """Thin ctypes wrapper over the Win32/DWM calls the frameless chrome needs.
+
+    Built once per process (see :func:`_windows_chrome_api`); every method takes a
+    raw ``HWND`` so it stays decoupled from the widget. The DWM calls are
+    best-effort - unsupported attributes just return a failing ``HRESULT`` we
+    ignore - so the same code is safe from Windows 10 through 11.
+    """
+
+    GWL_STYLE = -16
+    GCL_STYLE = -26
+    WS_THICKFRAME = 0x00040000
+    WS_CAPTION = 0x00C00000
+    WS_MAXIMIZEBOX = 0x00010000
+    WS_MINIMIZEBOX = 0x00020000
+    WS_SYSMENU = 0x00080000
+    CS_DBLCLKS = 0x0008
+    SWP_FRAMECHANGED = 0x0001 | 0x0002 | 0x0004 | 0x0010 | 0x0020  # NOSIZE|NOMOVE|NOZORDER|NOACTIVATE|FRAMECHANGED
+    SM_CXSIZEFRAME = 32
+    SM_CYSIZEFRAME = 33
+    SM_CXPADDEDBORDER = 92
+    SW_SHOWMAXIMIZED = 3
+    DWMWA_WINDOW_CORNER_PREFERENCE = 33
+    DWMWA_BORDER_COLOR = 34
+    DWMWCP_ROUND = 2
+
+    def __init__(self) -> None:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        dwmapi = ctypes.WinDLL("dwmapi", use_last_error=True)
+        user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetWindowLongW.restype = wintypes.LONG
+        user32.SetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+        user32.SetWindowLongW.restype = wintypes.LONG
+        user32.GetClassLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.GetClassLongW.restype = wintypes.DWORD
+        user32.SetClassLongW.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.LONG]
+        user32.SetClassLongW.restype = wintypes.DWORD
+        user32.SetWindowPos.argtypes = [
+            wintypes.HWND,
+            wintypes.HWND,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.SetWindowPos.restype = wintypes.BOOL
+        user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+        user32.GetWindowRect.restype = wintypes.BOOL
+        user32.GetWindowPlacement.argtypes = [wintypes.HWND, ctypes.POINTER(_WINDOWPLACEMENT)]
+        user32.GetWindowPlacement.restype = wintypes.BOOL
+        user32.GetSystemMetrics.argtypes = [ctypes.c_int]
+        user32.GetSystemMetrics.restype = ctypes.c_int
+        dwmapi.DwmSetWindowAttribute.argtypes = [wintypes.HWND, wintypes.DWORD, ctypes.c_void_p, wintypes.DWORD]
+        dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
+        self._user32 = user32
+        self._dwmapi = dwmapi
+
+    def restore_window_styles(self, hwnd: int) -> None:
+        """Re-add the styles Qt's frameless hint strips (resize + snap + animations)."""
+        handle = wintypes.HWND(hwnd)
+        style = self._user32.GetWindowLongW(handle, self.GWL_STYLE)
+        wanted = (
+            style
+            | self.WS_THICKFRAME
+            | self.WS_CAPTION
+            | self.WS_MAXIMIZEBOX
+            | self.WS_MINIMIZEBOX
+            | self.WS_SYSMENU
+        )
+        if wanted != style:
+            self._user32.SetWindowLongW(handle, self.GWL_STYLE, wanted)
+        class_style = self._user32.GetClassLongW(handle, self.GCL_STYLE)
+        if not class_style & self.CS_DBLCLKS:
+            self._user32.SetClassLongW(handle, self.GCL_STYLE, class_style | self.CS_DBLCLKS)
+        self._user32.SetWindowPos(handle, None, 0, 0, 0, 0, self.SWP_FRAMECHANGED)
+
+    def apply_rounded_frame(self, hwnd: int, border_color: str) -> None:
+        """Round the corners (Win11) and paint a subtle neutral DWM border."""
+        handle = wintypes.HWND(hwnd)
+        preference = ctypes.c_int(self.DWMWCP_ROUND)
+        self._dwmapi.DwmSetWindowAttribute(
+            handle, self.DWMWA_WINDOW_CORNER_PREFERENCE, ctypes.byref(preference), ctypes.sizeof(preference)
+        )
+        color = QColor(border_color)
+        colorref = ctypes.c_uint((color.blue() << 16) | (color.green() << 8) | color.red())
+        self._dwmapi.DwmSetWindowAttribute(
+            handle, self.DWMWA_BORDER_COLOR, ctypes.byref(colorref), ctypes.sizeof(colorref)
+        )
+
+    def window_rect(self, hwnd: int) -> tuple[int, int, int, int] | None:
+        rect = wintypes.RECT()
+        if not self._user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(rect)):
+            return None
+        return rect.left, rect.top, rect.right, rect.bottom
+
+    def is_maximized(self, hwnd: int) -> bool:
+        placement = _WINDOWPLACEMENT()
+        placement.length = ctypes.sizeof(_WINDOWPLACEMENT)
+        if not self._user32.GetWindowPlacement(wintypes.HWND(hwnd), ctypes.byref(placement)):
+            return False
+        return placement.showCmd == self.SW_SHOWMAXIMIZED
+
+    def resize_border_thickness(self, device_pixel_ratio: float) -> tuple[int, int]:
+        padded = self._user32.GetSystemMetrics(self.SM_CXPADDEDBORDER)
+        thickness_x = self._user32.GetSystemMetrics(self.SM_CXSIZEFRAME) + padded
+        thickness_y = self._user32.GetSystemMetrics(self.SM_CYSIZEFRAME) + padded
+        fallback = max(1, round(8 * (device_pixel_ratio or 1.0)))
+        return (
+            thickness_x if thickness_x > 0 else fallback,
+            thickness_y if thickness_y > 0 else fallback,
+        )
+
+
+_WINDOWS_CHROME_API: _WindowsChromeApi | None = None
+_WINDOWS_CHROME_API_READY = False
+
+
+def _windows_chrome_api() -> _WindowsChromeApi | None:
+    """Return the cached Win32 chrome helper, or ``None`` off Windows."""
+    global _WINDOWS_CHROME_API, _WINDOWS_CHROME_API_READY
+    if not _WINDOWS_CHROME_API_READY:
+        _WINDOWS_CHROME_API_READY = True
+        if sys.platform == "win32":
+            _WINDOWS_CHROME_API = _WindowsChromeApi()
+    return _WINDOWS_CHROME_API
+
+
 class MainWindow(QMainWindow):
     def __init__(self, repository: ScheduleRepository) -> None:
         super().__init__()
@@ -2400,6 +2692,8 @@ class MainWindow(QMainWindow):
         self.compact_auto = False
         self.changing_mode = False
         self.closing = False
+        self._normal_window_size: QSize | None = None
+        self._suppress_normal_size_tracking = False
         self.break_until: datetime | None = None
         self.preferences = self.repository.get_preferences()
         stored_preferences = self._preferences_with_stored_media_assets(self.preferences)
@@ -2424,7 +2718,7 @@ class MainWindow(QMainWindow):
         self.quick_note_trash_window: QDialog | None = None
         self.compact_widget_window: QDialog | None = None
         self.startup_refresh_pending = False
-        self._resize_cursor_widget: QWidget | None = None
+        self._screen_change_connected = False
 
         self.setWindowTitle(self.preferences.app_title)
         self.setMinimumSize(QSize(430, 320))
@@ -2432,7 +2726,6 @@ class MainWindow(QMainWindow):
         self.setStatusBar(QStatusBar(self))
         self._initialize_focus_timer()
         self._build_ui()
-        self._install_window_resize_filter()
         self.restore_last_window_size()
         self.apply_preferences(refresh_content=False)
         self.restore_last_layout_state()
@@ -2597,6 +2890,7 @@ class MainWindow(QMainWindow):
         bar = AppChromeBar()
         bar.setObjectName("appChromeBar")
         bar.setFixedHeight(56)
+        self.app_chrome_bar = bar
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(16, 0, 8, 0)
         layout.setSpacing(12)
@@ -2754,12 +3048,12 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(14, 10, 14, 10)
         layout.setSpacing(2)
 
-        self.current_date_label = QLabel()
+        self.current_date_label = OutlinedTextLabel()
         self.current_date_label.setObjectName("currentDateLabel")
         self.current_date_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.current_date_label)
 
-        self.current_time_label = QLabel()
+        self.current_time_label = OutlinedTextLabel()
         self.current_time_label.setObjectName("currentTimeLabel")
         self.current_time_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         layout.addWidget(self.current_time_label)
@@ -3216,10 +3510,11 @@ class MainWindow(QMainWindow):
         self.focus_title_edit.setPlaceholderText("지금 집중할 일")
         _stabilize_control(self.focus_title_edit, 120)
         self.focus_title_edit.setMinimumWidth(0)
-        self.focus_task_label = QLabel("할 일")
+        self.focus_title_edit.setCursor(Qt.CursorShape.IBeamCursor)
+        self.focus_task_label = QLabel("", form_panel)
         self.focus_task_label.setObjectName("formLabel")
-        form.addWidget(self.focus_task_label, 0, 0)
-        form.addWidget(self.focus_title_edit, 0, 1, 1, 3)
+        self.focus_task_label.hide()
+        form.addWidget(self.focus_title_edit, 0, 0, 1, 4)
 
         self.target_combo = QComboBox()
         self.target_combo.setObjectName("focusTargetCombo")
@@ -3229,6 +3524,8 @@ class MainWindow(QMainWindow):
         self.target_combo.setMinimumWidth(0)
         self.target_combo.view().setObjectName("focusTargetComboView")
         self.target_combo.view().setSpacing(0)
+        self.target_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.target_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
         self.target_combo.activated.connect(lambda _index: self.add_focus_target_from_combo())
         self.target_combo.view().pressed.connect(self.add_focus_target_from_combo_index)
         self.use_focus_target_check = QCheckBox("화면 지정 사용")
@@ -3266,9 +3563,10 @@ class MainWindow(QMainWindow):
         _stabilize_control(self.remove_target_button, 64)
         self.remove_target_button.clicked.connect(self.remove_selected_focus_target)
         self.remove_target_button.hide()
-        self.focus_targets_label = QLabel("지정 창")
-        form.addWidget(self.focus_targets_label, 2, 0)
-        form.addWidget(self.focus_targets_list, 2, 1, 1, 3)
+        self.focus_targets_label = QLabel("", form_panel)
+        self.focus_targets_label.setObjectName("formLabel")
+        self.focus_targets_label.hide()
+        form.addWidget(self.focus_targets_list, 2, 0, 1, 4)
 
         self.planned_minutes_spin = QSpinBox()
         self.planned_minutes_spin.setObjectName("focusDurationSpin")
@@ -3497,17 +3795,15 @@ class MainWindow(QMainWindow):
                 form.setColumnStretch(1, 1)
                 form.setColumnStretch(2, 1)
                 form.setColumnStretch(3, 1)
-                form.addWidget(self.focus_task_label, 0, 0, 1, 4)
-                form.addWidget(self.focus_title_edit, 1, 0, 1, 4)
-                form.addWidget(self.use_focus_target_check, 2, 0, 1, 4)
-                form.addWidget(self.target_combo, 3, 0, 1, 4)
-                form.addWidget(self.target_action_box, 4, 0, 1, 4)
-                form.addWidget(self.focus_targets_label, 5, 0, 1, 4)
-                form.addWidget(self.focus_targets_list, 6, 0, 1, 4)
-                form.addWidget(self.planned_minutes_label, 7, 0)
-                form.addWidget(self.planned_minutes_spin, 7, 1)
-                form.addWidget(self.idle_cutoff_label, 7, 2)
-                form.addWidget(self.idle_cutoff_spin, 7, 3)
+                form.addWidget(self.focus_title_edit, 0, 0, 1, 4)
+                form.addWidget(self.use_focus_target_check, 1, 0, 1, 4)
+                form.addWidget(self.target_combo, 2, 0, 1, 4)
+                form.addWidget(self.target_action_box, 3, 0, 1, 4)
+                form.addWidget(self.focus_targets_list, 4, 0, 1, 4)
+                form.addWidget(self.planned_minutes_label, 5, 0)
+                form.addWidget(self.planned_minutes_spin, 5, 1)
+                form.addWidget(self.idle_cutoff_label, 5, 2)
+                form.addWidget(self.idle_cutoff_spin, 5, 3)
             else:
                 form.setColumnMinimumWidth(0, 58)
                 form.setColumnMinimumWidth(1, 90)
@@ -3517,13 +3813,11 @@ class MainWindow(QMainWindow):
                 form.setColumnStretch(1, 3)
                 form.setColumnStretch(2, 2)
                 form.setColumnStretch(3, 2)
-                form.addWidget(self.focus_task_label, 0, 0)
-                form.addWidget(self.focus_title_edit, 0, 1, 1, 3)
+                form.addWidget(self.focus_title_edit, 0, 0, 1, 4)
                 form.addWidget(self.use_focus_target_check, 1, 0)
                 form.addWidget(self.target_combo, 1, 1, 1, 2)
                 form.addWidget(self.target_action_box, 1, 3)
-                form.addWidget(self.focus_targets_label, 2, 0)
-                form.addWidget(self.focus_targets_list, 2, 1, 1, 3)
+                form.addWidget(self.focus_targets_list, 2, 0, 1, 4)
                 form.addWidget(self.planned_minutes_label, 3, 0)
                 form.addWidget(self.planned_minutes_spin, 3, 1)
                 form.addWidget(self.idle_cutoff_label, 3, 2)
@@ -3564,7 +3858,7 @@ class MainWindow(QMainWindow):
         self.focus_header_label.setVisible(False)
         self.focus_form_panel.setVisible(not micro)
         self.focus_title_label.setVisible(True)
-        self.focus_task_label.setVisible(not tiny)
+        self.focus_task_label.setVisible(False)
         self.focus_title_edit.setVisible(not micro)
         self.use_focus_target_check.setVisible(not dense)
         for widget in (
@@ -3572,11 +3866,11 @@ class MainWindow(QMainWindow):
             self.add_target_button,
             self.target_refresh_button,
             self.target_action_box,
-            self.focus_targets_label,
             self.focus_targets_list,
         ):
             widget.setVisible(target_controls_visible)
             widget.setEnabled(self.use_focus_target_check.isChecked())
+        self.focus_targets_label.setVisible(False)
         self.remove_target_button.hide()
         self.planned_minutes_label.setVisible(not tiny)
         self.planned_minutes_spin.setVisible(not micro)
@@ -3711,6 +4005,7 @@ class MainWindow(QMainWindow):
         self.pomodoro_detail_label.setObjectName("pomodoroDetail")
         self.pomodoro_detail_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.pomodoro_detail_label.setWordWrap(True)
+        self.pomodoro_detail_label.hide()
         timer_card_layout.addWidget(self.pomodoro_detail_label)
         layout.addWidget(timer_card)
 
@@ -3804,7 +4099,7 @@ class MainWindow(QMainWindow):
         direction = QBoxLayout.Direction.TopToBottom if tiny else QBoxLayout.Direction.LeftToRight
         self.pomodoro_input_row.setDirection(direction)
         self.pomodoro_button_row.setDirection(direction)
-        self.pomodoro_detail_label.setVisible(not tiny)
+        self.pomodoro_detail_label.setVisible(False)
         self.pomodoro_status_label.setVisible(not tiny)
         if tiny:
             self.pomodoro_time_label.setStyleSheet("font-size: 22px;")
@@ -3953,6 +4248,8 @@ class MainWindow(QMainWindow):
         self.quick_note_folder_combo.setObjectName("quickNoteFolderCombo")
         _stabilize_control(self.quick_note_folder_combo, 118)
         self.quick_note_folder_combo.setMaximumWidth(172)
+        self.quick_note_folder_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.quick_note_folder_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
         self.quick_note_folder_combo.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.quick_note_folder_combo.customContextMenuRequested.connect(
             lambda position: self.show_note_folder_combo_context_menu(self.quick_note_folder_combo, position)
@@ -3984,6 +4281,7 @@ class MainWindow(QMainWindow):
         self.quick_note_editor.setObjectName("memoInput")
         self.quick_note_editor.setPlaceholderText("생각나는 것을 적고 Ctrl+Enter로 저장")
         self.quick_note_editor.setMinimumHeight(56)
+        self.quick_note_editor.setCursor(Qt.CursorShape.IBeamCursor)
         memo_editor_layout.addWidget(self.quick_note_editor, 1)
 
         self.pending_attachments_label = QLabel("")
@@ -4015,6 +4313,8 @@ class MainWindow(QMainWindow):
         notes_filter_row.addStretch(1)
         self.note_filter_combo = QComboBox()
         _stabilize_control(self.note_filter_combo, 150)
+        self.note_filter_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.note_filter_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
         self.note_filter_combo.currentIndexChanged.connect(lambda _index: self.refresh_notes())
         folder_view_button = QPushButton("폴더 보기")
         folder_view_button.setObjectName("ghostButton")
@@ -4402,12 +4702,19 @@ class MainWindow(QMainWindow):
             QScrollArea#fullScrollArea::viewport {
                 background: #ececed;
             }
-            QWidget#appShell, QWidget#appBody, QWidget#workspace {
+            QWidget#appShell {
+                background: #fbfbfc;
+                border: 1px solid #d4d4da;
+                border-radius: 8px;
+            }
+            QWidget#appBody, QWidget#workspace {
                 background: #fbfbfc;
             }
             QWidget#appChromeBar {
                 background: #ffffff;
                 border-bottom: 1px solid #f0f0f3;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
             }
             QWidget#featureGrid {
                 background: transparent;
@@ -5939,6 +6246,19 @@ class MainWindow(QMainWindow):
             self.header_banner_widget.set_theme(accent, palette["border"], palette["surface_2"])
         self.update_focus_rate_display_mode()
         self.sync_theme_segment()
+        datetime_outline_color = _normalize_optional_color(
+            getattr(self.preferences, "datetime_panel_text_outline_color", "")
+        )
+        datetime_outline_thickness = _normalize_datetime_text_outline_thickness(
+            getattr(self.preferences, "datetime_panel_text_outline_thickness", 0)
+        )
+        for datetime_label in (
+            getattr(self, "current_date_label", None),
+            getattr(self, "current_time_label", None),
+        ):
+            if isinstance(datetime_label, OutlinedTextLabel):
+                datetime_label.set_text_fill_color(datetime_text_color)
+                datetime_label.set_text_outline(datetime_outline_color, datetime_outline_thickness)
 
     def update_focus_rate_display_mode(self) -> None:
         stack = getattr(self, "focus_ratio_stack", None)
@@ -6013,12 +6333,16 @@ class MainWindow(QMainWindow):
     def restore_last_window_size(self) -> None:
         width = min(4000, max(430, int(self.preferences.last_window_width or 1280)))
         height = min(3000, max(320, int(self.preferences.last_window_height or 820)))
+        self._normal_window_size = QSize(width, height)
         self.resize(width, height)
 
     def save_last_window_size(self) -> None:
-        geometry = self.normalGeometry() if self.isMaximized() or self.isFullScreen() else self.geometry()
-        width = geometry.width() if geometry.isValid() else self.width()
-        height = geometry.height() if geometry.isValid() else self.height()
+        if self._is_effectively_maximized() and self._normal_window_size is not None:
+            width = self._normal_window_size.width()
+            height = self._normal_window_size.height()
+        else:
+            width = self.width()
+            height = self.height()
         width = min(4000, max(430, int(width)))
         height = min(3000, max(320, int(height)))
         if width == self.preferences.last_window_width and height == self.preferences.last_window_height:
@@ -7506,87 +7830,186 @@ class MainWindow(QMainWindow):
         self._sync_always_on_top_checks()
 
     def toggle_max_restore(self) -> None:
-        if self.isMaximized():
-            self.showNormal()
+        if self._is_effectively_maximized():
+            self._restore_normal_window_size()
         else:
+            self._remember_normal_window_size()
             self.showMaximized()
         self._sync_max_restore_button()
 
     def _sync_max_restore_button(self) -> None:
         button = getattr(self, "window_maximize_button", None)
         if isinstance(button, WindowControlButton):
-            button.set_control_kind("restore" if self.isMaximized() else "maximize")
-            button.setToolTip("이전 크기로" if self.isMaximized() else "최대화")
+            maximized = self._is_effectively_maximized()
+            button.set_control_kind("restore" if maximized else "maximize")
+            button.setToolTip("이전 크기로" if maximized else "최대화")
+
+    def _native_window_handle(self) -> int:
+        # Resolve the HWND only for a real, already-realized Windows window. This
+        # keeps offscreen/non-Windows runs free of winId() side effects and gives
+        # tests one seam to stub the handle without poking winId().
+        if QGuiApplication.platformName() != "windows":
+            return 0
+        if not self.isVisible():
+            return 0
+        return int(self.winId())
+
+    def _is_native_maximized(self) -> bool:
+        # The frameless chrome maximizes through Win32, which can leave Qt's
+        # isMaximized() reporting False while GetWindowPlacement reports maximized.
+        api = _windows_chrome_api()
+        if api is None:
+            return False
+        hwnd = self._native_window_handle()
+        if not hwnd:
+            return False
+        return bool(api.is_maximized(hwnd))
+
+    def _is_effectively_maximized(self) -> bool:
+        # The frameless chrome's maximize can land the window in Qt's
+        # WindowMaximized state, Qt's WindowFullScreen state (what showMaximized()
+        # actually yields on real Windows here), or a Win32 SW_SHOWMAXIMIZED
+        # placement. Any of them means the restore control should collapse it.
+        return self.isMaximized() or self.isFullScreen() or self._is_native_maximized()
+
+    def _remember_normal_window_size(self) -> None:
+        if getattr(self, "_suppress_normal_size_tracking", False):
+            return
+        if self._is_effectively_maximized():
+            return
+        size = self.size()
+        if size.width() <= 0 or size.height() <= 0:
+            return
+        self._normal_window_size = QSize(size.width(), size.height())
+
+    def _restore_normal_window_size(self) -> None:
+        target = self._normal_window_size
+        self._suppress_normal_size_tracking = True
+        try:
+            if self._is_native_maximized() and not self.isMaximized():
+                # Qt thinks the frameless window is normal while the Win32 placement
+                # is maximized; sync Qt up so showNormal() issues a real SW_SHOWNORMAL
+                # and actually clears the native maximized placement.
+                self.setWindowState(self.windowState() | Qt.WindowState.WindowMaximized)
+            self.showNormal()
+            if target is not None:
+                self.resize(target.width(), target.height())
+        finally:
+            self._suppress_normal_size_tracking = False
+        if target is not None:
+            self._normal_window_size = QSize(target.width(), target.height())
 
     def changeEvent(self, event) -> None:
         super().changeEvent(event)
         if event.type() == QEvent.Type.WindowStateChange:
             self._sync_max_restore_button()
 
-    def _install_window_resize_filter(self) -> None:
-        surfaces: list[QWidget] = []
-        central = self.centralWidget()
-        if central is not None:
-            surfaces.append(central)
-            surfaces.extend(central.findChildren(QWidget))
-        status_bar = self.statusBar()
-        if status_bar is not None:
-            surfaces.append(status_bar)
-        for surface in surfaces:
-            if _is_resize_eligible_widget(surface):
-                surface.setMouseTracking(True)
-                surface.installEventFilter(self)
-
-    def eventFilter(self, watched, event) -> bool:
-        if isinstance(watched, QWidget) and self._handle_window_resize_event(watched, event):
-            return True
-        return super().eventFilter(watched, event)
-
-    def _handle_window_resize_event(self, watched: QWidget, event) -> bool:
-        event_type = event.type()
-        if event_type == QEvent.Type.MouseButtonPress:
-            return self._begin_window_resize(watched, event)
-        if event_type == QEvent.Type.MouseMove:
-            self._update_resize_cursor(watched, event)
-            return False
-        if event_type == QEvent.Type.Leave:
-            self._clear_resize_cursor()
-            return False
-        return False
-
-    def _resize_edges_at_global(self, watched: QWidget, global_point: QPoint) -> Qt.Edge:
-        if self.isMaximized() or self.isFullScreen():
-            return Qt.Edge(0)
-        if not _is_resize_eligible_widget(watched):
-            return Qt.Edge(0)
-        return _resize_edges_for_point(self.mapFromGlobal(global_point), self.size())
-
-    def _update_resize_cursor(self, watched: QWidget, event) -> None:
-        edges = self._resize_edges_at_global(watched, event.globalPosition().toPoint())
-        cursor_shape = _cursor_for_resize_edges(edges)
-        if cursor_shape is None:
-            self._clear_resize_cursor()
-            return
-        if self._resize_cursor_widget is not None and self._resize_cursor_widget is not watched:
-            self._resize_cursor_widget.unsetCursor()
-        watched.setCursor(cursor_shape)
-        self._resize_cursor_widget = watched
-
-    def _clear_resize_cursor(self) -> None:
-        if self._resize_cursor_widget is not None:
-            self._resize_cursor_widget.unsetCursor()
-            self._resize_cursor_widget = None
-
-    def _begin_window_resize(self, watched: QWidget, event) -> bool:
-        if event.button() != Qt.MouseButton.LeftButton:
-            return False
-        edges = self._resize_edges_at_global(watched, event.globalPosition().toPoint())
-        if not edges:
-            return False
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # The platform HWND exists by now (and is rebuilt whenever a window flag
+        # such as "always on top" toggles), so (re)apply the native frame here.
+        self._apply_windows_native_chrome()
         handle = self.windowHandle()
-        if handle is None:
+        if handle is not None and not self._screen_change_connected:
+            handle.screenChanged.connect(self._on_window_screen_changed)
+            self._screen_change_connected = True
+
+    def _on_window_screen_changed(self, _screen) -> None:
+        # A DPI change alters the resize-border metrics; reassert the frame.
+        self._apply_windows_native_chrome()
+
+    def _apply_windows_native_chrome(self) -> None:
+        if QGuiApplication.platformName() != "windows":
+            return
+        api = _windows_chrome_api()
+        if api is None:
+            return
+        hwnd = int(self.winId())
+        if not hwnd:
+            return
+        api.restore_window_styles(hwnd)
+        api.apply_rounded_frame(hwnd, WINDOW_FRAME_BORDER_COLOR)
+
+    def nativeEvent(self, event_type, message):
+        if _is_windows_native_event_type(event_type):
+            result = self._handle_windows_native_message(message)
+            if result is not None:
+                return True, result
+        return super().nativeEvent(event_type, message)
+
+    def _handle_windows_native_message(self, message) -> int | None:
+        msg = wintypes.MSG.from_address(_native_message_address(message))
+        message_id = msg.message
+        if message_id != _WM_NCCALCSIZE and message_id != _WM_NCHITTEST:
+            return None
+        api = _windows_chrome_api()
+        if api is None:
+            return None
+        hwnd = int(msg.hWnd) if msg.hWnd else 0
+        if not hwnd:
+            return None
+        if message_id == _WM_NCCALCSIZE:
+            return self._native_nccalcsize(api, hwnd, msg)
+        return self._native_nchittest(api, hwnd, msg)
+
+    def _native_nccalcsize(self, api: _WindowsChromeApi, hwnd: int, msg) -> int | None:
+        # Returning 0 keeps the whole window as client area (no native title bar);
+        # a maximized window must inset by the frame metrics so it does not bleed
+        # past the work area.
+        if not msg.wParam:
+            return None
+        client = _NCCALCSIZE_PARAMS.from_address(int(msg.lParam)).rgrc[0]
+        if api.is_maximized(hwnd) and not self.isFullScreen():
+            thickness_x, thickness_y = api.resize_border_thickness(self.devicePixelRatioF())
+            client.left += thickness_x
+            client.right -= thickness_x
+            client.top += thickness_y
+            client.bottom -= thickness_y
+        return 0
+
+    def _native_nchittest(self, api: _WindowsChromeApi, hwnd: int, msg) -> int | None:
+        if self.isFullScreen():
+            return None
+        rect = api.window_rect(hwnd)
+        if rect is None:
+            return None
+        left, top, right, bottom = rect
+        screen_x, screen_y = _screen_point_from_lparam(int(msg.lParam))
+        device_pixel_ratio = self.devicePixelRatioF() or 1.0
+        physical_point = QPoint(screen_x - left, screen_y - top)
+        physical_size = QSize(right - left, bottom - top)
+        margin = max(2, round(WINDOW_RESIZE_MARGIN * device_pixel_ratio))
+        logical_point = QPoint(
+            round(physical_point.x() / device_pixel_ratio),
+            round(physical_point.y() / device_pixel_ratio),
+        )
+        result = _window_hit_test_result(
+            physical_point,
+            physical_size,
+            margin=margin,
+            on_caption=self._point_is_caption(logical_point),
+            resizable=not self.isMaximized(),
+        )
+        return None if result == HTCLIENT else result
+
+    def _point_is_caption(self, local_point: QPoint) -> bool:
+        """True only when ``local_point`` lands on the chrome bar's drag surface.
+
+        Interactive children (window controls, menu buttons, the pin checkbox)
+        short-circuit to ``False`` so they keep receiving their own clicks; the
+        brand lockup and empty bar walk up to the chrome bar and become caption.
+        """
+        chrome_bar = getattr(self, "app_chrome_bar", None)
+        if not isinstance(chrome_bar, QWidget) or not chrome_bar.isVisible():
             return False
-        return bool(handle.startSystemResize(edges))
+        node = self.childAt(local_point)
+        while isinstance(node, QWidget):
+            if node is chrome_bar:
+                return True
+            if not _is_resize_eligible_widget(node):
+                return False
+            node = node.parentWidget()
+        return False
 
     def hide_feature_from_main(self, feature_key: str) -> None:
         attribute = self._feature_visibility_attribute(feature_key)
@@ -10513,7 +10936,8 @@ class MainWindow(QMainWindow):
         if hasattr(self, "pomodoro_progress"):
             self.pomodoro_progress.setValue(progress)
         if hasattr(self, "pomodoro_detail_label"):
-            self.pomodoro_detail_label.setText(detail)
+            self.pomodoro_detail_label.setText("")
+            self.pomodoro_detail_label.setVisible(False)
         self.update_pomodoro_controls()
         self.refresh_feature_widget("pomodoro")
 
@@ -10965,7 +11389,7 @@ class MainWindow(QMainWindow):
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        return
+        self._remember_normal_window_size()
 
     def closeEvent(self, event) -> None:
         self.save_last_window_size()
@@ -13517,6 +13941,7 @@ class TodayChecklistWidget(QWidget):
         self.new_task_edit.setObjectName("checklistInput")
         self.new_task_edit.setPlaceholderText("오늘 항목 추가")
         _stabilize_control(self.new_task_edit, 160)
+        self.new_task_edit.setCursor(Qt.CursorShape.IBeamCursor)
         self.new_task_edit.returnPressed.connect(self.add_today_task)
         add_button = QPushButton("추가")
         add_button.setObjectName("checklistAddButton")
@@ -14063,6 +14488,8 @@ class TodayTimelineWidget(QWidget):
         filter_row.addWidget(filter_segment)
         self.timeline_filter_combo = QComboBox()
         self.timeline_filter_combo.setObjectName("timelineFilterCombo")
+        self.timeline_filter_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.timeline_filter_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
         self.timeline_filter_combo.addItem("전체", "all")
         self.timeline_filter_combo.addItem("항목", "schedule_task")
         self.timeline_filter_combo.addItem("완료", "completed")
@@ -14080,6 +14507,8 @@ class TodayTimelineWidget(QWidget):
 
         self.block_table = QTableWidget(24, 7)
         self.block_table.setObjectName("timeBlockTable")
+        self.block_table.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.block_table.viewport().setCursor(Qt.CursorShape.PointingHandCursor)
         self.block_table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.block_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.block_table.setHorizontalHeaderLabels(["시간", "00", "10", "20", "30", "40", "50"])
@@ -14383,10 +14812,13 @@ class TodayTimelineWidget(QWidget):
         self.timeline_event_type_combo = QComboBox()
         _populate_item_type_combo(self.timeline_event_type_combo, self.repository, "task")
         _stabilize_control(self.timeline_event_type_combo, 96)
+        self.timeline_event_type_combo.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.timeline_event_type_combo.view().setCursor(Qt.CursorShape.PointingHandCursor)
         self.timeline_event_edit = QLineEdit()
         self.timeline_event_edit.setMinimumWidth(0)
         self.timeline_event_edit.setPlaceholderText("시간 있는 항목 추가")
         _stabilize_control(self.timeline_event_edit, 120)
+        self.timeline_event_edit.setCursor(Qt.CursorShape.IBeamCursor)
         self.timeline_event_time = QTimeEdit()
         self.timeline_event_time.setDisplayFormat(_time_edit_display_format(self._preferences()))
         self.timeline_event_time.setTime(QTime.currentTime())
@@ -16310,6 +16742,9 @@ class SettingsDialog(QDialog):
         self.table_color = _normalize_optional_color(preferences.table_color)
         self.text_color = _normalize_optional_color(preferences.text_color)
         self.datetime_text_color = _normalize_optional_color(getattr(preferences, "datetime_panel_text_color", ""))
+        self.datetime_text_outline_color = _normalize_optional_color(
+            getattr(preferences, "datetime_panel_text_outline_color", "")
+        )
         color_form.addRow(
             self._build_color_group(
                 "전체 색",
@@ -16383,6 +16818,23 @@ class SettingsDialog(QDialog):
         display_form.addRow("시간 패널 테두리", self.datetime_border_check)
 
         display_form.addRow("시간 글자색", self._build_color_control("datetime_text", "", "시간 글자색"))
+
+        display_form.addRow(
+            "시간 글자 외곽선색",
+            self._build_color_control("datetime_text_outline", "", "시간 글자 외곽선색"),
+        )
+
+        self.datetime_text_outline_thickness_spin = QSpinBox()
+        self.datetime_text_outline_thickness_spin.setObjectName("datetimeTextOutlineThicknessSpin")
+        self.datetime_text_outline_thickness_spin.setRange(0, 12)
+        self.datetime_text_outline_thickness_spin.setValue(
+            _normalize_datetime_text_outline_thickness(
+                getattr(preferences, "datetime_panel_text_outline_thickness", 0)
+            )
+        )
+        self.datetime_text_outline_thickness_spin.setSuffix("px")
+        _stabilize_control(self.datetime_text_outline_thickness_spin, 92)
+        display_form.addRow("시간 글자 외곽선 두께", self.datetime_text_outline_thickness_spin)
 
         datetime_font_row = QWidget()
         datetime_font_layout = QHBoxLayout(datetime_font_row)
@@ -16872,6 +17324,7 @@ class SettingsDialog(QDialog):
         self.set_setting_color("table", preferences.table_color)
         self.set_setting_color("text", preferences.text_color)
         self.set_setting_color("datetime_text", getattr(preferences, "datetime_panel_text_color", ""))
+        self.set_setting_color("datetime_text_outline", getattr(preferences, "datetime_panel_text_outline_color", ""))
         time_index = self.time_format_combo.findData(preferences.time_format)
         self.time_format_combo.setCurrentIndex(max(0, time_index))
         theme_index = self.theme_combo.findData(_normalize_theme(preferences.appearance_theme))
@@ -16893,6 +17346,11 @@ class SettingsDialog(QDialog):
         self.datetime_font_combo.setEnabled(not self.use_default_datetime_font_check.isChecked())
         self.datetime_font_size_spin.setValue(
             _normalize_datetime_panel_font_size(getattr(preferences, "datetime_panel_font_size", 24))
+        )
+        self.datetime_text_outline_thickness_spin.setValue(
+            _normalize_datetime_text_outline_thickness(
+                getattr(preferences, "datetime_panel_text_outline_thickness", 0)
+            )
         )
         self.set_datetime_background_image_path(getattr(preferences, "datetime_panel_background_image_path", ""))
         self.media_rounded_corners_check.setChecked(getattr(preferences, "media_rounded_corners", True))
@@ -16938,6 +17396,8 @@ class SettingsDialog(QDialog):
             datetime_panel_border_enabled=self.datetime_border_check.isChecked(),
             datetime_panel_transparent_background=self.datetime_transparent_check.isChecked(),
             datetime_panel_text_color=self.datetime_text_color,
+            datetime_panel_text_outline_color=self.datetime_text_outline_color,
+            datetime_panel_text_outline_thickness=self.datetime_text_outline_thickness_spin.value(),
             datetime_panel_font_family="" if self.use_default_datetime_font_check.isChecked() else self.datetime_font_combo.currentFont().family(),
             datetime_panel_font_size=self.datetime_font_size_spin.value(),
             datetime_panel_background_image_path=self.datetime_background_path_edit.text().strip(),
@@ -17823,15 +18283,51 @@ def _normalize_datetime_panel_font_size(value: object) -> int:
     return min(72, max(12, size))
 
 
+def _normalize_datetime_text_outline_thickness(value: object) -> int:
+    try:
+        thickness = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return min(12, max(0, thickness))
+
+
 def _normalize_main_font_family(value: object) -> str:
     family = str(value or "").strip()
     family = "".join(character for character in family if character not in "{};")
     return family[:80]
 
 
+def _available_korean_font_families() -> tuple[str, ...]:
+    global _korean_font_load_attempted, _loaded_korean_font_families
+    if _loaded_korean_font_families or _korean_font_load_attempted or QGuiApplication.instance() is None:
+        return _loaded_korean_font_families
+    _korean_font_load_attempted = True
+    fonts_dir = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+    families: list[str] = []
+    for file_name in KOREAN_FONT_FILES:
+        font_path = fonts_dir / file_name
+        if not font_path.exists():
+            continue
+        font_id = QFontDatabase.addApplicationFont(str(font_path))
+        if font_id < 0:
+            continue
+        families.extend(QFontDatabase.applicationFontFamilies(font_id))
+    unique_families: list[str] = []
+    for font_family in families:
+        if font_family and font_family not in unique_families:
+            unique_families.append(font_family)
+    _loaded_korean_font_families = tuple(unique_families)
+    return _loaded_korean_font_families
+
+
 def _css_font_stack(font_family: object) -> str:
     family = _normalize_main_font_family(font_family)
-    default_stack = '"Pretendard", "Segoe UI", "Malgun Gothic", sans-serif'
+    default_families = [*_available_korean_font_families(), "Malgun Gothic", "Pretendard", "Segoe UI"]
+    unique_families: list[str] = []
+    for default_family in default_families:
+        if default_family and default_family not in unique_families:
+            unique_families.append(default_family)
+    default_stack = ", ".join(f'"{default_family}"' for default_family in unique_families) + ", sans-serif"
     if not family:
         return default_stack
     escaped = family.replace("\\", "\\\\").replace('"', '\\"')
