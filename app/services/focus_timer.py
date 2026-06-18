@@ -289,6 +289,6 @@ def _is_schedule_helper_window(process_name: str, window_title: str) -> bool:
     title = window_title.strip().casefold()
     if process.startswith("schedulehelper"):
         return True
-    if process in {"python.exe", "pythonw.exe"} and ("schedule helper" in title or "focus desk" in title):
+    if process in {"python.exe", "pythonw.exe"} and ("schedule helper" in title or "오롯" in title):
         return True
     return False
