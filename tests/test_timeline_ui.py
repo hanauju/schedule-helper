@@ -1,6 +1,7 @@
 import ctypes
 import json
 import os
+import re
 from ctypes import wintypes
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -8,7 +9,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QSize, Qt, QTime
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -62,6 +63,8 @@ from app.ui.main_window import (
     ItemTypeSettingsDialog,
     LayoutProfileLoadDialog,
     MainWindow,
+    NoScrollFontComboBox,
+    NoScrollSpinBox,
     OutlinedTextLabel,
     QuickNoteDetailDialog,
     QuickNoteFolderNotesDialog,
@@ -1355,6 +1358,79 @@ def test_settings_live_preview_updates_main_window_without_saving(tmp_path) -> N
     window.close()
 
 
+def test_settings_background_live_preview_paints_main_shell_without_saving(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    dialog.set_setting_color("background", "#112233")
+    app.processEvents()
+
+    style = window.styleSheet()
+    shell_block = re.search(r"QWidget#appShell \{([^}]*)\}", style)
+    body_block = re.search(r"QWidget#appBody, QWidget#workspace \{([^}]*)\}", style)
+    main_block = re.search(r"QMainWindow \{([^}]*)\}", style)
+    widget_block = re.search(r"QWidget \{([^}]*)\}", style)
+
+    assert window.preferences.background_color == "#112233"
+    assert shell_block is not None and "#112233" in shell_block.group(1)
+    assert body_block is not None and "#112233" in body_block.group(1)
+    assert main_block is not None and "#112233" in main_block.group(1)
+    assert widget_block is not None and "color: #eef4ef;" in widget_block.group(1)
+    assert repository.get_preferences().background_color == ""
+
+    dialog.close()
+    window.close()
+
+
+def test_settings_inner_background_field_preserved_without_ui_control(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.inner_background_color = "#0a1b2c"
+    repository.save_preferences(preferences)
+
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    assert getattr(dialog, "inner_background_swatch", None) is None
+    assert dialog.preferences().inner_background_color == "#0a1b2c"
+
+    dialog.close()
+
+
+def test_saved_inner_background_does_not_override_visible_background(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.background_color = "#112233"
+    preferences.inner_background_color = "#0a1b2c"
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    style = window.styleSheet()
+    shell_block = re.search(r"QWidget#appShell \{([^}]*)\}", style)
+    body_block = re.search(r"QWidget#appBody, QWidget#workspace \{([^}]*)\}", style)
+
+    assert window.preferences.inner_background_color == "#0a1b2c"
+    assert shell_block is not None and "#112233" in shell_block.group(1)
+    assert body_block is not None and "#112233" in body_block.group(1)
+    assert "#0a1b2c" not in shell_block.group(1)
+    assert "#0a1b2c" not in body_block.group(1)
+
+    window.close()
+
+
 def test_datetime_panel_live_preview_applies_text_style(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -2008,7 +2084,7 @@ def test_integrated_widget_layout_and_memo_folder_actions(tmp_path) -> None:
     memo_buttons = {button.text() for button in window.memo_panel.findChildren(QPushButton)}
     assert "폴더 보기" in memo_buttons
     assert "폴더 관리" not in memo_buttons
-    assert "쓰레기통" in memo_buttons
+    assert "쓰레기통" not in memo_buttons
     assert window.memo_panel.findChild(QWidget, "memoFolderStrip") is None
 
     window.open_compact_widget()
@@ -2162,6 +2238,37 @@ def test_note_trash_soft_delete_restore_and_permanent_delete(tmp_path, monkeypat
     window.close()
 
 
+def test_note_folder_window_trash_button_opens_main_trash(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = QuickNoteFolderNotesDialog(repository, window, on_changed=window.refresh_quick_note_views)
+    dialog.show()
+    app.processEvents()
+
+    trash_button = dialog.findChild(QPushButton, "quickNoteFolderTrashButton")
+    assert trash_button is not None
+    assert trash_button.text() == "쓰레기통"
+
+    assert window.quick_note_trash_window is None
+    trash_button.click()
+    app.processEvents()
+
+    trash_window = window.quick_note_trash_window
+    assert isinstance(trash_window, QuickNoteTrashDialog)
+
+    trash_button.click()
+    app.processEvents()
+    assert window.quick_note_trash_window is trash_window
+
+    trash_window.close()
+    dialog.close()
+    window.close()
+
+
 def test_quick_memo_editor_ports_compact_header_actions(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -2177,14 +2284,11 @@ def test_quick_memo_editor_ports_compact_header_actions(tmp_path) -> None:
     assert window.memo_attach_button.parentWidget() is window.memo_editor_header
     assert window.memo_folder_view_button.parentWidget() is window.memo_history_card
     assert window.memo_folder_settings_button.parentWidget() is None
-    assert window.memo_trash_button.parentWidget() is window.memo_history_card
     assert window.memo_save_button.maximumWidth() == 76
     assert window.memo_attach_button.maximumWidth() == 76
     assert window.memo_folder_view_button.maximumWidth() <= 86
-    assert window.memo_trash_button.maximumWidth() <= 86
     assert window.memo_history_filter_row.indexOf(window.note_filter_combo) == window.memo_history_filter_row.count() - 1
     assert window.memo_history_filter_row.indexOf(window.memo_folder_view_button) < window.memo_history_filter_row.indexOf(window.note_filter_combo)
-    assert window.memo_history_filter_row.indexOf(window.memo_trash_button) < window.memo_history_filter_row.indexOf(window.note_filter_combo)
     assert window.memo_panel.findChild(QWidget, "memoFolderStrip") is None
     assert 40 <= window.quick_note_editor.minimumHeight() <= 64
     splitter_sizes = window.memo_splitter.sizes()
@@ -2243,7 +2347,6 @@ def test_quick_memo_prioritizes_editor_when_tiny(tmp_path) -> None:
     assert window.memo_shortcut_label.isHidden()
     assert window.memo_folder_view_button.isHidden()
     assert window.memo_folder_settings_button.isHidden()
-    assert window.memo_trash_button.isHidden()
     assert window.quick_note_editor.isVisible()
     assert window.quick_note_editor.minimumHeight() == 40
     assert window.memo_save_button.isVisible()
@@ -3064,6 +3167,44 @@ def test_hidden_header_banner_does_not_block_dashboard_top_space(tmp_path) -> No
     window.close()
 
 
+def test_pinning_panel_preserves_visible_slot_when_header_banner_is_hidden(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = False
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    focus_cell = window.feature_cells["focus"]
+    before_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(focus_cell)
+    )
+    assert before_position[:2] == (0, 0)
+
+    window.set_feature_panel_pinned("focus", True)
+    app.processEvents()
+
+    pinned_cell = window.feature_cells["focus"]
+    after_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(pinned_cell)
+    )
+    assert after_position[:2] == before_position[:2]
+    assert window.feature_panel_pinned("focus")
+    saved_focus = next(
+        item
+        for item in window.current_layout_state()["layout"]["dashboard"]
+        if item.get("key") == "focus"
+    )
+    assert (int(saved_focus["x"]), int(saved_focus["y"])) == (0, 0)
+    assert saved_focus.get("pinned") is True
+
+    window.close()
+
+
 def test_datetime_panel_overlays_other_dashboard_items(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -3465,10 +3606,10 @@ def test_dashboard_feature_pin_blocks_move_and_resize(tmp_path) -> None:
     window.show()
     app.processEvents()
 
-    before = {
-        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
-        for item in window._current_feature_dashboard_layout()
-    }
+    focus_cell = window.feature_cells["focus"]
+    before_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(focus_cell)
+    )
     window.set_feature_panel_pinned("focus", True)
     assert window.feature_panel_pinned("focus")
 
@@ -3477,11 +3618,19 @@ def test_dashboard_feature_pin_blocks_move_and_resize(tmp_path) -> None:
     window.resize_feature_panel_height("focus", window._dashboard_item_pixel_height(12))
     app.processEvents()
 
-    after = {
-        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]), bool(item.get("pinned", False)))
-        for item in window._current_feature_dashboard_layout()
-    }
-    assert after["focus"] == (*before["focus"], True)
+    pinned_cell = window.feature_cells["focus"]
+    after_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(pinned_cell)
+    )
+    assert after_position == before_position
+    focus_item = next(item for item in window._current_feature_dashboard_layout() if item.get("key") == "focus")
+    assert (
+        int(focus_item["x"]),
+        int(focus_item["y"]),
+        int(focus_item["w"]),
+        int(focus_item["h"]),
+        bool(focus_item.get("pinned", False)),
+    ) == (before_position[1], before_position[0], before_position[3], before_position[2], True)
     assert any(item.get("key") == "focus" and item.get("pinned") for item in window.current_layout_state()["layout"]["dashboard"])
     window.close()
 
@@ -3977,3 +4126,228 @@ def test_download_site_icon_falls_back_when_home_page_is_too_large(monkeypatch) 
     assert file_name == "favicon.ico"
     assert data == b"ico-data"
     assert calls == ["https://large.example.com", "https://large.example.com/favicon.ico"]
+
+
+def _vertical_wheel_event(widget: QWidget, steps: int) -> QWheelEvent:
+    center = widget.rect().center()
+    return QWheelEvent(
+        QPointF(center),
+        QPointF(widget.mapToGlobal(center)),
+        QPoint(0, 0),
+        QPoint(0, 120 * steps),
+        Qt.MouseButton.NoButton,
+        Qt.KeyboardModifier.NoModifier,
+        Qt.ScrollPhase.NoScrollPhase,
+        False,
+    )
+
+
+def test_settings_font_size_spin_ignores_wheel_until_focused(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    spin = dialog.findChild(QSpinBox, "mainFontSizeSpin")
+    assert isinstance(spin, NoScrollSpinBox)
+
+    spin.clearFocus()
+    app.processEvents()
+    assert not spin.hasFocus()
+
+    # Wheeling over an unfocused spin box must not silently change its value.
+    unfocused_start = spin.value()
+    QApplication.sendEvent(spin, _vertical_wheel_event(spin, 1))
+    assert spin.value() == unfocused_start
+
+    # Programmatic setValue still works while the spin box is unfocused.
+    spin.setValue(unfocused_start + 1)
+    assert spin.value() == unfocused_start + 1
+
+    # Once the spin box owns focus the wheel adjusts the value again.
+    dialog.activateWindow()
+    spin.setFocus()
+    app.processEvents()
+    assert spin.hasFocus()
+    focused_start = spin.value()
+    QApplication.sendEvent(spin, _vertical_wheel_event(spin, 1))
+    assert spin.value() > focused_start
+
+    dialog.close()
+
+
+def test_settings_font_combos_ignore_wheel_until_focused(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    # The font combos are disabled while the "use default font" switches are on,
+    # so uncheck both to enable them before exercising the wheel guard.
+    dialog.use_default_datetime_font_check.setChecked(False)
+    dialog.use_default_main_font_check.setChecked(False)
+    app.processEvents()
+
+    for object_name in ("datetimeFontCombo", "mainFontCombo"):
+        combo = dialog.findChild(NoScrollFontComboBox, object_name)
+        assert isinstance(combo, NoScrollFontComboBox), object_name
+        assert combo.focusPolicy() == Qt.FocusPolicy.StrongFocus, object_name
+        assert combo.isEnabled(), object_name
+
+        combo.clearFocus()
+        app.processEvents()
+        assert not combo.hasFocus(), object_name
+
+        # Wheeling over an unfocused font combo must not silently change the font.
+        unfocused_index = combo.currentIndex()
+        unfocused_text = combo.currentText()
+        QApplication.sendEvent(combo, _vertical_wheel_event(combo, 1))
+        assert combo.currentIndex() == unfocused_index, object_name
+        assert combo.currentText() == unfocused_text, object_name
+
+        # Once the combo owns focus the wheel selects another font as usual.
+        if combo.count() > 1:
+            dialog.activateWindow()
+            combo.setFocus()
+            app.processEvents()
+            assert combo.hasFocus(), object_name
+
+            combo.setCurrentIndex(min(2, combo.count() - 1))
+            app.processEvents()
+            focused_start_index = combo.currentIndex()
+            QApplication.sendEvent(combo, _vertical_wheel_event(combo, 1))
+            assert combo.currentIndex() != focused_start_index, object_name
+
+    dialog.close()
+
+
+def test_settings_display_form_spins_are_no_scroll(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    for object_name in (
+        "mainFontSizeSpin",
+        "labelFontSizeSpin",
+        "contentFontSizeSpin",
+        "datetimeFontSizeSpin",
+        "datetimeTextOutlineThicknessSpin",
+    ):
+        spin = dialog.findChild(QSpinBox, object_name)
+        assert isinstance(spin, NoScrollSpinBox), object_name
+        assert spin.focusPolicy() == Qt.FocusPolicy.StrongFocus, object_name
+
+    dialog.close()
+
+
+def test_dashboard_preview_rect_follows_narrow_grid_width(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(560, 780)
+    window.show()
+    app.processEvents()
+
+    container_width = window.feature_grid_container.width()
+    # Precondition: the grid is narrower than the old hard-coded 720px floor.
+    assert 0 < container_width < 720
+
+    window.feature_dashboard_items = [{"key": "focus", "x": 0, "y": 0, "w": 12, "h": 4}]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    # A full-width span now tracks the real container, not the old 720px floor.
+    assert abs(window._dashboard_item_pixel_width(DASHBOARD_GRID_COLUMNS) - container_width) <= 2
+
+    focus_item = next(
+        item for item in window._current_feature_dashboard_layout() if item["key"] == "focus"
+    )
+    rect = window._dashboard_item_rect(focus_item)
+    cell = window.feature_cells["focus"]
+    assert abs(rect.width() - cell.width()) <= 2
+    assert rect.right() <= container_width + 1
+
+    # The drag preview overlay stays inside the narrowed grid too.
+    window._show_dashboard_resize_guides("focus")
+    app.processEvents()
+    overlay = window.dashboard_guide_overlay
+    assert overlay.preview_rect.right() <= container_width + 1
+    window._hide_dashboard_drag_guides()
+    window.close()
+
+
+def test_quick_memo_narrow_tall_keeps_history_scrollable(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    now = datetime(2026, 6, 20, 10, 0)
+    for index in range(20):
+        repository.save_quick_note(
+            QuickNote(
+                f"좁은 창 메모 {index + 1} - 마지막까지 스크롤 확인",
+                now - timedelta(minutes=index),
+            )
+        )
+    window = MainWindow(repository)
+    window.resize(1200, 820)
+    window.show()
+    app.processEvents()
+
+    panel = window.memo_content_panel
+
+    # A short panel may still collapse to an editor-only view.
+    panel.resize(280, 280)
+    window.update_memo_panel_responsive_layout()
+    assert window.memo_history_card.isHidden()
+    assert window.memo_splitter.sizes()[1] == 0
+
+    # Narrow but tall must keep the saved-note history visible and scrollable
+    # instead of hiding it and stretching only the editor.
+    panel.resize(280, 600)
+    window.update_memo_panel_responsive_layout()
+    assert not window.memo_history_card.isHidden()
+    assert not window.notes_list.isHidden()
+    sizes = window.memo_splitter.sizes()
+    assert len(sizes) == 2
+    assert sizes[0] > 0
+    assert sizes[1] > 0
+    window.refresh_notes()
+    app.processEvents()
+    assert window.notes_list.count() == 12
+    scroll_bar = window.notes_list.verticalScrollBar()
+    scroll_bar.setValue(scroll_bar.maximum())
+    app.processEvents()
+    last_item_rect = window.notes_list.visualItemRect(window.notes_list.item(window.notes_list.count() - 1))
+    assert window.notes_list.viewport().rect().intersects(last_item_rect)
+
+    window.close()
+
+
+def test_main_window_resize_hides_stale_dashboard_guides(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    target_cell = window.feature_cells["today_timeline"]
+    window._show_dashboard_drag_guides("focus", target_cell.mapToGlobal(target_cell.rect().center()))
+    app.processEvents()
+    overlay = window.dashboard_guide_overlay
+    assert overlay.isVisible()
+    assert overlay.preview_rect.isValid()
+
+    # Resizing the main window must clear any stale guide so no transient flash remains.
+    window.resize(900, 760)
+    app.processEvents()
+
+    assert not overlay.isVisible()
+    assert not overlay.preview_rect.isValid()
+    assert overlay.preview_rect.isNull()
+    assert overlay.impact_rects == []
+
+    window.close()

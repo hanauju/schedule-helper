@@ -17,6 +17,13 @@ def test_background_color_drives_unset_surfaces() -> None:
     assert palette["surface"] != "#ffffff"
     assert palette["surface_2"] != "#f3f6f4"
     assert palette["table"] == palette["surface"]
+    assert palette["text"] == "#eef4ef"
+
+
+def test_light_background_color_keeps_dark_default_text() -> None:
+    palette = _resolved_theme_palette(Preference(background_color="#e8f4ef"))
+
+    assert palette["bg"] == "#e8f4ef"
     assert palette["text"] == "#18201b"
 
 
