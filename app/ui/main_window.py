@@ -1438,6 +1438,45 @@ class DashboardGridGuideOverlay(QWidget):
             painter.drawRoundedRect(self.preview_rect.adjusted(8, 8, -8, -8), 10, 10)
 
 
+class NoScrollSpinBox(QSpinBox):
+    """Spin box that ignores wheel scrolling until it already holds focus.
+
+    Scrolling over a settings form should move the surrounding scroll area, not
+    silently change a value the cursor merely passed over. Clicking, typing, the
+    up/down buttons, and setValue() keep working because only wheelEvent is gated.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoScrollFontComboBox(QFontComboBox):
+    """Font combo box that ignores wheel scrolling until it already holds focus.
+
+    Scrolling over a settings form should move the surrounding scroll area, not
+    silently swap the selected font the cursor merely passed over. Clicking,
+    keyboard navigation, and setCurrentFont() keep working because only
+    wheelEvent is gated.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+
+    def wheelEvent(self, event) -> None:
+        if self.hasFocus():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
 class DraggableFeatureBox(QWidget):
     def __init__(
         self,
@@ -4431,13 +4470,6 @@ class MainWindow(QMainWindow):
         folder_settings_button.clicked.connect(self.show_note_folder_settings)
         self.memo_folder_settings_button = folder_settings_button
         folder_settings_button.hide()
-        trash_button = QPushButton("쓰레기통")
-        trash_button.setObjectName("ghostButton")
-        _stabilize_control(trash_button, 76)
-        trash_button.setMaximumWidth(86)
-        trash_button.clicked.connect(self.open_note_trash_window)
-        self.memo_trash_button = trash_button
-        notes_filter_row.addWidget(trash_button)
         notes_filter_row.addWidget(self.note_filter_combo)
         notes_layout.addLayout(notes_filter_row)
 
@@ -4483,8 +4515,8 @@ class MainWindow(QMainWindow):
         height = panel.height() if isinstance(panel, QWidget) else 0
         compact = (width > 0 and width < 430) or (height > 0 and height < 420)
         tiny = (width > 0 and width < 300) or (height > 0 and height < 320)
-        mode = "tiny" if tiny else "compact" if compact else "wide"
-        previous_mode = getattr(self, "_memo_responsive_mode", None)
+        short = height > 0 and height < 320
+        previous_history_collapsed = bool(getattr(self, "_memo_history_collapsed", False))
 
         _apply_panel_rhythm(self.memo_panel_layout, "tiny" if tiny else "compact" if compact else "normal")
         self.memo_editor_layout.setContentsMargins(10 if compact else 12, 9 if compact else 11, 10 if compact else 12, 9 if compact else 11)
@@ -4495,21 +4527,17 @@ class MainWindow(QMainWindow):
         self.quick_note_folder_combo.setVisible(not tiny)
         self.memo_folder_view_button.setVisible(not tiny)
         self.memo_folder_settings_button.setVisible(False)
-        if hasattr(self, "memo_trash_button"):
-            self.memo_trash_button.setVisible(not tiny)
         self.memo_editor_title.setVisible(True)
         self.memo_shortcut_label.setVisible(not compact)
-        self.memo_saved_notes_label.setVisible(not tiny)
+        self.memo_saved_notes_label.setVisible(not short)
         self.note_filter_combo.setVisible(not tiny)
-        self.memo_history_card.setVisible(not tiny)
+        self.memo_history_card.setVisible(not short)
         self.quick_note_editor.setMinimumHeight(40 if tiny else 48 if compact else 56)
-        if mode != previous_mode and tiny:
+        if short and not previous_history_collapsed:
             self.memo_splitter.setSizes([1, 0])
-        elif previous_mode == "tiny" and compact:
-            self.memo_splitter.setSizes([120, 220])
-        elif previous_mode == "tiny":
-            self.memo_splitter.setSizes([150, 300])
-        self._memo_responsive_mode = mode
+        elif previous_history_collapsed and not short:
+            self.memo_splitter.setSizes([120, 220] if compact else [150, 300])
+        self._memo_history_collapsed = short
 
     def _build_link_favorites_panel(self) -> QWidget:
         panel = ResizeAwareWidget(self.update_link_favorites_responsive_layout)
@@ -9055,12 +9083,17 @@ class MainWindow(QMainWindow):
         unit_width = max(1, DASHBOARD_GRID_COLUMNS / 3)
         return min(3, max(1, round(width_value / unit_width)))
 
+    def _dashboard_container_width(self) -> int:
+        container = getattr(self, "feature_grid_container", None)
+        width = container.width() if isinstance(container, QWidget) else 0
+        return width if width > 0 else 720
+
     def _dashboard_width_from_pixels(self, width: object) -> int:
         try:
             pixel_width = int(width)
         except (TypeError, ValueError):
             return 3
-        container_width = max(720, self.feature_grid_container.width())
+        container_width = self._dashboard_container_width()
         usable_width = max(1, container_width - DASHBOARD_GRID_GAP * (DASHBOARD_GRID_COLUMNS - 1))
         column_width = max(1, usable_width / DASHBOARD_GRID_COLUMNS)
         return self._normalized_dashboard_width(round((pixel_width + DASHBOARD_GRID_GAP) / (column_width + DASHBOARD_GRID_GAP)))
@@ -9074,7 +9107,7 @@ class MainWindow(QMainWindow):
         return self._normalized_dashboard_height(round((pixel_height + DASHBOARD_GRID_GAP) / max(1, row_step)))
 
     def _dashboard_column_width(self) -> float:
-        container_width = max(720, self.feature_grid_container.width())
+        container_width = self._dashboard_container_width()
         usable_width = max(1, container_width - DASHBOARD_GRID_GAP * (DASHBOARD_GRID_COLUMNS - 1))
         return usable_width / DASHBOARD_GRID_COLUMNS
 
@@ -9759,16 +9792,32 @@ class MainWindow(QMainWindow):
                     return bool(item.get("pinned", False))
         return False
 
+    def _visible_feature_dashboard_slot(self, feature_key: str) -> tuple[int, int, int, int] | None:
+        layout = getattr(self, "feature_dashboard_layout", None)
+        if not isinstance(layout, QGridLayout):
+            return None
+        cell = getattr(self, "feature_cells", {}).get(feature_key)
+        if not isinstance(cell, FeatureCell):
+            return None
+        index = layout.indexOf(cell)
+        if index < 0:
+            return None
+        row, column, row_span, column_span = layout.getItemPosition(index)
+        return column, row, column_span, row_span
+
     def set_feature_panel_pinned(self, feature_key: str, pinned: bool) -> None:
         if feature_key not in self.feature_boxes:
             return
         if not hasattr(self, "feature_dashboard_layout"):
             self.statusBar().showMessage("현재 배치에서는 패널 고정을 사용할 수 없습니다.", 1800)
             return
+        visible_slot = self._visible_feature_dashboard_slot(feature_key)
         items = [dict(item) for item in self._current_feature_dashboard_layout()]
         changed = False
         for item in items:
             if str(item.get("key", "")) == feature_key:
+                if visible_slot is not None:
+                    item["x"], item["y"], item["w"], item["h"] = visible_slot
                 item["pinned"] = bool(pinned)
                 changed = True
                 break
@@ -11507,6 +11556,7 @@ class MainWindow(QMainWindow):
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._remember_normal_window_size()
+        self._hide_dashboard_drag_guides()
 
     def closeEvent(self, event) -> None:
         self.save_last_window_size()
@@ -12830,11 +12880,16 @@ class QuickNoteFolderNotesDialog(QDialog):
         delete_folder_button = QPushButton("삭제")
         _stabilize_control(delete_folder_button, 72)
         delete_folder_button.clicked.connect(self.delete_folder)
+        trash_button = QPushButton("쓰레기통")
+        trash_button.setObjectName("quickNoteFolderTrashButton")
+        _stabilize_control(trash_button, 86)
+        trash_button.clicked.connect(self.open_trash)
         folder_button_row.addWidget(add_folder_button)
         folder_button_row.addWidget(rename_folder_button)
         folder_button_row.addWidget(default_folder_button)
         folder_button_row.addWidget(delete_folder_button)
         folder_button_row.addStretch(1)
+        folder_button_row.addWidget(trash_button)
         folder_layout.addLayout(folder_button_row)
         splitter.addWidget(folder_panel)
 
@@ -13188,6 +13243,16 @@ class QuickNoteFolderNotesDialog(QDialog):
         parent = self.parent()
         if hasattr(parent, "statusBar"):
             parent.statusBar().showMessage(message, 2200)
+
+    def open_trash(self) -> None:
+        parent = self.parent()
+        open_trash_window = getattr(parent, "open_note_trash_window", None)
+        if callable(open_trash_window):
+            open_trash_window()
+            return
+        dialog = QuickNoteTrashDialog(self.repository, self, on_changed=self.emit_changed)
+        dialog.exec()
+        self.refresh()
 
 
 class QuickNoteTrashDialog(QDialog):
@@ -16865,9 +16930,9 @@ class SettingsDialog(QDialog):
         color_form.addRow(
             self._build_color_group(
                 "전체 색",
-                "바탕 배경을 바꾸면 따로 지정하지 않은 안쪽 배경, 카드, 표 색까지 같은 톤으로 맞춥니다.",
+                "바탕 배경을 바꾸면 앱 전체가 그 색이 되고, 따로 지정하지 않은 카드·표 색도 같은 톤으로 맞춥니다.",
                 (
-                    ("background", "바탕 배경", "", "앱 전체 바깥"),
+                    ("background", "바탕 배경", "", "앱 전체 배경"),
                     ("accent", "강조", "#4f8c6b", "선택과 진행"),
                     ("button", "버튼", "#4f8c6b", "버튼 배경"),
                     ("text", "글자", "", "전체 글자"),
@@ -16879,7 +16944,6 @@ class SettingsDialog(QDialog):
                 "내용 색",
                 "필요할 때만 개별 영역을 덮어씁니다. 비워두면 전체 색을 따라갑니다.",
                 (
-                    ("inner_background", "안쪽 배경", "", "메인 작업 영역"),
                     ("panel", "카드/입력", "", "패널과 입력칸"),
                     ("table", "시간표", "", "표와 시간칸"),
                 ),
@@ -16941,7 +17005,7 @@ class SettingsDialog(QDialog):
             self._build_color_control("datetime_text_outline", "", "시간 글자 외곽선색"),
         )
 
-        self.datetime_text_outline_thickness_spin = QSpinBox()
+        self.datetime_text_outline_thickness_spin = NoScrollSpinBox()
         self.datetime_text_outline_thickness_spin.setObjectName("datetimeTextOutlineThicknessSpin")
         self.datetime_text_outline_thickness_spin.setRange(0, 12)
         self.datetime_text_outline_thickness_spin.setValue(
@@ -16961,7 +17025,7 @@ class SettingsDialog(QDialog):
         datetime_font_family = _normalize_main_font_family(getattr(preferences, "datetime_panel_font_family", ""))
         self.use_default_datetime_font_check.setChecked(not bool(datetime_font_family))
         datetime_font_layout.addWidget(self.use_default_datetime_font_check)
-        self.datetime_font_combo = QFontComboBox()
+        self.datetime_font_combo = NoScrollFontComboBox()
         self.datetime_font_combo.setObjectName("datetimeFontCombo")
         if datetime_font_family:
             self.datetime_font_combo.setCurrentFont(QFont(datetime_font_family))
@@ -16971,7 +17035,7 @@ class SettingsDialog(QDialog):
         datetime_font_layout.addWidget(self.datetime_font_combo, 1)
         display_form.addRow("시간 글꼴", datetime_font_row)
 
-        self.datetime_font_size_spin = QSpinBox()
+        self.datetime_font_size_spin = NoScrollSpinBox()
         self.datetime_font_size_spin.setObjectName("datetimeFontSizeSpin")
         self.datetime_font_size_spin.setRange(12, 72)
         self.datetime_font_size_spin.setValue(
@@ -17009,7 +17073,7 @@ class SettingsDialog(QDialog):
         self.use_default_main_font_check.setObjectName("mainFontDefaultCheck")
         self.use_default_main_font_check.setChecked(not bool(_normalize_main_font_family(preferences.main_font_family)))
         font_layout.addWidget(self.use_default_main_font_check)
-        self.main_font_combo = QFontComboBox()
+        self.main_font_combo = NoScrollFontComboBox()
         self.main_font_combo.setObjectName("mainFontCombo")
         if _normalize_main_font_family(preferences.main_font_family):
             self.main_font_combo.setCurrentFont(QFont(preferences.main_font_family))
@@ -17019,7 +17083,7 @@ class SettingsDialog(QDialog):
         font_layout.addWidget(self.main_font_combo, 1)
         display_form.addRow("메인 글꼴", font_row)
 
-        self.main_font_size_spin = QSpinBox()
+        self.main_font_size_spin = NoScrollSpinBox()
         self.main_font_size_spin.setObjectName("mainFontSizeSpin")
         self.main_font_size_spin.setRange(10, 22)
         self.main_font_size_spin.setValue(_normalize_main_font_size(preferences.main_font_size))
@@ -17027,7 +17091,7 @@ class SettingsDialog(QDialog):
         _stabilize_control(self.main_font_size_spin, 92)
         display_form.addRow("메인 글자 크기", self.main_font_size_spin)
 
-        self.label_font_size_spin = QSpinBox()
+        self.label_font_size_spin = NoScrollSpinBox()
         self.label_font_size_spin.setObjectName("labelFontSizeSpin")
         self.label_font_size_spin.setRange(10, 20)
         self.label_font_size_spin.setValue(_normalize_label_font_size(getattr(preferences, "label_font_size", 13)))
@@ -17035,7 +17099,7 @@ class SettingsDialog(QDialog):
         _stabilize_control(self.label_font_size_spin, 92)
         display_form.addRow("라벨 글자 크기", self.label_font_size_spin)
 
-        self.content_font_size_spin = QSpinBox()
+        self.content_font_size_spin = NoScrollSpinBox()
         self.content_font_size_spin.setObjectName("contentFontSizeSpin")
         self.content_font_size_spin.setRange(11, 24)
         self.content_font_size_spin.setValue(_normalize_content_font_size(getattr(preferences, "content_font_size", 13)))
@@ -18171,14 +18235,13 @@ def _resolved_theme_palette(preferences: Preference | None) -> dict[str, str]:
         is_dark = _is_dark_color(background_color)
         lift_target = "#ffffff"
         border_target = "#ffffff" if is_dark else "#000000"
-        app_lift = 0.035 if is_dark else 0.70
         surface_lift = 0.065 if is_dark else 0.86
         soft_lift = 0.10 if is_dark else 0.58
         border_mix = 0.16 if is_dark else 0.12
         palette = {**palette, "bg": background_color}
         palette = {
             **palette,
-            "app": _mix_hex_color(background_color, lift_target, app_lift),
+            "app": background_color,
             "surface": _mix_hex_color(background_color, lift_target, surface_lift),
             "surface_2": _mix_hex_color(background_color, lift_target, soft_lift),
             "border": _mix_hex_color(background_color, border_target, border_mix),
@@ -18187,7 +18250,8 @@ def _resolved_theme_palette(preferences: Preference | None) -> dict[str, str]:
         }
 
     inner_background_color = _normalize_optional_color(getattr(preferences, "inner_background_color", ""))
-    if inner_background_color:
+    legacy_inner_background_active = bool(inner_background_color and not background_color)
+    if legacy_inner_background_active:
         is_dark = _is_dark_color(inner_background_color)
         lift_target = "#ffffff"
         border_target = "#ffffff" if is_dark else "#000000"
@@ -18217,7 +18281,7 @@ def _resolved_theme_palette(preferences: Preference | None) -> dict[str, str]:
             "border_2": _mix_hex_color(panel_color, border_target, border_mix * 0.65),
             "track": _mix_hex_color(panel_color, border_target, border_mix * 0.80),
         }
-    elif inner_background_color:
+    elif legacy_inner_background_active:
         palette = {**palette, "surface": inner_background_color}
 
     table_color = _normalize_optional_color(getattr(preferences, "table_color", ""))
@@ -18242,11 +18306,12 @@ def _resolved_theme_palette(preferences: Preference | None) -> dict[str, str]:
         }
 
     text_color = _normalize_optional_color(getattr(preferences, "text_color", ""))
+    text_surface_is_dark = _is_dark_color(palette["surface"])
     if text_color:
-        palette = {**palette, **_text_role_palette(text_color, palette["surface"], is_dark_theme)}
-    elif background_color or inner_background_color or panel_color:
-        text_color = "#eef4ef" if is_dark_theme else "#18201b"
-        palette = {**palette, **_text_role_palette(text_color, palette["surface"], is_dark_theme)}
+        palette = {**palette, **_text_role_palette(text_color, palette["surface"], text_surface_is_dark)}
+    elif background_color or legacy_inner_background_active or panel_color:
+        text_color = "#eef4ef" if text_surface_is_dark else "#18201b"
+        palette = {**palette, **_text_role_palette(text_color, palette["surface"], text_surface_is_dark)}
     return palette
 
 
