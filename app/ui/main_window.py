@@ -2674,6 +2674,15 @@ class _WindowsChromeApi:
     DWMWA_BORDER_COLOR = 34
     DWMWCP_ROUND = 2
     MONITOR_DEFAULTTONEAREST = 2
+    WM_SETICON = 0x0080
+    ICON_SMALL = 0
+    ICON_BIG = 1
+    IMAGE_ICON = 1
+    LR_LOADFROMFILE = 0x00000010
+    SM_CXICON = 11
+    SM_CYICON = 12
+    SM_CXSMICON = 49
+    SM_CYSMICON = 50
 
     def __init__(self) -> None:
         user32 = ctypes.WinDLL("user32", use_last_error=True)
@@ -2713,6 +2722,17 @@ class _WindowsChromeApi:
         dwmapi.DwmSetWindowAttribute.restype = ctypes.c_long
         shell32.SHAppBarMessage.argtypes = [wintypes.DWORD, ctypes.POINTER(_APPBARDATA)]
         shell32.SHAppBarMessage.restype = ctypes.c_void_p
+        user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        user32.LoadImageW.restype = wintypes.HANDLE
+        user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        user32.SendMessageW.restype = wintypes.LPARAM
         self._user32 = user32
         self._dwmapi = dwmapi
         self._shell32 = shell32
@@ -2800,6 +2820,33 @@ class _WindowsChromeApi:
             if self._shell32.SHAppBarMessage(_ABM_GETAUTOHIDEBAREX, ctypes.byref(appbar_data)):
                 edges |= qt_edge
         return edges
+
+    def apply_window_icons(self, hwnd: int, icon_path: str) -> bool:
+        """Load ``icon_path`` from disk and push it onto the HWND via WM_SETICON.
+
+        Qt assigns the window icon to its QWindow, but the frameless HWND that
+        Qt can recreate on flag changes (e.g. always-on-top) may not carry the
+        WM_SETICON association Explorer reads for the taskbar button and the
+        Alt-Tab / taskbar preview before the app is pinned. We set both the big
+        (preview / Alt-Tab) and small (caption / taskbar button) icons at the
+        native size so they stay crisp. Returns whether any icon was applied.
+        """
+        handle = wintypes.HWND(hwnd)
+        applied = False
+        for icon_kind, width_metric, height_metric in (
+            (self.ICON_BIG, self.SM_CXICON, self.SM_CYICON),
+            (self.ICON_SMALL, self.SM_CXSMICON, self.SM_CYSMICON),
+        ):
+            width = self._user32.GetSystemMetrics(width_metric)
+            height = self._user32.GetSystemMetrics(height_metric)
+            hicon = self._user32.LoadImageW(
+                None, icon_path, self.IMAGE_ICON, width, height, self.LR_LOADFROMFILE
+            )
+            if not hicon:
+                continue
+            self._user32.SendMessageW(handle, self.WM_SETICON, icon_kind, hicon)
+            applied = True
+        return applied
 
 
 _WINDOWS_CHROME_API: _WindowsChromeApi | None = None
@@ -8043,7 +8090,8 @@ class MainWindow(QMainWindow):
     def showEvent(self, event) -> None:
         super().showEvent(event)
         # The platform HWND exists by now (and is rebuilt whenever a window flag
-        # such as "always on top" toggles), so (re)apply the native frame here.
+        # such as "always on top" toggles), so (re)apply the native frame and the
+        # native taskbar/preview icons here.
         self._apply_windows_native_chrome()
         handle = self.windowHandle()
         if handle is not None and not self._screen_change_connected:
@@ -8055,16 +8103,29 @@ class MainWindow(QMainWindow):
         self._apply_windows_native_chrome()
 
     def _apply_windows_native_chrome(self) -> None:
-        if QGuiApplication.platformName() != "windows":
-            return
         api = _windows_chrome_api()
         if api is None:
             return
-        hwnd = int(self.winId())
+        # _native_window_handle() already gates on the Windows platform and a
+        # realized, visible HWND, and is the single seam tests stub.
+        hwnd = self._native_window_handle()
         if not hwnd:
             return
         api.restore_window_styles(hwnd)
         api.apply_rounded_frame(hwnd, WINDOW_FRAME_BORDER_COLOR)
+        self._apply_windows_native_icons(api, hwnd)
+
+    def _apply_windows_native_icons(self, api: _WindowsChromeApi, hwnd: int) -> None:
+        # Qt sets the window icon on its QWindow, but the frameless HWND that Qt
+        # can recreate on flag changes (e.g. always-on-top) may drop the native
+        # WM_SETICON association Explorer reads for the taskbar button and the
+        # taskbar/Alt-Tab preview before the app is pinned. Load the OROT .ico
+        # straight off disk so the native icon still applies if Qt's .ico plugin
+        # has not populated windowIcon() yet in the packaged app.
+        icon_path = Path(__file__).resolve().parent.parent / "assets" / "orot.ico"
+        if not icon_path.exists():
+            return
+        api.apply_window_icons(hwnd, str(icon_path))
 
     def nativeEvent(self, event_type, message):
         if _is_windows_native_event_type(event_type):
@@ -16870,7 +16931,10 @@ class SettingsDialog(QDialog):
     def __init__(self, preferences: Preference, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("설정")
-        self.resize(700, 720)
+        # Open roomy and keep a usable floor so the tabbed forms (storage row,
+        # color groups, font controls) are not clipped or cramped.
+        self.setMinimumSize(QSize(860, 680))
+        self.resize(980, 760)
         self._live_preview_enabled = False
 
         layout = QVBoxLayout(self)

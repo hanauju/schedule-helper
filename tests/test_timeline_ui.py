@@ -9,7 +9,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QSize, Qt, QTime
-from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -871,6 +871,89 @@ def test_toggle_max_restore_uses_native_maximize_when_hwnd_exists(tmp_path, monk
     window.close()
 
 
+def test_apply_windows_native_chrome_pushes_orot_icon_to_hwnd(tmp_path, monkeypatch) -> None:
+    # The frameless HWND can lose its native WM_SETICON association whenever Qt
+    # recreates it, so applying native chrome must also (re)push the OROT .ico to
+    # the HWND or the taskbar button and preview fall back to a generic icon.
+    class IconRecordingChromeApi:
+        def __init__(self) -> None:
+            self.icon_calls: list[tuple[int, str]] = []
+
+        def restore_window_styles(self, hwnd: int) -> None:
+            pass
+
+        def apply_rounded_frame(self, hwnd: int, border_color: str) -> None:
+            pass
+
+        def apply_window_icons(self, hwnd: int, icon_path: str) -> bool:
+            self.icon_calls.append((hwnd, icon_path))
+            return True
+
+        def is_maximized(self, hwnd: int) -> bool:
+            return False
+
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    icon_pixmap = QPixmap(32, 32)
+    icon_pixmap.fill(Qt.GlobalColor.red)
+    window.setWindowIcon(QIcon(icon_pixmap))
+
+    fake_api = IconRecordingChromeApi()
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", fake_api)
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+    monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
+
+    window._apply_windows_native_chrome()
+
+    assert len(fake_api.icon_calls) == 1
+    applied_hwnd, applied_path = fake_api.icon_calls[0]
+    assert applied_hwnd == 4242
+    assert Path(applied_path).name == "orot.ico"
+    assert Path(applied_path).exists()
+    window.close()
+
+
+def test_apply_windows_native_chrome_uses_orot_asset_without_qt_icon(tmp_path, monkeypatch) -> None:
+    # Packaged Qt can fail to hydrate windowIcon() before the HWND exists. The
+    # native taskbar/preview icon still comes from the bundled OROT .ico asset.
+    class IconRecordingChromeApi:
+        def __init__(self) -> None:
+            self.icon_calls: list[tuple[int, str]] = []
+
+        def restore_window_styles(self, hwnd: int) -> None:
+            pass
+
+        def apply_rounded_frame(self, hwnd: int, border_color: str) -> None:
+            pass
+
+        def apply_window_icons(self, hwnd: int, icon_path: str) -> bool:
+            self.icon_calls.append((hwnd, icon_path))
+            return True
+
+        def is_maximized(self, hwnd: int) -> bool:
+            return False
+
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.setWindowIcon(QIcon())
+
+    fake_api = IconRecordingChromeApi()
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API", fake_api)
+    monkeypatch.setattr(main_window_module, "_WINDOWS_CHROME_API_READY", True)
+    monkeypatch.setattr(window, "_native_window_handle", lambda: 4242)
+
+    window._apply_windows_native_chrome()
+
+    assert len(fake_api.icon_calls) == 1
+    applied_hwnd, applied_path = fake_api.icon_calls[0]
+    assert applied_hwnd == 4242
+    assert Path(applied_path).name == "orot.ico"
+    assert Path(applied_path).exists()
+    window.close()
+
+
 def test_frameless_window_native_hit_test(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -1168,6 +1251,18 @@ def test_toggle_max_restore_restores_from_fullscreen_state(tmp_path) -> None:
     assert (window._normal_window_size.width(), window._normal_window_size.height()) == (1010, 620)
 
     window.close()
+
+
+def test_settings_dialog_opens_roomy_with_minimum_size(tmp_path) -> None:
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+
+    # Opens larger than the old 700x720 and cannot shrink below a usable floor,
+    # so the tabbed forms (storage row, color groups, fonts) are not clipped.
+    assert (dialog.size().width(), dialog.size().height()) == (980, 760)
+    assert (dialog.minimumSize().width(), dialog.minimumSize().height()) == (860, 680)
+    dialog.close()
 
 
 def test_settings_color_picker_uses_eyedropper_cursor(tmp_path) -> None:
