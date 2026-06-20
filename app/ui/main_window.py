@@ -15416,9 +15416,12 @@ class TodayTimelineWidget(QWidget):
         dialog = QDialog(self)
         dialog.setWindowTitle("시간과 날짜 선택")
         dialog.setModal(True)
+        dialog.setMinimumSize(QSize(344, 344))
+        dialog.resize(360, 360)
         layout = QVBoxLayout(dialog)
         layout.setContentsMargins(12, 12, 12, 12)
         calendar = QCalendarWidget(dialog)
+        _polish_calendar_widget(calendar, self._preferences())
         calendar.setSelectedDate(QDate(self.selected_date.year, self.selected_date.month, self.selected_date.day))
         layout.addWidget(calendar)
 
@@ -15482,8 +15485,8 @@ class TodayTimelineWidget(QWidget):
     def _update_timeline_toolbar_mode(self) -> None:
         narrow = self.width() < 660
         very_narrow = narrow
-        full_text = self.selected_date.strftime("%Y년 %m월 %d일")
-        self.date_label.setText(self.selected_date.strftime("%m/%d") if very_narrow else full_text)
+        full_text = _timeline_panel_date_text(self.selected_date, compact=False)
+        self.date_label.setText(_timeline_panel_date_text(self.selected_date, compact=very_narrow))
         self.date_label.setToolTip(f"{full_text} 시간표 보기")
         if hasattr(self, "timeline_filter_segment"):
             self.timeline_filter_segment.setVisible(not narrow)
@@ -18128,6 +18131,12 @@ def _date_from_qdate(value: QDate) -> date:
     return date(value.year(), value.month(), value.day())
 
 
+def _timeline_panel_date_text(selected_date: date, compact: bool) -> str:
+    if compact:
+        return f"{selected_date.month}월 {selected_date.day}일"
+    return f"{selected_date.year}년 {selected_date.month}월 {selected_date.day}일"
+
+
 def _qt_week_start_day(week_start_day: int) -> Qt.DayOfWeek:
     return Qt.DayOfWeek.Sunday if week_start_day == 6 else Qt.DayOfWeek.Monday
 
@@ -18137,7 +18146,8 @@ def _polish_calendar_widget(calendar: QCalendarWidget, preferences: Preference) 
     calendar.setVerticalHeaderFormat(QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader)
     calendar.setHorizontalHeaderFormat(QCalendarWidget.HorizontalHeaderFormat.ShortDayNames)
     calendar.setFirstDayOfWeek(_qt_week_start_day(preferences.week_start_day))
-    calendar.setMinimumHeight(260)
+    calendar.setMinimumWidth(320)
+    calendar.setMinimumHeight(300)
     calendar.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
 

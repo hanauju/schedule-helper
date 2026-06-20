@@ -13,6 +13,7 @@ from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPixmap, QWheel
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
+    QCalendarWidget,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -2016,17 +2017,54 @@ def test_timeline_uses_compact_filter_combo_when_narrow(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     widget = TodayTimelineWidget(repository)
+    widget.set_date(datetime(2026, 6, 20).date())
     widget.resize(420, 640)
     widget.show()
     app.processEvents()
 
     assert widget.timeline_filter_segment.isHidden()
     assert widget.timeline_filter_combo.isVisible()
-    assert widget.date_label.text().count("/") == 1
+    assert widget.date_label.text() == "6월 20일"
+    assert "/" not in widget.date_label.text()
 
     widget.timeline_filter_combo.setCurrentIndex(widget.timeline_filter_combo.findData("focus"))
     app.processEvents()
     assert widget.timeline_filter_key == "focus"
+    widget.close()
+
+
+def test_timeline_date_picker_calendar_keeps_full_grid_when_popup_opens(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    widget = TodayTimelineWidget(repository)
+    widget.set_date(datetime(2026, 6, 20).date())
+    widget.resize(420, 640)
+    widget.show()
+    app.processEvents()
+
+    opened_dialogs: list[QDialog] = []
+
+    class CapturingDialog(QDialog):
+        def __init__(self, *args) -> None:
+            super().__init__(*args)
+            opened_dialogs.append(self)
+
+        def exec(self) -> QDialog.DialogCode:
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "QDialog", CapturingDialog)
+
+    widget.open_date_picker_from_label(None)
+    app.processEvents()
+
+    assert opened_dialogs
+    dialog = opened_dialogs[0]
+    calendar = dialog.findChild(QCalendarWidget)
+    assert calendar is not None
+    assert calendar.minimumWidth() >= 320
+    assert calendar.minimumHeight() >= 300
+    assert dialog.minimumWidth() >= 344
+    assert dialog.minimumHeight() >= 344
     widget.close()
 
 
