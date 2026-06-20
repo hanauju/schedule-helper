@@ -16878,11 +16878,27 @@ class SettingsDialog(QDialog):
         self.settings_tabs.setObjectName("settingsTabs")
         layout.addWidget(self.settings_tabs, 1)
 
-        general_form = self._add_settings_tab("기본")
+        general_form = self._add_settings_tab("일반")
         color_form = self._add_settings_tab("색상")
-        display_form = self._add_settings_tab("화면")
-        feature_form = self._add_settings_tab("기능")
-        layout_form = self._add_settings_tab("배치")
+        font_form = self._add_settings_tab("글꼴")
+        panel_form = self._add_settings_tab("패널")
+        image_form = self._add_settings_tab("이미지·배너")
+        clock_form = self._add_settings_tab("시계")
+        data_form = self._add_settings_tab("데이터")
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("라이트", "light")
+        self.theme_combo.addItem("다크", "dark")
+        theme_index = self.theme_combo.findData(_normalize_theme(preferences.appearance_theme))
+        self.theme_combo.setCurrentIndex(max(0, theme_index))
+        general_form.addRow("테마", self.theme_combo)
+
+        self.time_format_combo = QComboBox()
+        self.time_format_combo.addItem("24시간 (13:30)", "24h")
+        self.time_format_combo.addItem("12시간 (PM 1:30)", "12h")
+        time_index = self.time_format_combo.findData(preferences.time_format)
+        self.time_format_combo.setCurrentIndex(max(0, time_index))
+        general_form.addRow("시간 표시", self.time_format_combo)
 
         self.week_start_combo = QComboBox()
         self.week_start_combo.addItem("월요일", 0)
@@ -16890,6 +16906,15 @@ class SettingsDialog(QDialog):
         index = self.week_start_combo.findData(6 if preferences.week_start_day == 6 else 0)
         self.week_start_combo.setCurrentIndex(max(0, index))
         general_form.addRow("한 주의 시작", self.week_start_combo)
+
+        self.focus_rate_display_combo = QComboBox()
+        self.focus_rate_display_combo.addItem("링", "ring")
+        self.focus_rate_display_combo.addItem("막대", "bar")
+        focus_rate_index = self.focus_rate_display_combo.findData(
+            _normalize_focus_rate_display(preferences.focus_rate_display)
+        )
+        self.focus_rate_display_combo.setCurrentIndex(max(0, focus_rate_index))
+        general_form.addRow("집중률 표시", self.focus_rate_display_combo)
 
         self.app_title_edit = QLineEdit()
         self.app_title_edit.setText(preferences.app_title)
@@ -16914,7 +16939,6 @@ class SettingsDialog(QDialog):
         _stabilize_control(reset_storage_button, 80)
         reset_storage_button.clicked.connect(lambda: self.set_database_path(str(current_database_path)))
         storage_layout.addWidget(reset_storage_button)
-        general_form.addRow("정보 저장 위치", storage_row)
 
         self.accent_color = _normalize_accent_color(preferences.accent_color)
         self.button_color = _normalize_accent_color(getattr(preferences, "button_color", "#4f8c6b"))
@@ -16923,10 +16947,6 @@ class SettingsDialog(QDialog):
         self.panel_color = _normalize_optional_color(preferences.panel_color)
         self.table_color = _normalize_optional_color(preferences.table_color)
         self.text_color = _normalize_optional_color(preferences.text_color)
-        self.datetime_text_color = _normalize_optional_color(getattr(preferences, "datetime_panel_text_color", ""))
-        self.datetime_text_outline_color = _normalize_optional_color(
-            getattr(preferences, "datetime_panel_text_outline_color", "")
-        )
         color_form.addRow(
             self._build_color_group(
                 "전체 색",
@@ -16950,72 +16970,144 @@ class SettingsDialog(QDialog):
             )
         )
 
-        self.time_format_combo = QComboBox()
-        self.time_format_combo.addItem("24시간 (13:30)", "24h")
-        self.time_format_combo.addItem("12시간 (PM 1:30)", "12h")
-        time_index = self.time_format_combo.findData(preferences.time_format)
-        self.time_format_combo.setCurrentIndex(max(0, time_index))
-        general_form.addRow("시간 표시", self.time_format_combo)
+        font_row = QWidget()
+        font_layout = QHBoxLayout(font_row)
+        font_layout.setContentsMargins(0, 0, 0, 0)
+        font_layout.setSpacing(8)
+        self.use_default_main_font_check = SwitchCheckBox("기본 글꼴")
+        self.use_default_main_font_check.setObjectName("mainFontDefaultCheck")
+        self.use_default_main_font_check.setChecked(not bool(_normalize_main_font_family(preferences.main_font_family)))
+        font_layout.addWidget(self.use_default_main_font_check)
+        self.main_font_combo = NoScrollFontComboBox()
+        self.main_font_combo.setObjectName("mainFontCombo")
+        if _normalize_main_font_family(preferences.main_font_family):
+            self.main_font_combo.setCurrentFont(QFont(preferences.main_font_family))
+        _stabilize_control(self.main_font_combo, 220)
+        self.main_font_combo.setEnabled(not self.use_default_main_font_check.isChecked())
+        self.use_default_main_font_check.toggled.connect(lambda checked: self.main_font_combo.setEnabled(not checked))
+        font_layout.addWidget(self.main_font_combo, 1)
+        font_form.addRow("메인 글꼴", font_row)
 
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItem("라이트", "light")
-        self.theme_combo.addItem("다크", "dark")
-        theme_index = self.theme_combo.findData(_normalize_theme(preferences.appearance_theme))
-        self.theme_combo.setCurrentIndex(max(0, theme_index))
-        general_form.addRow("테마", self.theme_combo)
+        self.main_font_size_spin = NoScrollSpinBox()
+        self.main_font_size_spin.setObjectName("mainFontSizeSpin")
+        self.main_font_size_spin.setRange(10, 22)
+        self.main_font_size_spin.setValue(_normalize_main_font_size(preferences.main_font_size))
+        self.main_font_size_spin.setSuffix("px")
+        _stabilize_control(self.main_font_size_spin, 92)
+        font_form.addRow("메인 글자 크기", self.main_font_size_spin)
 
-        self.focus_rate_display_combo = QComboBox()
-        self.focus_rate_display_combo.addItem("링", "ring")
-        self.focus_rate_display_combo.addItem("막대", "bar")
-        focus_rate_index = self.focus_rate_display_combo.findData(
-            _normalize_focus_rate_display(preferences.focus_rate_display)
+        self.label_font_size_spin = NoScrollSpinBox()
+        self.label_font_size_spin.setObjectName("labelFontSizeSpin")
+        self.label_font_size_spin.setRange(10, 20)
+        self.label_font_size_spin.setValue(_normalize_label_font_size(getattr(preferences, "label_font_size", 13)))
+        self.label_font_size_spin.setSuffix("px")
+        _stabilize_control(self.label_font_size_spin, 92)
+        font_form.addRow("라벨 글자 크기", self.label_font_size_spin)
+
+        self.content_font_size_spin = NoScrollSpinBox()
+        self.content_font_size_spin.setObjectName("contentFontSizeSpin")
+        self.content_font_size_spin.setRange(11, 24)
+        self.content_font_size_spin.setValue(_normalize_content_font_size(getattr(preferences, "content_font_size", 13)))
+        self.content_font_size_spin.setSuffix("px")
+        _stabilize_control(self.content_font_size_spin, 92)
+        font_form.addRow("기록 글자 크기", self.content_font_size_spin)
+
+        self.show_pomodoro_check = SwitchCheckBox("표시")
+        self.show_focus_panel_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_focus_panel_check.setChecked(preferences.show_focus_panel)
+        panel_form.addRow("집중", self.show_focus_panel_check)
+
+        self.show_pomodoro_check.setChecked(preferences.show_pomodoro_controls)
+        panel_form.addRow("뽀모도로", self.show_pomodoro_check)
+
+        self.show_today_timeline_inline_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_today_timeline_inline_check.setChecked(preferences.show_today_timeline_inline)
+        panel_form.addRow("시간표", self.show_today_timeline_inline_check)
+
+        self.show_today_timeline_waiting_check = SwitchCheckBox("대기함 표시")
+        self.show_today_timeline_waiting_check.setChecked(preferences.show_today_timeline_waiting_panel)
+        panel_form.addRow("시간표 대기함", self.show_today_timeline_waiting_check)
+
+        self.show_today_timeline_waiting_pinned_check = SwitchCheckBox("대기함을 사이드바로 고정")
+        self.show_today_timeline_waiting_pinned_check.setChecked(preferences.show_today_timeline_waiting_pinned)
+        panel_form.addRow("대기함 고정", self.show_today_timeline_waiting_pinned_check)
+
+        self.show_today_checklist_inline_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_today_checklist_inline_check.setChecked(preferences.show_today_checklist_inline)
+        panel_form.addRow("오늘 체크리스트", self.show_today_checklist_inline_check)
+
+        self.show_quick_memo_panel_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_quick_memo_panel_check.setChecked(preferences.show_quick_memo_panel)
+        panel_form.addRow("메모", self.show_quick_memo_panel_check)
+
+        self.show_link_favorites_panel_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_link_favorites_panel_check.setChecked(preferences.show_link_favorites_panel)
+        panel_form.addRow("즐겨찾기", self.show_link_favorites_panel_check)
+
+        self.show_compact_favorites_panel_check = SwitchCheckBox("통합 위젯에 표시")
+        self.show_compact_favorites_panel_check.setChecked(preferences.show_compact_favorites_panel)
+        panel_form.addRow("위젯 즐겨찾기", self.show_compact_favorites_panel_check)
+
+        self.media_rounded_corners_check = SwitchCheckBox("배너와 이미지 모서리 둥글게")
+        self.show_header_banner_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_header_banner_check.setChecked(preferences.show_header_banner)
+        image_form.addRow("헤더 배너", self.show_header_banner_check)
+
+        header_image_row = QHBoxLayout()
+        self.header_banner_path_edit = QLineEdit()
+        self.header_banner_path_edit.setReadOnly(True)
+        self.header_banner_path_edit.setPlaceholderText("이미지를 선택하지 않음")
+        self.header_banner_path_edit.setText(preferences.header_banner_image_path)
+        _stabilize_control(self.header_banner_path_edit, 260)
+        header_image_row.addWidget(self.header_banner_path_edit, 1)
+        choose_header_image_button = QPushButton("이미지 선택")
+        _stabilize_control(choose_header_image_button, 96)
+        choose_header_image_button.clicked.connect(self.choose_header_banner_image)
+        header_image_row.addWidget(choose_header_image_button)
+        clear_header_image_button = QPushButton("지우기")
+        _stabilize_control(clear_header_image_button, 72)
+        clear_header_image_button.clicked.connect(lambda: self.set_header_banner_image_path(""))
+        header_image_row.addWidget(clear_header_image_button)
+        image_form.addRow("배너 이미지", header_image_row)
+
+        self.show_media_panel_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_media_panel_check.setChecked(preferences.show_media_panel)
+        image_form.addRow("이미지 패널 1", self.show_media_panel_check)
+
+        self.show_media_panel_2_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_media_panel_2_check.setChecked(getattr(preferences, "show_media_panel_2", False))
+        image_form.addRow("이미지 패널 2", self.show_media_panel_2_check)
+
+        self.show_media_panel_3_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_media_panel_3_check.setChecked(getattr(preferences, "show_media_panel_3", False))
+        image_form.addRow("이미지 패널 3", self.show_media_panel_3_check)
+
+        self.show_media_panel_4_check = SwitchCheckBox("메인 화면에 표시")
+        self.show_media_panel_4_check.setChecked(getattr(preferences, "show_media_panel_4", False))
+        image_form.addRow("이미지 패널 4", self.show_media_panel_4_check)
+
+        self.media_rounded_corners_check.setChecked(getattr(preferences, "media_rounded_corners", True))
+        image_form.addRow("이미지 모서리", self.media_rounded_corners_check)
+
+        self.datetime_text_color = _normalize_optional_color(getattr(preferences, "datetime_panel_text_color", ""))
+        self.datetime_text_outline_color = _normalize_optional_color(
+            getattr(preferences, "datetime_panel_text_outline_color", "")
         )
-        self.focus_rate_display_combo.setCurrentIndex(max(0, focus_rate_index))
-        general_form.addRow("집중률 표시", self.focus_rate_display_combo)
-
         self.show_datetime_panel_check = SwitchCheckBox("메인 화면에 표시")
         self.show_datetime_panel_check.setChecked(preferences.show_datetime_panel)
-        display_form.addRow("날짜/시간 패널", self.show_datetime_panel_check)
+        clock_form.addRow("날짜/시간 패널", self.show_datetime_panel_check)
 
         self.show_current_date_check = SwitchCheckBox("날짜 표시")
         self.show_current_date_check.setChecked(preferences.show_current_date)
-        display_form.addRow("현재 날짜", self.show_current_date_check)
+        clock_form.addRow("현재 날짜", self.show_current_date_check)
 
         self.show_current_time_check = SwitchCheckBox("시간 표시")
         self.show_current_time_check.setChecked(preferences.show_current_time)
-        display_form.addRow("현재 시간", self.show_current_time_check)
+        clock_form.addRow("현재 시간", self.show_current_time_check)
 
         self.show_current_seconds_check = SwitchCheckBox("초 표시")
         self.show_current_seconds_check.setChecked(preferences.show_current_seconds)
-        display_form.addRow("현재 초", self.show_current_seconds_check)
-
-        self.media_rounded_corners_check = SwitchCheckBox("배너와 이미지 모서리 둥글게")
-        self.datetime_transparent_check = SwitchCheckBox("배경 투명")
-        self.datetime_transparent_check.setChecked(getattr(preferences, "datetime_panel_transparent_background", True))
-        display_form.addRow("시간 패널 배경", self.datetime_transparent_check)
-
-        self.datetime_border_check = SwitchCheckBox("테두리 표시")
-        self.datetime_border_check.setChecked(getattr(preferences, "datetime_panel_border_enabled", False))
-        display_form.addRow("시간 패널 테두리", self.datetime_border_check)
-
-        display_form.addRow("시간 글자색", self._build_color_control("datetime_text", "", "시간 글자색"))
-
-        display_form.addRow(
-            "시간 글자 외곽선색",
-            self._build_color_control("datetime_text_outline", "", "시간 글자 외곽선색"),
-        )
-
-        self.datetime_text_outline_thickness_spin = NoScrollSpinBox()
-        self.datetime_text_outline_thickness_spin.setObjectName("datetimeTextOutlineThicknessSpin")
-        self.datetime_text_outline_thickness_spin.setRange(0, 12)
-        self.datetime_text_outline_thickness_spin.setValue(
-            _normalize_datetime_text_outline_thickness(
-                getattr(preferences, "datetime_panel_text_outline_thickness", 0)
-            )
-        )
-        self.datetime_text_outline_thickness_spin.setSuffix("px")
-        _stabilize_control(self.datetime_text_outline_thickness_spin, 92)
-        display_form.addRow("시간 글자 외곽선 두께", self.datetime_text_outline_thickness_spin)
+        clock_form.addRow("현재 초", self.show_current_seconds_check)
 
         datetime_font_row = QWidget()
         datetime_font_layout = QHBoxLayout(datetime_font_row)
@@ -17033,7 +17125,7 @@ class SettingsDialog(QDialog):
         self.datetime_font_combo.setEnabled(not self.use_default_datetime_font_check.isChecked())
         self.use_default_datetime_font_check.toggled.connect(lambda checked: self.datetime_font_combo.setEnabled(not checked))
         datetime_font_layout.addWidget(self.datetime_font_combo, 1)
-        display_form.addRow("시간 글꼴", datetime_font_row)
+        clock_form.addRow("시간 글꼴", datetime_font_row)
 
         self.datetime_font_size_spin = NoScrollSpinBox()
         self.datetime_font_size_spin.setObjectName("datetimeFontSizeSpin")
@@ -17043,7 +17135,34 @@ class SettingsDialog(QDialog):
         )
         self.datetime_font_size_spin.setSuffix("px")
         _stabilize_control(self.datetime_font_size_spin, 92)
-        display_form.addRow("시간 글자 크기", self.datetime_font_size_spin)
+        clock_form.addRow("시간 글자 크기", self.datetime_font_size_spin)
+
+        clock_form.addRow("시간 글자색", self._build_color_control("datetime_text", "", "시간 글자색"))
+
+        clock_form.addRow(
+            "시간 글자 외곽선색",
+            self._build_color_control("datetime_text_outline", "", "시간 글자 외곽선색"),
+        )
+
+        self.datetime_text_outline_thickness_spin = NoScrollSpinBox()
+        self.datetime_text_outline_thickness_spin.setObjectName("datetimeTextOutlineThicknessSpin")
+        self.datetime_text_outline_thickness_spin.setRange(0, 12)
+        self.datetime_text_outline_thickness_spin.setValue(
+            _normalize_datetime_text_outline_thickness(
+                getattr(preferences, "datetime_panel_text_outline_thickness", 0)
+            )
+        )
+        self.datetime_text_outline_thickness_spin.setSuffix("px")
+        _stabilize_control(self.datetime_text_outline_thickness_spin, 92)
+        clock_form.addRow("시간 글자 외곽선 두께", self.datetime_text_outline_thickness_spin)
+
+        self.datetime_transparent_check = SwitchCheckBox("배경 투명")
+        self.datetime_transparent_check.setChecked(getattr(preferences, "datetime_panel_transparent_background", True))
+        clock_form.addRow("시간 패널 배경", self.datetime_transparent_check)
+
+        self.datetime_border_check = SwitchCheckBox("테두리 표시")
+        self.datetime_border_check.setChecked(getattr(preferences, "datetime_panel_border_enabled", False))
+        clock_form.addRow("시간 패널 테두리", self.datetime_border_check)
 
         datetime_image_row = QHBoxLayout()
         self.datetime_background_path_edit = QLineEdit()
@@ -17060,125 +17179,7 @@ class SettingsDialog(QDialog):
         _stabilize_control(clear_datetime_image_button, 72)
         clear_datetime_image_button.clicked.connect(lambda: self.set_datetime_background_image_path(""))
         datetime_image_row.addWidget(clear_datetime_image_button)
-        display_form.addRow("시간 배경 이미지", datetime_image_row)
-
-        self.media_rounded_corners_check.setChecked(getattr(preferences, "media_rounded_corners", True))
-        display_form.addRow("이미지 모서리", self.media_rounded_corners_check)
-
-        font_row = QWidget()
-        font_layout = QHBoxLayout(font_row)
-        font_layout.setContentsMargins(0, 0, 0, 0)
-        font_layout.setSpacing(8)
-        self.use_default_main_font_check = SwitchCheckBox("기본 글꼴")
-        self.use_default_main_font_check.setObjectName("mainFontDefaultCheck")
-        self.use_default_main_font_check.setChecked(not bool(_normalize_main_font_family(preferences.main_font_family)))
-        font_layout.addWidget(self.use_default_main_font_check)
-        self.main_font_combo = NoScrollFontComboBox()
-        self.main_font_combo.setObjectName("mainFontCombo")
-        if _normalize_main_font_family(preferences.main_font_family):
-            self.main_font_combo.setCurrentFont(QFont(preferences.main_font_family))
-        _stabilize_control(self.main_font_combo, 220)
-        self.main_font_combo.setEnabled(not self.use_default_main_font_check.isChecked())
-        self.use_default_main_font_check.toggled.connect(lambda checked: self.main_font_combo.setEnabled(not checked))
-        font_layout.addWidget(self.main_font_combo, 1)
-        display_form.addRow("메인 글꼴", font_row)
-
-        self.main_font_size_spin = NoScrollSpinBox()
-        self.main_font_size_spin.setObjectName("mainFontSizeSpin")
-        self.main_font_size_spin.setRange(10, 22)
-        self.main_font_size_spin.setValue(_normalize_main_font_size(preferences.main_font_size))
-        self.main_font_size_spin.setSuffix("px")
-        _stabilize_control(self.main_font_size_spin, 92)
-        display_form.addRow("메인 글자 크기", self.main_font_size_spin)
-
-        self.label_font_size_spin = NoScrollSpinBox()
-        self.label_font_size_spin.setObjectName("labelFontSizeSpin")
-        self.label_font_size_spin.setRange(10, 20)
-        self.label_font_size_spin.setValue(_normalize_label_font_size(getattr(preferences, "label_font_size", 13)))
-        self.label_font_size_spin.setSuffix("px")
-        _stabilize_control(self.label_font_size_spin, 92)
-        display_form.addRow("라벨 글자 크기", self.label_font_size_spin)
-
-        self.content_font_size_spin = NoScrollSpinBox()
-        self.content_font_size_spin.setObjectName("contentFontSizeSpin")
-        self.content_font_size_spin.setRange(11, 24)
-        self.content_font_size_spin.setValue(_normalize_content_font_size(getattr(preferences, "content_font_size", 13)))
-        self.content_font_size_spin.setSuffix("px")
-        _stabilize_control(self.content_font_size_spin, 92)
-        display_form.addRow("기록 글자 크기", self.content_font_size_spin)
-
-        self.show_header_banner_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_header_banner_check.setChecked(preferences.show_header_banner)
-        display_form.addRow("헤더 배너", self.show_header_banner_check)
-
-        header_image_row = QHBoxLayout()
-        self.header_banner_path_edit = QLineEdit()
-        self.header_banner_path_edit.setReadOnly(True)
-        self.header_banner_path_edit.setPlaceholderText("이미지를 선택하지 않음")
-        self.header_banner_path_edit.setText(preferences.header_banner_image_path)
-        _stabilize_control(self.header_banner_path_edit, 260)
-        header_image_row.addWidget(self.header_banner_path_edit, 1)
-        choose_header_image_button = QPushButton("이미지 선택")
-        _stabilize_control(choose_header_image_button, 96)
-        choose_header_image_button.clicked.connect(self.choose_header_banner_image)
-        header_image_row.addWidget(choose_header_image_button)
-        clear_header_image_button = QPushButton("지우기")
-        _stabilize_control(clear_header_image_button, 72)
-        clear_header_image_button.clicked.connect(lambda: self.set_header_banner_image_path(""))
-        header_image_row.addWidget(clear_header_image_button)
-        display_form.addRow("배너 이미지", header_image_row)
-
-        self.show_pomodoro_check = SwitchCheckBox("표시")
-        self.show_focus_panel_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_focus_panel_check.setChecked(preferences.show_focus_panel)
-        feature_form.addRow("집중", self.show_focus_panel_check)
-
-        self.show_pomodoro_check.setChecked(preferences.show_pomodoro_controls)
-        feature_form.addRow("뽀모도로", self.show_pomodoro_check)
-
-        self.show_today_timeline_inline_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_today_timeline_inline_check.setChecked(preferences.show_today_timeline_inline)
-        feature_form.addRow("시간표", self.show_today_timeline_inline_check)
-
-        self.show_today_timeline_waiting_check = SwitchCheckBox("대기함 표시")
-        self.show_today_timeline_waiting_check.setChecked(preferences.show_today_timeline_waiting_panel)
-        feature_form.addRow("시간표 대기함", self.show_today_timeline_waiting_check)
-
-        self.show_today_timeline_waiting_pinned_check = SwitchCheckBox("대기함을 사이드바로 고정")
-        self.show_today_timeline_waiting_pinned_check.setChecked(preferences.show_today_timeline_waiting_pinned)
-        feature_form.addRow("대기함 고정", self.show_today_timeline_waiting_pinned_check)
-
-        self.show_today_checklist_inline_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_today_checklist_inline_check.setChecked(preferences.show_today_checklist_inline)
-        feature_form.addRow("오늘 체크리스트", self.show_today_checklist_inline_check)
-
-        self.show_quick_memo_panel_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_quick_memo_panel_check.setChecked(preferences.show_quick_memo_panel)
-        feature_form.addRow("메모", self.show_quick_memo_panel_check)
-
-        self.show_link_favorites_panel_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_link_favorites_panel_check.setChecked(preferences.show_link_favorites_panel)
-        feature_form.addRow("즐겨찾기", self.show_link_favorites_panel_check)
-
-        self.show_media_panel_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_check.setChecked(preferences.show_media_panel)
-        feature_form.addRow("이미지 패널 1", self.show_media_panel_check)
-
-        self.show_media_panel_2_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_2_check.setChecked(getattr(preferences, "show_media_panel_2", False))
-        feature_form.addRow("이미지 패널 2", self.show_media_panel_2_check)
-
-        self.show_media_panel_3_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_3_check.setChecked(getattr(preferences, "show_media_panel_3", False))
-        feature_form.addRow("이미지 패널 3", self.show_media_panel_3_check)
-
-        self.show_media_panel_4_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_4_check.setChecked(getattr(preferences, "show_media_panel_4", False))
-        feature_form.addRow("이미지 패널 4", self.show_media_panel_4_check)
-
-        self.show_compact_favorites_panel_check = SwitchCheckBox("통합 위젯에 표시")
-        self.show_compact_favorites_panel_check.setChecked(preferences.show_compact_favorites_panel)
-        feature_form.addRow("위젯 즐겨찾기", self.show_compact_favorites_panel_check)
+        clock_form.addRow("시간 배경 이미지", datetime_image_row)
 
         layout_tools_panel = QWidget()
         layout_tools_row = QHBoxLayout(layout_tools_panel)
@@ -17197,7 +17198,8 @@ class SettingsDialog(QDialog):
         layout_tools_row.addWidget(load_layout_button)
         layout_tools_row.addWidget(reset_layout_button)
         layout_tools_row.addStretch(1)
-        layout_form.addRow("화면 배치", layout_tools_panel)
+        data_form.addRow("화면 배치", layout_tools_panel)
+        data_form.addRow("정보 저장 위치", storage_row)
 
         button_row = QHBoxLayout()
         button_row.addStretch(1)
