@@ -482,7 +482,7 @@ def _eyedropper_cursor() -> QCursor:
     painter.setPen(QPen(QColor("#18201b"), 2))
     painter.setBrush(QColor("#ffffff"))
     painter.drawEllipse(QPoint(22, 6), 5, 5)
-    painter.setBrush(QColor("#4f8c6b"))
+    painter.setBrush(QColor("#68a8f5"))
     painter.drawEllipse(QPoint(7, 22), 4, 4)
     painter.end()
 
@@ -656,7 +656,7 @@ class FeatureMoveBar(QWidget):
         dragging = bool(self.property("dragging"))
         if not hovering and not dragging:
             return
-        accent = "#4f8c6b"
+        accent = "#68a8f5"
         window = self.window()
         preferences = getattr(window, "preferences", None)
         if not isinstance(preferences, Preference):
@@ -867,8 +867,8 @@ class FocusRateRing(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.ratio = 1.0
-        self.accent_color = "#4f8c6b"
-        self.track_color = "#dde6e0"
+        self.accent_color = "#68a8f5"
+        self.track_color = "#d9e7f5"
         self.text_color = "#18201b"
         self.setMinimumSize(72, 72)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
@@ -921,7 +921,7 @@ class HeaderBannerWidget(QLabel):
         self.movie: QMovie | None = None
         self.select_callback: Callable[[], None] | None = None
         self.context_callback: Callable[[QWidget, QPoint], None] | None = None
-        self.accent_color = "#4f8c6b"
+        self.accent_color = "#68a8f5"
         self.border_color = "#dbe5df"
         self.surface_color = "#f3f6f4"
         self.image_position = "center"
@@ -1334,7 +1334,7 @@ class SwitchCheckBox(QCheckBox):
         event.accept()
         preferences = _preferences_from_widget(self)
         palette = _resolved_theme_palette(preferences)
-        accent = _normalize_accent_color(getattr(preferences, "accent_color", "#4f8c6b"))
+        accent = _normalize_accent_color(getattr(preferences, "accent_color", "#68a8f5"))
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -1377,7 +1377,7 @@ class DashboardGridGuideOverlay(QWidget):
         super().paintEvent(event)
         preferences = _preferences_from_widget(self)
         palette = _resolved_theme_palette(preferences)
-        accent = _normalize_accent_color(getattr(preferences, "accent_color", "#4f8c6b"))
+        accent = _normalize_accent_color(getattr(preferences, "accent_color", "#68a8f5"))
 
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
@@ -4790,11 +4790,11 @@ class MainWindow(QMainWindow):
         return page
 
     def _apply_style(self) -> None:
-        accent = _normalize_accent_color(getattr(self.preferences, "accent_color", "#4f8c6b"))
+        accent = _normalize_accent_color(getattr(self.preferences, "accent_color", "#68a8f5"))
         accent_hover = _accent_hover_color(accent)
         accent_soft = _accent_rgba(accent, 0.10)
         accent_handle = _accent_rgba(accent, 0.18)
-        button_color = _normalize_accent_color(getattr(self.preferences, "button_color", "#4f8c6b"))
+        button_color = _normalize_accent_color(getattr(self.preferences, "button_color", "#d9e7f5"))
         button_hover = _accent_hover_color(button_color)
         is_dark_theme = _normalize_theme(getattr(self.preferences, "appearance_theme", "light")) == "dark"
         palette = _resolved_theme_palette(self.preferences)
@@ -8351,7 +8351,8 @@ class MainWindow(QMainWindow):
             "width": max(self.width(), int(default_window.get("width", 1120))),
             "height": max(self.height(), int(default_window.get("height", 760))),
         }
-        self.apply_layout_state(state, include_visibility=False)
+        self.apply_layout_state(state, include_visibility=True)
+        self.save_last_layout_state()
         self.statusBar().showMessage("기본 배치로 되돌렸습니다.", 2500)
 
     def current_layout_state(self) -> dict[str, object]:
@@ -8401,6 +8402,25 @@ class MainWindow(QMainWindow):
         }
 
     def default_layout_state(self) -> dict[str, object]:
+        default_preferences = Preference()
+        default_visible = {
+            key: bool(getattr(default_preferences, attribute))
+            for key in (
+                "datetime",
+                "focus",
+                "pomodoro",
+                "header_banner",
+                "today_timeline",
+                "today_timeline_waiting",
+                "today_timeline_waiting_pinned",
+                "today_checklist",
+                "quick_memo",
+                "link_favorites",
+                *MEDIA_PANEL_KEYS,
+                "compact_favorites",
+            )
+            if (attribute := self._feature_visibility_attribute(key)) is not None
+        }
         return {
             "version": 1,
             "window": {
@@ -8423,6 +8443,7 @@ class MainWindow(QMainWindow):
                 "grid": self.default_feature_grid_layout(),
                 **self.default_feature_layout(),
             },
+            "visible": default_visible,
         }
 
     def apply_layout_state(self, state: dict[str, object], include_visibility: bool = True) -> None:
@@ -8525,17 +8546,17 @@ class MainWindow(QMainWindow):
     def default_feature_dashboard_layout(self) -> list[dict[str, object]]:
         return [
             {"key": "header_banner", "x": 0, "y": 0, "w": 12, "h": 3},
-            {"key": "focus", "x": 0, "y": 3, "w": 5, "h": 7},
-            {"key": "today_timeline", "x": 0, "y": 10, "w": 5, "h": 11},
-            {"key": "today_checklist", "x": 5, "y": 3, "w": 4, "h": 6},
-            {"key": "quick_memo", "x": 5, "y": 9, "w": 4, "h": 12},
-            {"key": "pomodoro", "x": 9, "y": 3, "w": 3, "h": 4},
-            {"key": "media_panel", "x": 9, "y": 7, "w": 3, "h": 8},
-            {"key": "link_favorites", "x": 9, "y": 15, "w": 3, "h": 6},
-            {"key": "datetime", "x": 9, "y": 21, "w": 3, "h": 1},
-            {"key": "media_panel_2", "x": 0, "y": 21, "w": 4, "h": 6},
-            {"key": "media_panel_3", "x": 4, "y": 21, "w": 4, "h": 6},
-            {"key": "media_panel_4", "x": 8, "y": 22, "w": 4, "h": 6},
+            {"key": "focus", "x": 0, "y": 3, "w": 3, "h": 16},
+            {"key": "quick_memo", "x": 3, "y": 3, "w": 3, "h": 16},
+            {"key": "today_checklist", "x": 6, "y": 3, "w": 3, "h": 16},
+            {"key": "today_timeline", "x": 9, "y": 3, "w": 3, "h": 16},
+            {"key": "pomodoro", "x": 0, "y": 19, "w": 3, "h": 6},
+            {"key": "link_favorites", "x": 3, "y": 19, "w": 3, "h": 6},
+            {"key": "media_panel", "x": 6, "y": 19, "w": 3, "h": 6},
+            {"key": "media_panel_2", "x": 9, "y": 19, "w": 3, "h": 6},
+            {"key": "datetime", "x": 0, "y": 25, "w": 3, "h": 1},
+            {"key": "media_panel_3", "x": 6, "y": 41, "w": 4, "h": 6},
+            {"key": "media_panel_4", "x": 2, "y": 41, "w": 4, "h": 6},
         ]
 
     def default_feature_rows_layout(self) -> list[dict[str, object]]:
@@ -17008,7 +17029,7 @@ class SettingsDialog(QDialog):
         storage_layout.addWidget(reset_storage_button)
 
         self.accent_color = _normalize_accent_color(preferences.accent_color)
-        self.button_color = _normalize_accent_color(getattr(preferences, "button_color", "#4f8c6b"))
+        self.button_color = _normalize_accent_color(getattr(preferences, "button_color", "#d9e7f5"))
         self.background_color = _normalize_optional_color(preferences.background_color)
         self.inner_background_color = _normalize_optional_color(preferences.inner_background_color)
         self.panel_color = _normalize_optional_color(preferences.panel_color)
@@ -17019,10 +17040,10 @@ class SettingsDialog(QDialog):
                 "전체 색",
                 "바탕 배경을 바꾸면 앱 전체가 그 색이 되고, 따로 지정하지 않은 카드·표 색도 같은 톤으로 맞춥니다.",
                 (
-                    ("background", "바탕 배경", "", "앱 전체 배경"),
-                    ("accent", "강조", "#4f8c6b", "선택과 진행"),
-                    ("button", "버튼", "#4f8c6b", "버튼 배경"),
-                    ("text", "글자", "", "전체 글자"),
+                    ("background", "바탕 배경", "#d9e7f5", "앱 전체 배경"),
+                    ("accent", "강조", "#68a8f5", "선택과 진행"),
+                    ("button", "버튼", "#d9e7f5", "버튼 배경"),
+                    ("text", "글자", "#111315", "전체 글자"),
                 ),
             )
         )
@@ -17031,8 +17052,8 @@ class SettingsDialog(QDialog):
                 "내용 색",
                 "필요할 때만 개별 영역을 덮어씁니다. 비워두면 전체 색을 따라갑니다.",
                 (
-                    ("panel", "카드/입력", "", "패널과 입력칸"),
-                    ("table", "시간표", "", "표와 시간칸"),
+                    ("panel", "카드/입력", "#fafafa", "패널과 입력칸"),
+                    ("table", "시간표", "#fafafa", "표와 시간칸"),
                 ),
             )
         )
@@ -17394,6 +17415,21 @@ class SettingsDialog(QDialog):
         setattr(self, f"{key}_swatch", swatch)
         control_row.addWidget(swatch)
 
+        hex_edit = QLineEdit()
+        hex_edit.setObjectName(f"{key}ColorHexEdit")
+        hex_edit.setMaxLength(7)
+        hex_edit.setPlaceholderText("#RRGGBB")
+        hex_edit.setToolTip("색상 코드를 직접 입력하세요. 예: #68a8f5")
+        _stabilize_control(hex_edit, 84)
+        setattr(self, f"{key}_hex_edit", hex_edit)
+        hex_edit.textEdited.connect(
+            lambda value, name=key: self._on_setting_color_hex_edited(name, value)
+        )
+        hex_edit.editingFinished.connect(
+            lambda name=key: self._on_setting_color_hex_committed(name)
+        )
+        control_row.addWidget(hex_edit)
+
         choose_button = QPushButton("색 선택")
         _stabilize_control(choose_button, 68)
         choose_button.clicked.connect(lambda _checked=False, name=key, label=title, default=default_color: self.choose_setting_color(name, label, default))
@@ -17487,22 +17523,38 @@ class SettingsDialog(QDialog):
         self.preview_preferences()
 
     def update_setting_color_swatch(self, key: str) -> None:
-        swatch = getattr(self, f"{key}_swatch", None)
-        if not isinstance(swatch, QLabel):
-            return
         color = self.setting_color_value(key)
-        swatch.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        if color:
-            swatch.setText("")
-            swatch.setStyleSheet(f"background: {color}; border: 1px solid #d0d7d2; border-radius: 8px;")
-        else:
-            swatch.setText("기본")
-            swatch.setStyleSheet(
-                "background: transparent; border: 1px solid #d0d7d2; border-radius: 8px; color: #5c5c66;"
-            )
+        swatch = getattr(self, f"{key}_swatch", None)
+        if isinstance(swatch, QLabel):
+            swatch.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            if color:
+                swatch.setText("")
+                swatch.setStyleSheet(f"background: {color}; border: 1px solid #d0d7d2; border-radius: 8px;")
+            else:
+                swatch.setText("기본")
+                swatch.setStyleSheet(
+                    "background: transparent; border: 1px solid #d0d7d2; border-radius: 8px; color: #5c5c66;"
+                )
+        hex_edit = getattr(self, f"{key}_hex_edit", None)
+        if isinstance(hex_edit, QLineEdit) and hex_edit.text().strip().lower() != color.lower():
+            blocked = hex_edit.blockSignals(True)
+            hex_edit.setText(color)
+            hex_edit.blockSignals(blocked)
+
+    def _on_setting_color_hex_edited(self, key: str, text: str) -> None:
+        value = text.strip()
+        if not value:
+            if key not in {"accent", "button"}:
+                self.set_setting_color(key, "")
+            return
+        if _normalize_optional_color(value):
+            self.set_setting_color(key, value)
+
+    def _on_setting_color_hex_committed(self, key: str) -> None:
+        self.update_setting_color_swatch(key)
 
     def choose_accent_color(self) -> None:
-        self.choose_setting_color("accent", "강조색", "#4f8c6b")
+        self.choose_setting_color("accent", "강조색", "#68a8f5")
 
     def set_accent_color(self, color: str) -> None:
         self.set_setting_color("accent", color)
@@ -17567,7 +17619,7 @@ class SettingsDialog(QDialog):
         self._live_preview_enabled = False
         self.app_title_edit.setText(preferences.app_title)
         self.set_accent_color(preferences.accent_color)
-        self.set_setting_color("button", getattr(preferences, "button_color", "#4f8c6b"))
+        self.set_setting_color("button", getattr(preferences, "button_color", "#d9e7f5"))
         self.set_background_color(preferences.background_color)
         self.set_setting_color("inner_background", preferences.inner_background_color)
         self.set_setting_color("panel", preferences.panel_color)
@@ -18634,7 +18686,7 @@ def _normalize_accent_color(value: object) -> str:
         character in "0123456789abcdefABCDEF" for character in color[1:]
     ):
         return color.lower()
-    return "#4f8c6b"
+    return "#68a8f5"
 
 
 def _normalize_optional_color(value: object) -> str:

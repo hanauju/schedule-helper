@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
     QDialog,
     QFrame,
     QLabel,
+    QLineEdit,
     QListWidget,
     QMessageBox,
     QPushButton,
@@ -37,6 +38,7 @@ from app.ui.main_window import (
     DASHBOARD_GRID_GAP,
     DASHBOARD_GRID_COLUMNS,
     DASHBOARD_GRID_ROW_HEIGHT,
+    FLOATING_OVERLAY_FEATURE_KEYS,
     PANEL_CONTROL_HEIGHT,
     PANEL_CORNER_RADIUS,
     PANEL_HANDLE_CONTENT_GAP,
@@ -438,11 +440,11 @@ def test_feature_move_bar_uses_accent_when_dragging(tmp_path) -> None:
     assert move_bar.testAttribute(Qt.WidgetAttribute.WA_Hover)
     assert move_bar.hasMouseTracking()
     assert "QWidget#featureMoveBar:hover" in window.styleSheet()
-    assert "rgba(79, 140, 107, 0.18)" in window.styleSheet()
-    assert "border: 1px solid rgba(79, 140, 107, 0.18)" in window.styleSheet()
+    assert "rgba(104, 168, 245, 0.18)" in window.styleSheet()
+    assert "border: 1px solid rgba(104, 168, 245, 0.18)" in window.styleSheet()
     assert "QWidget#featureMoveBar[dragging=\"true\"]" in window.styleSheet()
-    assert "background: #4f8c6b" in window.styleSheet()
-    assert "border: 1px solid #4f8c6b" in window.styleSheet()
+    assert "background: #68a8f5" in window.styleSheet()
+    assert "border: 1px solid #68a8f5" in window.styleSheet()
 
     QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Enter))
     assert move_bar.property("hovering") is True
@@ -522,6 +524,9 @@ def test_feature_move_bar_shows_central_grip_affordance(tmp_path) -> None:
 def test_feature_panel_controls_share_consistent_alignment_metrics(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_today_checklist_inline = False
+    repository.save_preferences(preferences)
     window = MainWindow(repository)
     window.resize(1600, 900)
     window.show()
@@ -542,9 +547,6 @@ def test_feature_panel_controls_share_consistent_alignment_metrics(tmp_path) -> 
         window.start_pomodoro_button,
         window.pause_pomodoro_button,
         window.reset_pomodoro_button,
-        window.today_checklist_widget.new_task_type_combo,
-        window.today_checklist_widget.new_task_edit,
-        window.today_checklist_widget.findChild(QPushButton, "checklistAddButton"),
         window.quick_note_folder_combo,
         window.note_filter_combo,
     ]
@@ -730,17 +732,17 @@ def test_app_bar_shows_default_orot_branding(tmp_path) -> None:
     assert orot_wordmark.text() == "OROT"
     style = window.styleSheet()
     chrome_bar_style = style[style.index("QWidget#appChromeBar {") : style.index("QWidget#featureGrid")]
-    assert "background: #ffffff;" in chrome_bar_style
+    assert "background: #fafafa;" in chrome_bar_style
     chrome_title_style = style[style.index("QLabel#chromeTitle {") : style.index("QLabel#eyebrowLabel")]
     assert "color: #6fa8e0;" in chrome_title_style
     assert OROT_RING_COLOR == "#6fa8e0"
     assert window.orot_mark._color.name() == "#6fa8e0"
     assert window.compact_button.objectName() == "topBarButton"
     top_button_style = style[style.index("QPushButton#topBarButton {") : style.index("QPushButton#topBarAccentButton")]
-    assert "background: #ffffff;" in top_button_style
+    assert "background: #fafafa;" in top_button_style
     assert "__BUTTON_BG__" not in top_button_style
     pin_style = style[style.index("QCheckBox#pinCheck {") : style.index("QCheckBox#pinCheck::indicator")]
-    assert "background: #ffffff;" in pin_style
+    assert "background: #fafafa;" in pin_style
     assert "__BUTTON_BG__" not in pin_style
     window.close()
 
@@ -1419,7 +1421,7 @@ def test_main_window_applies_configured_font_and_scales_text(tmp_path) -> None:
     assert 'font-family: "Arial", ' in style
     assert '"Malgun Gothic"' in style
     assert '"Segoe UI"' in style
-    assert "QWidget {\n                color: #18201b;\n                font-family:" in style
+    assert "QWidget {\n                color: #111315;\n                font-family:" in style
     assert "font-size: 15px;" in style
     assert "QLabel#noteBodyLabel" in style
     assert "QLabel#sectionTitle," in style
@@ -1478,8 +1480,8 @@ def test_settings_background_live_preview_paints_main_shell_without_saving(tmp_p
     assert shell_block is not None and "#112233" in shell_block.group(1)
     assert body_block is not None and "#112233" in body_block.group(1)
     assert main_block is not None and "#112233" in main_block.group(1)
-    assert widget_block is not None and "color: #eef4ef;" in widget_block.group(1)
-    assert repository.get_preferences().background_color == ""
+    assert widget_block is not None and "color: #111315;" in widget_block.group(1)
+    assert repository.get_preferences().background_color == "#d9e7f5"
 
     dialog.close()
     window.close()
@@ -1498,6 +1500,63 @@ def test_settings_inner_background_field_preserved_without_ui_control(tmp_path) 
 
     assert getattr(dialog, "inner_background_swatch", None) is None
     assert dialog.preferences().inner_background_color == "#0a1b2c"
+
+    dialog.close()
+
+
+def test_settings_accent_hex_field_applies_typed_color_live(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    accent_hex = getattr(dialog, "accent_hex_edit", None)
+    assert isinstance(accent_hex, QLineEdit)
+    assert accent_hex.text().lower() == "#68a8f5"
+
+    accent_hex.setText("#3366aa")
+    accent_hex.textEdited.emit("#3366aa")
+    app.processEvents()
+
+    assert dialog.setting_color_value("accent") == "#3366aa"
+    assert window.preferences.accent_color == "#3366aa"
+    assert repository.get_preferences().accent_color == "#68a8f5"
+
+    dialog.set_setting_color("accent", "#112233")
+    assert accent_hex.text() == "#112233"
+
+    accent_hex.setText("#11")
+    accent_hex.textEdited.emit("#11")
+    assert dialog.setting_color_value("accent") == "#112233"
+
+    dialog.close()
+    window.close()
+
+
+def test_settings_optional_color_hex_field_clears_to_theme_default(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    dialog = SettingsDialog(repository.get_preferences())
+    dialog.show()
+    app.processEvents()
+
+    panel_hex = getattr(dialog, "panel_hex_edit", None)
+    assert isinstance(panel_hex, QLineEdit)
+    assert panel_hex.text().lower() == "#fafafa"
+
+    panel_hex.setText("#abcdef")
+    panel_hex.textEdited.emit("#abcdef")
+    assert dialog.setting_color_value("panel") == "#abcdef"
+
+    panel_hex.setText("")
+    panel_hex.textEdited.emit("")
+    assert dialog.setting_color_value("panel") == ""
+    assert dialog.preferences().panel_color == ""
 
     dialog.close()
 
@@ -1644,7 +1703,7 @@ def test_settings_cancel_restores_live_preview_changes(tmp_path, monkeypatch) ->
     app.processEvents()
 
     assert window.preferences.content_font_size == 13
-    assert window.preferences.accent_color == "#4f8c6b"
+    assert window.preferences.accent_color == "#68a8f5"
     assert window.memo_panel.isVisible()
     assert repository.get_preferences().content_font_size == 13
     window.close()
@@ -1655,6 +1714,9 @@ def test_focus_panel_target_controls_start_collapsed_and_splitter_is_slim(tmp_pa
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
     window.show()
+    app.processEvents()
+    window.focus_content_panel.setFixedSize(720, max(520, window.focus_content_panel.height()))
+    window.update_focus_panel_responsive_layout()
     app.processEvents()
 
     assert not window.target_combo.isVisible()
@@ -1679,6 +1741,9 @@ def test_focus_panel_reflows_controls_when_narrow(tmp_path) -> None:
     window = MainWindow(repository)
     window.resize(1280, 820)
     window.show()
+    app.processEvents()
+    window.focus_content_panel.setFixedSize(720, max(520, window.focus_content_panel.height()))
+    window.update_focus_panel_responsive_layout()
     app.processEvents()
 
     form = window.focus_form
@@ -1927,8 +1992,10 @@ def test_same_size_feature_panels_share_inner_rhythm(tmp_path) -> None:
     window.update_memo_panel_responsive_layout()
     window.link_favorites_content_panel.setFixedSize(560, 260)
     window.update_link_favorites_responsive_layout()
-    window.today_checklist_widget.resize(560, 420)
-    window.inline_timeline_widget.resize(700, 520)
+    window.today_checklist_widget.setFixedSize(560, 420)
+    window.timeline_panel.setFixedSize(760, 620)
+    window.inline_timeline_widget.setFixedSize(700, 520)
+    window.inline_timeline_widget.update_panel_rhythm()
     app.processEvents()
 
     layouts = [
@@ -2657,8 +2724,8 @@ def test_today_checklist_rows_use_compact_task_row_port(tmp_path) -> None:
     assert row.sizePolicy().verticalPolicy() == QSizePolicy.Policy.Maximum
     assert _margins_tuple(row.layout()) == (8, 12, 8, 12)
     assert "QLabel#noteBodyLabel" in window.styleSheet()
-    assert "QLabel#noteBodyLabel {\n                color: #18201b;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
-    assert "QLabel#checklistItemTitle {\n                color: #18201b;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
+    assert "QLabel#noteBodyLabel {\n                color: #111315;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
+    assert "QLabel#checklistItemTitle {\n                color: #111315;\n                font-size: 13px;\n                font-weight: 500;" in window.styleSheet()
     assert "QLabel#checklistItemMeta, QLabel#checklistItemMetaDone" in window.styleSheet()
     assert "font-size: 11px;" in window.styleSheet()
     assert "subcontrol-position: center;" in window.styleSheet()
@@ -3229,6 +3296,8 @@ def test_feature_width_resize_keeps_neighbors_packed(tmp_path) -> None:
     assert widths["link_favorites"] == 3
     occupied: set[tuple[int, int]] = set()
     for item in current:
+        if str(item["key"]) in FLOATING_OVERLAY_FEATURE_KEYS:
+            continue
         cells = {
             (column, row)
             for column in range(int(item["x"]), int(item["x"]) + int(item["w"]))
@@ -3269,13 +3338,100 @@ def test_default_dashboard_layout_is_cleanly_packed(tmp_path) -> None:
         occupied.update(cells)
 
     assert positions["header_banner"] == (0, 0, 12, 3)
-    assert positions["focus"] == (0, 3, 5, 7)
-    assert positions["today_timeline"] == (0, 10, 5, 11)
-    assert positions["today_checklist"] == (5, 3, 4, 6)
-    assert positions["quick_memo"] == (5, 9, 4, 12)
-    assert positions["pomodoro"] == (9, 3, 3, 4)
-    assert positions["media_panel"] == (9, 7, 3, 8)
-    assert positions["link_favorites"] == (9, 15, 3, 6)
+    assert positions["focus"] == (0, 3, 3, 16)
+    assert positions["quick_memo"] == (3, 3, 3, 16)
+    assert positions["today_checklist"] == (6, 3, 3, 16)
+    assert positions["today_timeline"] == (9, 3, 3, 16)
+    assert positions["pomodoro"] == (0, 19, 3, 6)
+    assert positions["link_favorites"] == (3, 19, 3, 6)
+    assert positions["media_panel"] == (6, 19, 3, 6)
+    assert positions["media_panel_2"] == (9, 19, 3, 6)
+    assert positions["datetime"] == (0, 25, 3, 1)
+    assert positions["media_panel_3"] == (6, 41, 4, 6)
+    assert positions["media_panel_4"] == (2, 41, 4, 6)
+    window.close()
+
+
+def test_reset_main_layout_applies_captured_default_for_existing_users(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = False
+    preferences.show_today_checklist_inline = False
+    preferences.show_media_panel_2 = False
+    preferences.show_datetime_panel = True
+    preferences.last_layout_state = ""
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    assert not window.preferences.show_header_banner
+    assert not window.preferences.show_today_checklist_inline
+    assert not window.preferences.show_media_panel_2
+
+    window.reset_main_layout()
+    app.processEvents()
+
+    assert window.preferences.show_header_banner
+    assert window.preferences.show_today_checklist_inline
+    assert window.preferences.show_media_panel_2
+    assert not window.preferences.show_datetime_panel
+
+    reloaded = repository.get_preferences()
+    assert reloaded.show_header_banner
+    assert reloaded.show_today_checklist_inline
+    assert reloaded.show_media_panel_2
+
+    positions = {
+        str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
+        for item in window._current_feature_dashboard_layout()
+    }
+    assert positions["focus"] == (0, 3, 3, 16)
+    assert positions["today_timeline"] == (9, 3, 3, 16)
+    assert positions["media_panel"] == (6, 19, 3, 6)
+    assert positions["media_panel_2"] == (9, 19, 3, 6)
+    assert positions["datetime"] == (0, 25, 3, 1)
+
+    assert reloaded.last_layout_state
+    saved_state = json.loads(reloaded.last_layout_state)
+    saved_focus = next(
+        item for item in saved_state["layout"]["dashboard"] if item.get("key") == "focus"
+    )
+    assert (int(saved_focus["x"]), int(saved_focus["y"])) == (0, 3)
+    assert saved_state["visible"]["header_banner"] is True
+    assert saved_state["visible"]["today_checklist"] is True
+    assert saved_state["visible"]["media_panel_2"] is True
+    assert saved_state["visible"]["datetime"] is False
+
+    window.close()
+
+
+def test_restore_last_layout_state_preserves_user_visibility(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_header_banner = False
+    preferences.show_media_panel_2 = False
+    preferences.last_layout_state = json.dumps(
+        {
+            "version": 1,
+            "visible": {"header_banner": True, "media_panel_2": True},
+        }
+    )
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    assert not window.preferences.show_header_banner
+    assert not window.preferences.show_media_panel_2
+    assert not repository.get_preferences().show_header_banner
+    assert not repository.get_preferences().show_media_panel_2
+
     window.close()
 
 
@@ -3485,7 +3641,9 @@ def test_feature_move_preserves_panel_size_and_repacks_neighbors_cleanly(tmp_pat
     assert after["quick_memo"][:2] == (1, 0)
 
     occupied: set[tuple[int, int]] = set()
-    for x, y, width, height in after.values():
+    for key, (x, y, width, height) in after.items():
+        if key in FLOATING_OVERLAY_FEATURE_KEYS:
+            continue
         cells = {
             (column, row)
             for column in range(x, x + width)
