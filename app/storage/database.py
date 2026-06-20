@@ -201,7 +201,7 @@ def _accent_color(value: object) -> str:
         character in "0123456789abcdefABCDEF" for character in color[1:]
     ):
         return color.lower()
-    return "#4f8c6b"
+    return "#68a8f5"
 
 
 def _optional_color(value: object) -> str:
@@ -342,7 +342,7 @@ class ScheduleRepository:
                     app_title TEXT NOT NULL DEFAULT '오롯',
                     main_always_on_top INTEGER NOT NULL DEFAULT 0,
                     show_focus_panel INTEGER NOT NULL DEFAULT 1,
-                    show_datetime_panel INTEGER NOT NULL DEFAULT 1,
+                    show_datetime_panel INTEGER NOT NULL DEFAULT 0,
                     show_current_date INTEGER NOT NULL DEFAULT 1,
                     show_current_time INTEGER NOT NULL DEFAULT 1,
                     show_current_seconds INTEGER NOT NULL DEFAULT 0,
@@ -359,7 +359,7 @@ class ScheduleRepository:
                     show_today_timeline_inline INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_waiting_panel INTEGER NOT NULL DEFAULT 1,
                     show_today_timeline_waiting_pinned INTEGER NOT NULL DEFAULT 1,
-                    show_today_checklist_inline INTEGER NOT NULL DEFAULT 0,
+                    show_today_checklist_inline INTEGER NOT NULL DEFAULT 1,
                     show_today_flow_panel INTEGER NOT NULL DEFAULT 0,
                     show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
@@ -367,7 +367,7 @@ class ScheduleRepository:
                     media_panel_file_path TEXT NOT NULL DEFAULT '',
                     media_panel_image_position TEXT NOT NULL DEFAULT 'center',
                     media_panel_image_view TEXT NOT NULL DEFAULT '',
-                    show_media_panel_2 INTEGER NOT NULL DEFAULT 0,
+                    show_media_panel_2 INTEGER NOT NULL DEFAULT 1,
                     media_panel_2_file_path TEXT NOT NULL DEFAULT '',
                     media_panel_2_image_position TEXT NOT NULL DEFAULT 'center',
                     media_panel_2_image_view TEXT NOT NULL DEFAULT '',
@@ -384,18 +384,18 @@ class ScheduleRepository:
                     favorite_display_mode TEXT NOT NULL DEFAULT 'text',
                     time_format TEXT NOT NULL DEFAULT '24h',
                     appearance_theme TEXT NOT NULL DEFAULT 'light',
-                    accent_color TEXT NOT NULL DEFAULT '#4f8c6b',
-                    button_color TEXT NOT NULL DEFAULT '#4f8c6b',
-                    background_color TEXT NOT NULL DEFAULT '',
-                    inner_background_color TEXT NOT NULL DEFAULT '',
-                    panel_color TEXT NOT NULL DEFAULT '',
-                    table_color TEXT NOT NULL DEFAULT '',
-                    text_color TEXT NOT NULL DEFAULT '',
+                    accent_color TEXT NOT NULL DEFAULT '#68a8f5',
+                    button_color TEXT NOT NULL DEFAULT '#d9e7f5',
+                    background_color TEXT NOT NULL DEFAULT '#d9e7f5',
+                    inner_background_color TEXT NOT NULL DEFAULT '#d9e7f5',
+                    panel_color TEXT NOT NULL DEFAULT '#fafafa',
+                    table_color TEXT NOT NULL DEFAULT '#fafafa',
+                    text_color TEXT NOT NULL DEFAULT '#111315',
                     main_font_family TEXT NOT NULL DEFAULT '',
                     main_font_size INTEGER NOT NULL DEFAULT 13,
                     label_font_size INTEGER NOT NULL DEFAULT 13,
                     content_font_size INTEGER NOT NULL DEFAULT 13,
-                    show_header_banner INTEGER NOT NULL DEFAULT 0,
+                    show_header_banner INTEGER NOT NULL DEFAULT 1,
                     header_banner_image_path TEXT NOT NULL DEFAULT '',
                     header_banner_image_position TEXT NOT NULL DEFAULT 'center',
                     header_banner_image_view TEXT NOT NULL DEFAULT '',
@@ -556,7 +556,7 @@ class ScheduleRepository:
             if "show_focus_panel" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_panel INTEGER NOT NULL DEFAULT 1")
             if "show_datetime_panel" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN show_datetime_panel INTEGER NOT NULL DEFAULT 1")
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_datetime_panel INTEGER NOT NULL DEFAULT 0")
             if "show_current_date" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_current_date INTEGER NOT NULL DEFAULT 1")
             if "show_current_time" not in preference_columns:
@@ -611,7 +611,7 @@ class ScheduleRepository:
                 )
             if "show_today_checklist_inline" not in preference_columns:
                 connection.execute(
-                    "ALTER TABLE preferences ADD COLUMN show_today_checklist_inline INTEGER NOT NULL DEFAULT 0"
+                    "ALTER TABLE preferences ADD COLUMN show_today_checklist_inline INTEGER NOT NULL DEFAULT 1"
                 )
             if "show_today_flow_panel" not in preference_columns:
                 connection.execute(
@@ -641,8 +641,9 @@ class ScheduleRepository:
                 position_column = f"media_panel_{index}_image_position"
                 view_column = f"media_panel_{index}_image_view"
                 if visible_column not in preference_columns:
+                    default_visible = 1 if index == 2 else 0
                     connection.execute(
-                        f"ALTER TABLE preferences ADD COLUMN {visible_column} INTEGER NOT NULL DEFAULT 0"
+                        f"ALTER TABLE preferences ADD COLUMN {visible_column} INTEGER NOT NULL DEFAULT {default_visible}"
                     )
                 if path_column not in preference_columns:
                     connection.execute(f"ALTER TABLE preferences ADD COLUMN {path_column} TEXT NOT NULL DEFAULT ''")
@@ -670,26 +671,27 @@ class ScheduleRepository:
             if needs_palette_migration:
                 connection.execute("ALTER TABLE preferences ADD COLUMN appearance_theme TEXT NOT NULL DEFAULT 'light'")
             if "accent_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN accent_color TEXT NOT NULL DEFAULT '#4f8c6b'")
+                connection.execute("ALTER TABLE preferences ADD COLUMN accent_color TEXT NOT NULL DEFAULT '#68a8f5'")
             elif needs_palette_migration:
                 connection.execute(
-                    "UPDATE preferences SET accent_color = '#4f8c6b' WHERE lower(accent_color) = '#5a5ad6'"
+                    "UPDATE preferences SET accent_color = '#68a8f5' WHERE lower(accent_color) = '#5a5ad6'"
                 )
             if "button_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN button_color TEXT NOT NULL DEFAULT '#4f8c6b'")
-                connection.execute("UPDATE preferences SET button_color = accent_color")
+                connection.execute("ALTER TABLE preferences ADD COLUMN button_color TEXT NOT NULL DEFAULT '#d9e7f5'")
             if "focus_rate_display" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN focus_rate_display TEXT NOT NULL DEFAULT 'ring'")
             if "background_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN background_color TEXT NOT NULL DEFAULT ''")
+                connection.execute("ALTER TABLE preferences ADD COLUMN background_color TEXT NOT NULL DEFAULT '#d9e7f5'")
             if "inner_background_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN inner_background_color TEXT NOT NULL DEFAULT ''")
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN inner_background_color TEXT NOT NULL DEFAULT '#d9e7f5'"
+                )
             if "panel_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN panel_color TEXT NOT NULL DEFAULT ''")
+                connection.execute("ALTER TABLE preferences ADD COLUMN panel_color TEXT NOT NULL DEFAULT '#fafafa'")
             if "table_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN table_color TEXT NOT NULL DEFAULT ''")
+                connection.execute("ALTER TABLE preferences ADD COLUMN table_color TEXT NOT NULL DEFAULT '#fafafa'")
             if "text_color" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN text_color TEXT NOT NULL DEFAULT ''")
+                connection.execute("ALTER TABLE preferences ADD COLUMN text_color TEXT NOT NULL DEFAULT '#111315'")
             if "main_font_family" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_font_family TEXT NOT NULL DEFAULT ''")
             if "main_font_size" not in preference_columns:
@@ -699,7 +701,7 @@ class ScheduleRepository:
             if "content_font_size" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN content_font_size INTEGER NOT NULL DEFAULT 13")
             if "show_header_banner" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN show_header_banner INTEGER NOT NULL DEFAULT 0")
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_header_banner INTEGER NOT NULL DEFAULT 1")
             if "header_banner_image_path" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN header_banner_image_path TEXT NOT NULL DEFAULT ''")
             if "header_banner_image_position" not in preference_columns:
@@ -791,14 +793,14 @@ class ScheduleRepository:
                        show_today_timeline_waiting_pinned,
                        show_today_checklist_inline,
                        show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
-                       show_media_panel, media_panel_file_path,
+                       show_media_panel, media_panel_file_path, show_media_panel_2,
                        show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color, button_color,
                        background_color, inner_background_color, panel_color, table_color, text_color,
                        main_font_family, main_font_size, label_font_size, content_font_size,
                        show_header_banner, header_banner_image_path,
                        header_banner_height, header_banner_position, header_banner_span,
                        focus_rate_display)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, '오롯', 0, 1, 1, 1, 1, 0, 1, 1, 1, 1, 0, 0, 1, 1, 1, '', 0, 'text', '24h', 'light', '#4f8c6b', '#4f8c6b', '', '', '', '', '', '', 13, 13, 13, 0, '', 132, 'center', 1, 'ring')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, '오롯', 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, '', 1, 0, 'text', '24h', 'light', '#68a8f5', '#d9e7f5', '#d9e7f5', '#d9e7f5', '#fafafa', '#fafafa', '#111315', '', 13, 13, 13, 1, '', 132, 'center', 1, 'ring')
                     """
                 )
 

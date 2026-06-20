@@ -13,11 +13,11 @@ choice it is injected at runtime through `__PLACEHOLDER__` markers in the styles
 
 ## 1. Atmosphere & Identity
 
-A calm, monochrome focus desk. Almost the entire surface is near-white cream; depth comes
-from quiet 1px borders and faint tonal steps between panels, never from shadows. Color is
-rationed: a sky-blue brand hue carries the OROT identity (ring + title), a single indigo
-accent marks live/interactive state, and an optional user accent (green by default) fills the
-one primary action. The signature is the OROT mark itself - a clean **open ring** in sky blue
+A calm, pale-blue focus desk. The default surface is a quiet powder blue, while cards and
+inputs stay near-white; depth comes from quiet 1px borders and faint tonal steps between
+panels, never from shadows. Color is rationed: a sky-blue brand hue carries the OROT identity
+(ring + title), a single indigo accent marks live/interactive state, and the user action accent
+defaults to clear sky blue. The signature is the OROT mark itself - a clean **open ring** in sky blue
 (a circle with a small gap, rotated so the gap sits toward the upper-right) paired with the
 Korean wordmark `오롯` and a quiet Latin `OROT`. The ring being open, not closed, is the
 recognizable idea: focused but unfinished, room to fill.
@@ -28,12 +28,12 @@ recognizable idea: focused but unfinished, room to fill.
 
 | Role | Token | Value | Usage |
 |------|-------|-------|-------|
-| Surface/base | surface-base | `#fbfbfc` | App shell, body, workspace |
+| Surface/base | surface-base | `#d9e7f5` (default; user-set) | App shell, body, workspace (`background_color`) |
 | Surface/sunken | surface-sunken | `#ececed` | Outer scroll viewport behind cards |
-| Surface/card | surface-card | `#ffffff` | Cards, header focus card, timer card, header bar |
+| Surface/card | surface-card | `#fafafa` (default; user-set) | Cards, inputs, header focus card, timer card, header bar (`panel_color`) |
 | Surface/muted | surface-muted | `#f4f4f6` | Soft control panels, nested metric cards |
 | Surface/disabled | surface-disabled | `#e9e9ef` | Disabled button fills |
-| Text/primary | text-primary | `#1b1b20` | Titles, primary labels |
+| Text/primary | text-primary | `#111315` (default; user-set) | Titles, primary labels (`text_color`) |
 | Text/secondary | text-secondary | `#5c5c66` | Button text, secondary labels |
 | Text/tertiary | text-tertiary | `#9c9ca6` | Eyebrows, muted captions, OROT wordmark |
 | Text/disabled | text-disabled | `#c3c3cc` | Disabled text |
@@ -41,14 +41,15 @@ recognizable idea: focused but unfinished, room to fill.
 | Border/subtle | border-subtle | `#f0f0f3` | Header bottom divider, soft panel borders |
 | Accent/ui | accent-ui | `#5a5ad6` | Live focus state, checked controls, status dot |
 | Accent/ui-tint | accent-ui-tint | `rgba(90, 90, 214, 0.10)` | Hover/checked wash for accent controls |
-| Accent/action | accent-action | `#4f8c6b` (default; user-set) | The one filled primary action |
+| Accent/action | accent-action | `#68a8f5` (default; user-set) | The one filled primary action |
+| Accent/button | accent-button | `#d9e7f5` (default; user-set) | Button fill (`button_color`) |
 | Brand/sky | brand-sky | `#6fa8e0` | OROT ring stroke + window title `오롯` (`chromeTitle`) |
 
 ### Rules
 
 - Two accents, two jobs. `accent-ui` (indigo) is the fixed system accent for live state and
   selection; it is hard-coded in the stylesheet. `accent-action` is the user's color
-  (`preferences.accent_color` / `button_color`, default `#4f8c6b`) injected via
+  (`preferences.accent_color` / `button_color`, defaults `#68a8f5` / `#d9e7f5`) injected via
   `__ACTION_BUTTON_*__`; it fills exactly one primary action per surface.
 - Accent is for interactive or live state only, never decoration.
 - Depth is tonal + bordered, never shadowed. Prefer a tonal step

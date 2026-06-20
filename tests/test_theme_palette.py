@@ -10,7 +10,15 @@ from app.ui.main_window import (
 
 
 def test_background_color_drives_unset_surfaces() -> None:
-    palette = _resolved_theme_palette(Preference(background_color="#224433"))
+    palette = _resolved_theme_palette(
+        Preference(
+            background_color="#224433",
+            inner_background_color="",
+            panel_color="",
+            table_color="",
+            text_color="",
+        )
+    )
 
     assert palette["bg"] == "#224433"
     assert palette["app"] != "#fbfcfb"
@@ -21,7 +29,15 @@ def test_background_color_drives_unset_surfaces() -> None:
 
 
 def test_light_background_color_keeps_dark_default_text() -> None:
-    palette = _resolved_theme_palette(Preference(background_color="#e8f4ef"))
+    palette = _resolved_theme_palette(
+        Preference(
+            background_color="#e8f4ef",
+            inner_background_color="",
+            panel_color="",
+            table_color="",
+            text_color="",
+        )
+    )
 
     assert palette["bg"] == "#e8f4ef"
     assert palette["text"] == "#18201b"
@@ -69,7 +85,16 @@ def test_light_theme_rejects_too_light_text_colors() -> None:
 
 
 def test_dark_theme_allows_light_text_colors() -> None:
-    palette = _resolved_theme_palette(Preference(appearance_theme="dark", text_color="#f8f9fa"))
+    palette = _resolved_theme_palette(
+        Preference(
+            appearance_theme="dark",
+            text_color="#f8f9fa",
+            background_color="",
+            inner_background_color="",
+            panel_color="",
+            table_color="",
+        )
+    )
 
     assert palette["text"] == "#f8f9fa"
 

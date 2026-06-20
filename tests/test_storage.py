@@ -43,6 +43,93 @@ def test_default_app_title_is_orot(tmp_path) -> None:
     assert legacy_repository.get_preferences().app_title == "오롯"
 
 
+def test_default_preference_dataclass_uses_first_run_palette() -> None:
+    preferences = Preference()
+
+    assert preferences.background_color == "#d9e7f5"
+    assert preferences.accent_color == "#68a8f5"
+    assert preferences.button_color == "#d9e7f5"
+    assert preferences.text_color == "#111315"
+    assert preferences.inner_background_color == "#d9e7f5"
+    assert preferences.panel_color == "#fafafa"
+    assert preferences.table_color == "#fafafa"
+
+
+def test_seed_defaults_apply_first_run_palette(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    preferences = repository.get_preferences()
+
+    assert preferences.background_color == "#d9e7f5"
+    assert preferences.accent_color == "#68a8f5"
+    assert preferences.button_color == "#d9e7f5"
+    assert preferences.text_color == "#111315"
+    assert preferences.inner_background_color == "#d9e7f5"
+    assert preferences.panel_color == "#fafafa"
+    assert preferences.table_color == "#fafafa"
+
+
+def test_legacy_preferences_migration_applies_first_run_palette(tmp_path) -> None:
+    db_path = tmp_path / "legacy_palette.sqlite3"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE preferences (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                day_max_minutes INTEGER NOT NULL,
+                break_minutes INTEGER NOT NULL,
+                strategy TEXT NOT NULL
+            );
+            INSERT INTO preferences (id, day_max_minutes, break_minutes, strategy)
+            VALUES (1, 480, 10, 'deadline_priority');
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    repository = ScheduleRepository(db_path)
+    preferences = repository.get_preferences()
+
+    assert preferences.background_color == "#d9e7f5"
+    assert preferences.accent_color == "#68a8f5"
+    assert preferences.button_color == "#d9e7f5"
+    assert preferences.text_color == "#111315"
+    assert preferences.inner_background_color == "#d9e7f5"
+    assert preferences.panel_color == "#fafafa"
+    assert preferences.table_color == "#fafafa"
+
+
+def test_default_preferences_show_captured_dashboard_panels(tmp_path) -> None:
+    defaults = Preference()
+
+    assert defaults.show_today_checklist_inline
+    assert defaults.show_media_panel_2
+    assert defaults.show_header_banner
+    assert defaults.show_focus_panel
+    assert defaults.show_quick_memo_panel
+    assert defaults.show_today_timeline_inline
+    assert defaults.show_pomodoro_controls
+    assert defaults.show_link_favorites_panel
+    assert defaults.show_media_panel
+    assert not defaults.show_datetime_panel
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+
+    assert seeded.show_today_checklist_inline
+    assert seeded.show_media_panel_2
+    assert seeded.show_header_banner
+    assert seeded.show_focus_panel
+    assert seeded.show_quick_memo_panel
+    assert seeded.show_today_timeline_inline
+    assert seeded.show_pomodoro_controls
+    assert seeded.show_link_favorites_panel
+    assert seeded.show_media_panel
+    assert not seeded.show_datetime_panel
+
+
 def test_repository_persists_tasks_and_events(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     custom_task_type = repository.save_item_type(ItemType("업무", "task"))
