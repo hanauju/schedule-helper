@@ -107,7 +107,7 @@ DASHBOARD_GRID_COLUMNS = 12
 DASHBOARD_GRID_ROW_HEIGHT = 42
 PANEL_CONTROL_HEIGHT = 40
 PANEL_MOVE_BAR_HEIGHT = 10
-PANEL_HANDLE_CONTENT_GAP = 2
+PANEL_HANDLE_CONTENT_GAP = 1
 PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
 PANEL_CORNER_RADIUS = 16  # keep in sync with normal card "border-radius: 16px" in the stylesheet
 DASHBOARD_GRID_GAP = 12
@@ -1369,8 +1369,11 @@ class DashboardGridGuideOverlay(QWidget):
         self.hide()
 
     def set_preview_rect(self, rect: QRectF, impact_rects: list[QRectF] | None = None) -> None:
+        next_impact_rects = impact_rects or []
+        if rect == self.preview_rect and next_impact_rects == self.impact_rects:
+            return
         self.preview_rect = rect
-        self.impact_rects = impact_rects or []
+        self.impact_rects = next_impact_rects
         self.update()
 
     def paintEvent(self, event) -> None:
@@ -1428,14 +1431,33 @@ class DashboardGridGuideOverlay(QWidget):
             painter.setBrush(highlight)
             preview_pen = QPen(QColor(accent), 2)
             painter.setPen(preview_pen)
-            painter.drawRoundedRect(self.preview_rect.adjusted(2, 2, -2, -2), 14, 14)
-            inner = QColor(accent)
-            inner.setAlpha(105)
-            inner_pen = QPen(inner, 1)
-            inner_pen.setStyle(Qt.PenStyle.DotLine)
-            painter.setPen(inner_pen)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(self.preview_rect.adjusted(8, 8, -8, -8), 10, 10)
+            painter.drawRoundedRect(
+                self.preview_rect.adjusted(0.5, 0.5, -0.5, -0.5),
+                PANEL_CORNER_RADIUS,
+                PANEL_CORNER_RADIUS,
+            )
+
+
+class FeatureGridContainer(QWidget):
+    """Host for the dashboard grid plus floating overlay cells.
+
+    Grid-managed cells are repositioned by the QGridLayout on resize, but
+    floating overlay cells (the datetime clock) are direct children placed by
+    geometry, so they need an explicit nudge to keep tracking their grid slot
+    when the container is resized.
+    """
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._resize_callback: Callable[[], None] | None = None
+
+    def set_resize_callback(self, callback: Callable[[], None]) -> None:
+        self._resize_callback = callback
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._resize_callback is not None:
+            self._resize_callback()
 
 
 class NoScrollSpinBox(QSpinBox):
@@ -1646,7 +1668,6 @@ class DraggableFeatureBox(QWidget):
         if not self.content_drag_enabled:
             return False
         self.begin_feature_reposition_gesture(event.globalPosition().toPoint(), watched)
-        watched.setCursor(Qt.CursorShape.ClosedHandCursor)
         return False
 
     def _handle_filtered_mouse_move(self, watched: QWidget, event) -> bool:
@@ -1663,10 +1684,12 @@ class DraggableFeatureBox(QWidget):
             self.content_drag_enabled
             and self.panel_drag_start is not None
             and event.buttons() & Qt.MouseButton.LeftButton
-            and self.update_feature_reposition_gesture(event.globalPosition().toPoint(), watched)
         ):
-            event.accept()
-            return True
+            self._apply_reposition_grab_cursor(watched)
+            if self.update_feature_reposition_gesture(event.globalPosition().toPoint(), watched):
+                event.accept()
+                return True
+            return False
         interactive = self._is_interactive_child(watched)
         if (
             not interactive
@@ -1739,9 +1762,12 @@ class DraggableFeatureBox(QWidget):
             self.content_drag_enabled
             and self.panel_drag_start is not None
             and event.buttons() & Qt.MouseButton.LeftButton
-            and self.update_feature_reposition_gesture(event.globalPosition().toPoint(), self)
         ):
-            event.accept()
+            self._apply_reposition_grab_cursor(self)
+            if self.update_feature_reposition_gesture(event.globalPosition().toPoint(), self):
+                event.accept()
+                return
+            super().mouseMoveEvent(event)
             return
         if self._is_height_resize_edge(event.position().toPoint()) and self.height_callback is not None:
             self.setCursor(Qt.CursorShape.SizeVerCursor)
@@ -1835,6 +1861,15 @@ class DraggableFeatureBox(QWidget):
         self.resize_start_height = self._current_height()
         self.setCursor(Qt.CursorShape.SizeVerCursor)
 
+    def _apply_reposition_grab_cursor(self, source: QWidget | None = None) -> None:
+        grab_cursor = Qt.CursorShape.ClosedHandCursor
+        self.setCursor(grab_cursor)
+        target = source or self.panel_drag_source
+        if isinstance(target, QWidget) and target is not self:
+            target.setCursor(grab_cursor)
+        if isinstance(self.move_bar, FeatureMoveBar):
+            self.move_bar.setCursor(grab_cursor)
+
     def begin_feature_reposition_gesture(self, global_position: QPoint, source: QWidget | None = None) -> None:
         self.panel_drag_start = global_position
         local_position = self.mapFromGlobal(global_position)
@@ -1844,6 +1879,7 @@ class DraggableFeatureBox(QWidget):
         )
         self.panel_drag_active = False
         self.panel_drag_source = source or self
+        self._apply_reposition_grab_cursor(self.panel_drag_source)
 
     def update_feature_reposition_gesture(self, global_position: QPoint, source: QWidget | None = None) -> bool:
         if self.panel_drag_start is None:
@@ -1855,8 +1891,7 @@ class DraggableFeatureBox(QWidget):
             if distance < QApplication.startDragDistance():
                 return False
             self.panel_drag_active = True
-            drag_source = source or self.panel_drag_source or self
-            drag_source.setCursor(Qt.CursorShape.ClosedHandCursor)
+            self._apply_reposition_grab_cursor(source or self.panel_drag_source)
         controller = self._feature_drag_controller()
         preview = getattr(controller, "preview_feature_reposition", None)
         if callable(preview):
@@ -1876,6 +1911,7 @@ class DraggableFeatureBox(QWidget):
         self.panel_drag_source = None
         if isinstance(drag_source, QWidget):
             drag_source.unsetCursor()
+        self.unsetCursor()
         self._reset_move_bar_state()
         if not was_active:
             return False
@@ -2902,6 +2938,7 @@ class MainWindow(QMainWindow):
         self.feature_widget_windows: dict[str, QDialog] = {}
         self.quick_note_detail_windows: dict[int, QDialog] = {}
         self.quick_note_folder_notes_window: QDialog | None = None
+        self.task_folder_notes_window: QDialog | None = None
         self.quick_note_trash_window: QDialog | None = None
         self.compact_widget_window: QDialog | None = None
         self.startup_refresh_pending = False
@@ -2963,6 +3000,7 @@ class MainWindow(QMainWindow):
         self.feature_dashboard_items: list[dict[str, object]] = []
         self.feature_row_splitters: list[QSplitter] = []
         self.feature_cells: dict[str, FeatureCell] = {}
+        self.feature_floating_cells: dict[str, FeatureCell] = {}
         self.media_preview_labels: dict[str, MediaPreviewLabel] = {}
         self.header_banner_widget = HeaderBannerWidget()
         self.header_banner_widget.select_callback = self.choose_header_banner_file
@@ -3049,7 +3087,7 @@ class MainWindow(QMainWindow):
         self.body_splitter.setStretchFactor(1, 3)
         self.body_splitter.setStretchFactor(2, 2)
         self.body_splitter.setSizes([560, 760, 420])
-        self.feature_grid_container = QWidget()
+        self.feature_grid_container = FeatureGridContainer()
         self.feature_grid_container.setObjectName("featureGrid")
         self.feature_dashboard_layout = QGridLayout(self.feature_grid_container)
         self.feature_dashboard_layout.setContentsMargins(0, 0, 0, 0)
@@ -3059,6 +3097,7 @@ class MainWindow(QMainWindow):
             self.feature_dashboard_layout.setColumnStretch(column, 1)
             self.feature_dashboard_layout.setColumnMinimumWidth(column, 28)
         self.dashboard_guide_overlay = DashboardGridGuideOverlay(self.feature_grid_container)
+        self.feature_grid_container.set_resize_callback(self._reposition_dashboard_floating_overlays)
         workspace_layout.addWidget(self.feature_grid_container, 1)
         self._apply_feature_layout(self.default_layout_state().get("layout"))
 
@@ -3187,6 +3226,7 @@ class MainWindow(QMainWindow):
 
     def _wrap_feature(self, feature_key: str, title: str, content: QWidget) -> DraggableFeatureBox:
         expand_content = feature_key != "datetime"
+        content_direct_drag = feature_key in {"header_banner", *MEDIA_PANEL_KEYS, *FLOATING_OVERLAY_FEATURE_KEYS}
         widget_callback = (
             self.open_feature_widget
             if feature_key
@@ -3201,7 +3241,6 @@ class MainWindow(QMainWindow):
             }
             else None
         )
-        is_floating_overlay = feature_key in FLOATING_OVERLAY_FEATURE_KEYS
         box = DraggableFeatureBox(
             feature_key,
             title,
@@ -3210,8 +3249,8 @@ class MainWindow(QMainWindow):
             expand_content,
             widget_callback,
             self.hide_feature_from_main,
-            show_title_bar=feature_key not in {"header_banner", *MEDIA_PANEL_KEYS, *FLOATING_OVERLAY_FEATURE_KEYS},
-            content_drag_enabled=feature_key in {"header_banner", *MEDIA_PANEL_KEYS} or is_floating_overlay,
+            show_title_bar=True,
+            content_drag_enabled=content_direct_drag,
         )
         box.resize_callback = self.resize_feature_panel_width
         box.resize_edge_callback = self.resize_feature_panel_width_from_edge
@@ -4443,10 +4482,6 @@ class MainWindow(QMainWindow):
         )
         memo_editor_header.addWidget(self.quick_note_folder_combo, 1)
         memo_editor_header.addStretch(1)
-        memo_shortcut_label = QLabel("Ctrl + Enter")
-        memo_shortcut_label.setObjectName("memoHintLabel")
-        self.memo_shortcut_label = memo_shortcut_label
-        memo_editor_header.addWidget(memo_shortcut_label)
         attach_note_button = QPushButton("첨부")
         attach_note_button.setObjectName("memoAttachButton")
         attach_note_button.clicked.connect(self.select_quick_note_attachments)
@@ -4478,10 +4513,12 @@ class MainWindow(QMainWindow):
         memo_editor_layout.addWidget(self.pending_attachments_label)
         self.memo_splitter.addWidget(memo_editor)
 
-        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.quick_note_editor)
-        shortcut.activated.connect(self.save_quick_note)
-        shortcut_enter = QShortcut(QKeySequence("Ctrl+Enter"), self.quick_note_editor)
-        shortcut_enter.activated.connect(self.save_quick_note)
+        self.quick_note_ctrl_return_shortcut = QShortcut(QKeySequence("Ctrl+Return"), self.quick_note_editor)
+        self.quick_note_ctrl_return_shortcut.setObjectName("quickNoteCtrlReturnShortcut")
+        self.quick_note_ctrl_return_shortcut.activated.connect(self.save_quick_note)
+        self.quick_note_ctrl_enter_shortcut = QShortcut(QKeySequence("Ctrl+Enter"), self.quick_note_editor)
+        self.quick_note_ctrl_enter_shortcut.setObjectName("quickNoteCtrlEnterShortcut")
+        self.quick_note_ctrl_enter_shortcut.activated.connect(self.save_quick_note)
 
         notes_container = QWidget()
         notes_container.setObjectName("memoHistoryCard")
@@ -4547,7 +4584,6 @@ class MainWindow(QMainWindow):
             "memo_folder_settings_button",
             "memo_editor_layout",
             "memo_editor_title",
-            "memo_shortcut_label",
             "quick_note_editor",
             "memo_history_card",
             "memo_history_layout",
@@ -4575,7 +4611,6 @@ class MainWindow(QMainWindow):
         self.memo_folder_view_button.setVisible(not tiny)
         self.memo_folder_settings_button.setVisible(False)
         self.memo_editor_title.setVisible(True)
-        self.memo_shortcut_label.setVisible(not compact)
         self.memo_saved_notes_label.setVisible(not short)
         self.note_filter_combo.setVisible(not tiny)
         self.memo_history_card.setVisible(not short)
@@ -4662,7 +4697,7 @@ class MainWindow(QMainWindow):
         panel = QWidget()
         panel.setObjectName("mediaPanel")
         layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP, 0, 0)
+        layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
         preview = MediaPreviewLabel()
@@ -5038,16 +5073,6 @@ class MainWindow(QMainWindow):
             }
             QScrollArea#checklistItemsArea QWidget, QScrollArea#favoritesShelfArea QWidget {
                 background: transparent;
-            }
-            QLabel#memoHintLabel {
-                background: #ffffff;
-                border: 1px solid #e7e7ec;
-                border-radius: 8px;
-                color: #5c5c66;
-                font-family: "IBM Plex Mono", "Consolas", "Pretendard", "Segoe UI", "Malgun Gothic", monospace;
-                font-size: 10px;
-                font-weight: 600;
-                padding: 3px 8px;
             }
             QLabel#memoAttachmentBadge {
                 background: rgba(90, 90, 214, 0.10);
@@ -6299,7 +6324,6 @@ class MainWindow(QMainWindow):
             QLabel#timelineStatChip,
             QLabel#waitingSummaryBadge,
             QLabel#checklistSummaryBadge,
-            QLabel#memoHintLabel,
             QLabel#memoAttachmentBadge,
             QLabel#noteTimeBadge,
             QLabel#noteFolderBadge,
@@ -6819,6 +6843,14 @@ class MainWindow(QMainWindow):
                 self.today_list.addItem(item)
         self.refresh_today_checklist()
         self.refresh_inline_timeline()
+        folder_window = self.task_folder_notes_window
+        if folder_window is not None:
+            try:
+                refresh = getattr(folder_window, "refresh", None)
+                if callable(refresh):
+                    refresh()
+            except RuntimeError:
+                self.task_folder_notes_window = None
 
     def refresh_notes(self) -> None:
         self.notes_list.clear()
@@ -7533,6 +7565,32 @@ class MainWindow(QMainWindow):
         dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dialog.destroyed.connect(lambda _obj=None: setattr(self, "quick_note_folder_notes_window", None))
         self.quick_note_folder_notes_window = dialog
+        dialog.show()
+
+    def open_task_folder_window(self, item_type_id: int | None = None) -> None:
+        existing = self.task_folder_notes_window
+        if existing is not None:
+            try:
+                if existing.isVisible():
+                    select_type = getattr(existing, "select_type", None)
+                    if callable(select_type) and item_type_id is not None:
+                        select_type(item_type_id)
+                    existing.raise_()
+                    existing.activateWindow()
+                    return
+            except RuntimeError:
+                self.task_folder_notes_window = None
+
+        dialog = TaskFolderTasksDialog(
+            self.repository,
+            self,
+            initial_type_id=item_type_id,
+            on_changed=self.refresh_all,
+        )
+        dialog.setModal(False)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.destroyed.connect(lambda _obj=None: setattr(self, "task_folder_notes_window", None))
+        self.task_folder_notes_window = dialog
         dialog.show()
 
     def open_note_trash_window(self) -> None:
@@ -9490,14 +9548,14 @@ class MainWindow(QMainWindow):
         if not isinstance(overlay, DashboardGridGuideOverlay) or not isinstance(container, QWidget):
             return
         scroll_position = self._full_scroll_position()
-        overlay.hide()
         overlay.setGeometry(container.rect())
         preview_layout = self._dashboard_preview_layout(source_key, global_position, drag_offset)
-        preview_item = next((item for item in preview_layout if str(item.get("key", "")) == source_key), None)
         impact_rects = self._dashboard_preview_impact_rects(source_key, preview_layout)
-        overlay.set_preview_rect(self._dashboard_item_rect(preview_item) if preview_item else QRectF(), impact_rects)
+        drag_rect = self._dashboard_drag_preview_rect(source_key, global_position, drag_offset)
+        overlay.set_preview_rect(drag_rect, impact_rects)
         overlay.raise_()
-        overlay.show()
+        if not overlay.isVisible():
+            overlay.show()
         self._restore_full_scroll_position(scroll_position)
 
     def _hide_dashboard_drag_guides(self) -> None:
@@ -9682,6 +9740,59 @@ class MainWindow(QMainWindow):
             self._dashboard_item_pixel_height(height),
         )
 
+    def _dashboard_drag_preview_size(self, source_key: str) -> tuple[float, float] | None:
+        cells = getattr(self, "feature_cells", {})
+        cell = cells.get(source_key) if isinstance(cells, dict) else None
+        if isinstance(cell, FeatureCell):
+            cell_size = cell.size()
+            if cell_size.width() > 0 and cell_size.height() > 0:
+                return float(cell_size.width()), float(cell_size.height())
+        item = next(
+            (
+                dict(item)
+                for item in self._current_feature_dashboard_layout()
+                if str(item.get("key", "")) == source_key
+            ),
+            None,
+        )
+        if item is None:
+            return None
+        rect = self._dashboard_item_rect(item)
+        if rect.width() <= 0 or rect.height() <= 0:
+            return None
+        return float(rect.width()), float(rect.height())
+
+    def _dashboard_drag_preview_rect(
+        self,
+        source_key: str,
+        global_position: QPoint,
+        drag_offset: QPoint | None = None,
+    ) -> QRectF:
+        container = getattr(self, "feature_grid_container", None)
+        if not isinstance(container, QWidget):
+            return QRectF()
+        size = self._dashboard_drag_preview_size(source_key)
+        if size is None:
+            return QRectF()
+        preview_width = min(size[0], float(container.width()))
+        preview_height = min(size[1], float(container.height()))
+        if preview_width <= 0 or preview_height <= 0:
+            return QRectF()
+        if isinstance(drag_offset, QPoint):
+            offset_x = float(drag_offset.x())
+            offset_y = float(drag_offset.y())
+        else:
+            offset_x = preview_width / 2.0
+            offset_y = preview_height / 2.0
+        cursor_position = container.mapFromGlobal(global_position)
+        left = float(cursor_position.x()) - offset_x
+        top = float(cursor_position.y()) - offset_y
+        max_left = max(0.0, float(container.width()) - preview_width)
+        max_top = max(0.0, float(container.height()) - preview_height)
+        left = min(max(0.0, left), max_left)
+        top = min(max(0.0, top), max_top)
+        return QRectF(left, top, preview_width, preview_height)
+
     def _render_feature_dashboard(self) -> None:
         layout = getattr(self, "feature_dashboard_layout", None)
         if not isinstance(layout, QGridLayout):
@@ -9700,6 +9811,13 @@ class MainWindow(QMainWindow):
                 widget.hide()
                 _park_widget_for_reparent(widget)
                 widget.deleteLater()
+        for floating_cell in getattr(self, "feature_floating_cells", {}).values():
+            if isinstance(floating_cell, FeatureCell):
+                floating_cell.detach_feature_box()
+                floating_cell.hide()
+                _park_widget_for_reparent(floating_cell)
+                floating_cell.deleteLater()
+        self.feature_floating_cells = {}
         self.feature_cells = {}
         overlay = getattr(self, "dashboard_guide_overlay", None)
         if isinstance(overlay, DashboardGridGuideOverlay):
@@ -9732,7 +9850,11 @@ class MainWindow(QMainWindow):
                 next_item.pop("x", None)
                 next_item.pop("y", None)
             visible_source_items.append(next_item)
-        visible_items = self._pack_feature_dashboard_items(visible_source_items) + floating_items
+        # Floating overlay items (e.g. the datetime clock) are intentionally excluded
+        # from the grid: a grid item overlapping other rows makes Qt redistribute row
+        # heights, which nudges unrelated panels. They render as direct children placed
+        # by geometry instead, so moving/resizing one never repacks its neighbors.
+        visible_items = self._pack_feature_dashboard_items(visible_source_items)
 
         previous_rows = int(getattr(self, "feature_dashboard_row_count", 0) or 0)
         max_row = max((int(item.get("y", 0)) + int(item.get("h", 1)) for item in visible_items), default=1)
@@ -9767,12 +9889,58 @@ class MainWindow(QMainWindow):
             )
             cell.show()
             widget.show()
-            if key in FLOATING_OVERLAY_FEATURE_KEYS:
-                cell.raise_()
-                widget.raise_()
+
+        for item in floating_items:
+            key = str(item.get("key", ""))
+            widget = self.feature_boxes.get(key)
+            if widget is None:
+                continue
+            width = self._normalized_dashboard_width(item.get("w"))
+            height = self._normalized_dashboard_height(item.get("h"))
+            widget.hide()
+            cell = FeatureCell(key, widget, self.feature_grid_container)
+            cell.hide()
+            cell.set_panel_height(self._dashboard_item_pixel_height(height))
+            cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
+            cell.setGeometry(self._dashboard_item_rect(item).toRect())
+            self.feature_cells[key] = cell
+            self.feature_floating_cells[key] = cell
+            cell.show()
+            widget.show()
+            cell.raise_()
+            widget.raise_()
+
         overlay = getattr(self, "dashboard_guide_overlay", None)
         if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.setGeometry(self.feature_grid_container.rect())
+            overlay.raise_()
+
+    def _reposition_dashboard_floating_overlays(self) -> None:
+        container = getattr(self, "feature_grid_container", None)
+        if not isinstance(container, QWidget):
+            return
+        overlay = getattr(self, "dashboard_guide_overlay", None)
+        if isinstance(overlay, DashboardGridGuideOverlay):
+            overlay.setGeometry(container.rect())
+        floating_cells = getattr(self, "feature_floating_cells", {})
+        if floating_cells:
+            slots = {
+                str(item.get("key", "")): item
+                for item in self._current_feature_dashboard_layout()
+            }
+            for key, cell in floating_cells.items():
+                if not isinstance(cell, FeatureCell):
+                    continue
+                item = slots.get(key)
+                if item is None:
+                    continue
+                width = self._normalized_dashboard_width(item.get("w"))
+                height = self._normalized_dashboard_height(item.get("h"))
+                cell.set_panel_height(self._dashboard_item_pixel_height(height))
+                cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
+                cell.setGeometry(self._dashboard_item_rect(item).toRect())
+                cell.raise_()
+        if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.raise_()
 
     def _sync_feature_dashboard_visibility(self) -> None:
@@ -14112,6 +14280,8 @@ class TaskAddDialog(QDialog):
 
 
 class TodayChecklistWidget(QWidget):
+    SUMMARY_HIDE_BELOW_WIDTH = 400
+
     def __init__(
         self,
         repository: ScheduleRepository,
@@ -14123,6 +14293,7 @@ class TodayChecklistWidget(QWidget):
         self.repository = repository
         self.on_changed = on_changed
         self._refreshing = False
+        self.title_label: QLabel | None = None
         self.setObjectName("checklistPanel")
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setMinimumWidth(0)
@@ -14136,15 +14307,26 @@ class TodayChecklistWidget(QWidget):
         title_row.setContentsMargins(0, 0, 0, 0)
         title_row.setSpacing(8)
         if show_title:
-            title = QLabel("오늘 체크리스트")
-            title.setObjectName("panelTitleLabel")
-            _stabilize_panel_caption(title)
-            title_row.addWidget(title)
+            self.title_label = QLabel("오늘 체크리스트")
+            self.title_label.setObjectName("panelTitleLabel")
+            _stabilize_panel_caption(self.title_label)
+            title_row.addWidget(self.title_label)
         title_row.addStretch(1)
+        self.folder_view_button = QPushButton("폴더 보기")
+        self.folder_view_button.setObjectName("ghostButton")
+        self.folder_view_button.setCursor(Qt.CursorShape.PointingHandCursor)
+        _stabilize_control(self.folder_view_button, 76)
+        self.folder_view_button.setMaximumWidth(86)
+        self.folder_view_button.clicked.connect(self.open_folder_view)
+        title_row.addWidget(self.folder_view_button)
         self.summary_label = QLabel()
         self.summary_label.setObjectName("checklistSummaryBadge")
         self.summary_label.setMinimumHeight(PANEL_CONTROL_HEIGHT)
         self.summary_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        # Start hidden so a static capture that never triggers a resize event cannot
+        # render the wide summary badge and crowd the title at narrow widths; the
+        # responsive layout reveals it once the row is wide enough.
+        self.summary_label.setVisible(False)
         title_row.addWidget(self.summary_label)
         layout.addLayout(title_row)
 
@@ -14227,12 +14409,44 @@ class TodayChecklistWidget(QWidget):
         width = self.width()
         mode = "tiny" if width > 0 and width < 260 else "compact" if width > 0 and width < 380 else "normal"
         _apply_panel_rhythm(self.panel_rhythm_layout, mode)
+        if self.title_label is not None:
+            # Keep the internal title for normal and compact widths (the dashboard renders
+            # the default checklist near 293px and other panels share this title baseline),
+            # but drop it only once the row is genuinely cramped so it cannot clip; the
+            # outer feature title still names the panel.
+            self.title_label.setVisible(mode != "tiny")
+        if hasattr(self, "summary_label"):
+            self.summary_label.setVisible(width >= self.SUMMARY_HIDE_BELOW_WIDTH)
 
     def select_checklist_folder_from_index(self, model_index) -> None:
         if not model_index.isValid():
             return
         self.new_task_type_combo.setCurrentIndex(model_index.row())
         self.new_task_type_combo.hidePopup()
+
+    def open_folder_view(self) -> None:
+        selected_type_id = _selected_item_type_id(self.new_task_type_combo)
+        host = self._folder_view_host()
+        if host is not None:
+            host.open_task_folder_window(selected_type_id)
+            return
+        dialog = TaskFolderTasksDialog(
+            self.repository,
+            self,
+            initial_type_id=selected_type_id,
+            on_changed=self.refresh_after_change,
+        )
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.show()
+
+    def _folder_view_host(self) -> MainWindow | None:
+        candidate = self.window()
+        if hasattr(candidate, "open_task_folder_window"):
+            return candidate
+        owner = getattr(candidate, "owner", None)
+        if hasattr(owner, "open_task_folder_window"):
+            return owner
+        return None
 
     def refresh_checklist(self) -> None:
         self._refreshing = True
@@ -14614,6 +14828,10 @@ class TodayChecklistWidget(QWidget):
             widget = item.widget()
             child_layout = item.layout()
             if widget is not None:
+                # Hide before detaching so a pending-deletion row cannot paint a
+                # stale label over the freshly rebuilt list in fast offscreen captures.
+                widget.hide()
+                widget.setParent(None)
                 widget.deleteLater()
             elif child_layout is not None:
                 self._clear_layout(child_layout)
@@ -16724,6 +16942,412 @@ class ItemTypeSettingsDialog(QDialog):
     def _item_type_label(self, item_type: ItemType, task_count: int = 0) -> str:
         default = " · 기본" if item_type.is_default else ""
         return f"{item_type.name} · {task_count}개{default}"
+
+
+class TaskFolderTasksDialog(QDialog):
+    def __init__(
+        self,
+        repository: ScheduleRepository,
+        parent: QWidget | None = None,
+        initial_type_id: int | None = None,
+        on_changed: Callable[[], None] | None = None,
+    ) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.on_changed = on_changed
+        self.item_types: list[ItemType] = []
+        self.setWindowTitle("할 일 폴더 보기")
+        self.setSizeGripEnabled(True)
+        self.setMinimumSize(QSize(720, 460))
+        self.resize(980, 640)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(12)
+
+        header_row = QHBoxLayout()
+        title = QLabel("할 일 폴더")
+        title.setObjectName("sectionTitle")
+        header_row.addWidget(title)
+        header_row.addStretch(1)
+        self.summary_label = QLabel()
+        self.summary_label.setObjectName("mutedLabel")
+        header_row.addWidget(self.summary_label)
+        layout.addLayout(header_row)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        splitter.setChildrenCollapsible(False)
+
+        folder_panel = QWidget()
+        folder_layout = QVBoxLayout(folder_panel)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        folder_layout.setSpacing(8)
+        folder_layout.addWidget(QLabel("폴더"))
+        self.folder_list = QListWidget()
+        self.folder_list.setObjectName("taskFolderViewList")
+        self.folder_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.folder_list.currentItemChanged.connect(lambda _current, _previous: self.refresh_tasks())
+        folder_layout.addWidget(self.folder_list, 1)
+
+        folder_button_row = QHBoxLayout()
+        manage_button = QPushButton("관리")
+        manage_button.setObjectName("ghostButton")
+        _stabilize_control(manage_button, 82)
+        manage_button.clicked.connect(self.open_folder_management)
+        folder_button_row.addWidget(manage_button)
+        folder_button_row.addStretch(1)
+        folder_layout.addLayout(folder_button_row)
+        splitter.addWidget(folder_panel)
+
+        task_panel = QWidget()
+        task_layout = QVBoxLayout(task_panel)
+        task_layout.setContentsMargins(0, 0, 0, 0)
+        task_layout.setSpacing(8)
+
+        task_header = QHBoxLayout()
+        self.folder_title_label = QLabel()
+        self.folder_title_label.setObjectName("sectionTitle")
+        task_header.addWidget(self.folder_title_label)
+        task_header.addStretch(1)
+        self.select_all_check = QCheckBox("전체 선택")
+        self.select_all_check.stateChanged.connect(
+            lambda _state: self.set_all_tasks_checked(self.select_all_check.isChecked())
+        )
+        task_header.addWidget(self.select_all_check)
+        task_layout.addLayout(task_header)
+
+        add_row = QHBoxLayout()
+        self.new_task_edit = QLineEdit()
+        self.new_task_edit.setObjectName("taskFolderViewInput")
+        self.new_task_edit.setPlaceholderText("이 폴더에 할 일 추가")
+        _stabilize_control(self.new_task_edit, 160)
+        self.new_task_edit.returnPressed.connect(self.add_task)
+        add_button = QPushButton("추가")
+        _stabilize_control(add_button, 72)
+        add_button.clicked.connect(self.add_task)
+        add_row.addWidget(self.new_task_edit, 1)
+        add_row.addWidget(add_button)
+        task_layout.addLayout(add_row)
+
+        move_row = QHBoxLayout()
+        move_row.addWidget(QLabel("선택한 할 일 이동"))
+        self.target_type_combo = QComboBox()
+        _stabilize_control(self.target_type_combo, 160)
+        move_row.addWidget(self.target_type_combo, 1)
+        move_button = QPushButton("이동")
+        _stabilize_control(move_button, 72)
+        move_button.clicked.connect(self.move_selected_tasks)
+        move_row.addWidget(move_button)
+        task_layout.addLayout(move_row)
+
+        self.tasks_list = QListWidget()
+        self.tasks_list.setObjectName("taskFolderViewTaskList")
+        self.tasks_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tasks_list.itemDoubleClicked.connect(self.edit_task_from_item)
+        self.tasks_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tasks_list.customContextMenuRequested.connect(self.show_task_context_menu)
+        task_layout.addWidget(self.tasks_list, 1)
+
+        hint = QLabel("할 일을 체크해서 다른 폴더로 옮기거나, 더블클릭으로 수정할 수 있습니다.")
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        task_layout.addWidget(hint)
+        splitter.addWidget(task_panel)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 3)
+        splitter.setSizes([260, 720])
+        layout.addWidget(splitter, 1)
+
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_button = QPushButton("닫기")
+        _stabilize_control(close_button, 84)
+        close_button.clicked.connect(self.close)
+        close_row.addWidget(close_button)
+        layout.addLayout(close_row)
+
+        self.refresh_folders(initial_type_id)
+
+    def refresh(self) -> None:
+        self.refresh_folders(self.current_type_id())
+
+    def refresh_folders(self, selected_type_id: int | None = None) -> None:
+        current_id = selected_type_id if selected_type_id is not None else self.current_type_id()
+        self.item_types = self.repository.list_item_types("task")
+        counts = self._task_counts_by_type()
+        self.folder_list.blockSignals(True)
+        self.folder_list.clear()
+        for item_type in self.item_types:
+            suffix = " · 기본" if item_type.is_default else ""
+            count = counts.get(item_type.id or -1, 0)
+            entry = QListWidgetItem(f"{item_type.name} · {count}개{suffix}")
+            entry.setData(Qt.ItemDataRole.UserRole, item_type.id)
+            self.folder_list.addItem(entry)
+        self.folder_list.blockSignals(False)
+        if current_id is None or not self._select_type(current_id):
+            if self.folder_list.count() > 0:
+                self.folder_list.setCurrentRow(0)
+        self.refresh_target_types()
+        self.refresh_tasks()
+
+    def refresh_target_types(self) -> None:
+        current_target = self.target_type_combo.currentData()
+        selected_id = self.current_type_id()
+        self.target_type_combo.blockSignals(True)
+        self.target_type_combo.clear()
+        for item_type in self.item_types:
+            self.target_type_combo.addItem(item_type.name, item_type.id)
+        preferred = current_target
+        if preferred is None or preferred == selected_id:
+            preferred = None
+            for index in range(self.target_type_combo.count()):
+                candidate = self.target_type_combo.itemData(index)
+                if candidate != selected_id:
+                    preferred = candidate
+                    break
+        if preferred is not None:
+            index = self.target_type_combo.findData(preferred)
+            if index >= 0:
+                self.target_type_combo.setCurrentIndex(index)
+        self.target_type_combo.blockSignals(False)
+
+    def current_type_id(self) -> int | None:
+        item = self.folder_list.currentItem()
+        if item is None:
+            return None
+        type_id = item.data(Qt.ItemDataRole.UserRole)
+        return int(type_id) if type_id is not None else None
+
+    def _select_type(self, type_id: int) -> bool:
+        for row in range(self.folder_list.count()):
+            item = self.folder_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) == type_id:
+                self.folder_list.setCurrentRow(row)
+                return True
+        return False
+
+    def select_type(self, type_id: int) -> None:
+        self._select_type(type_id)
+
+    def selected_item_type(self) -> ItemType | None:
+        type_id = self.current_type_id()
+        return self.repository.get_item_type(type_id) if type_id is not None else None
+
+    def _default_type_id(self) -> int | None:
+        return self.repository.default_item_type("task").id
+
+    def _task_counts_by_type(self) -> dict[int, int]:
+        counts: dict[int, int] = {}
+        default_id = self._default_type_id()
+        for task in self.repository.list_tasks(include_completed=True):
+            type_id = task.item_type_id or default_id
+            if type_id is None:
+                continue
+            counts[type_id] = counts.get(type_id, 0) + 1
+        return counts
+
+    def _tasks_in_type(self, type_id: int) -> list[Task]:
+        default_id = self._default_type_id()
+        return [
+            task
+            for task in self.repository.list_tasks(include_completed=True)
+            if (task.item_type_id or default_id) == type_id
+        ]
+
+    def refresh_tasks(self) -> None:
+        self.tasks_list.clear()
+        self.select_all_check.blockSignals(True)
+        self.select_all_check.setChecked(False)
+        self.select_all_check.blockSignals(False)
+        item_type = self.selected_item_type()
+        if item_type is None or item_type.id is None:
+            self.folder_title_label.setText("폴더")
+            self.summary_label.setText("")
+            self.new_task_edit.setEnabled(False)
+            return
+        self.new_task_edit.setEnabled(True)
+        tasks = self._tasks_in_type(item_type.id)
+        completed = sum(1 for task in tasks if task.completed)
+        self.folder_title_label.setText(item_type.name)
+        self.summary_label.setText(f"할 일 {len(tasks)}개 · 완료 {completed}개")
+        if not tasks:
+            empty = QListWidgetItem("이 폴더에 할 일이 없습니다.")
+            empty.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.tasks_list.addItem(empty)
+            return
+        for task in tasks:
+            entry = QListWidgetItem(self._task_label(task))
+            entry.setData(Qt.ItemDataRole.UserRole, task.id)
+            entry.setFlags(
+                Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsUserCheckable
+            )
+            entry.setCheckState(Qt.CheckState.Unchecked)
+            self.tasks_list.addItem(entry)
+
+    def _task_label(self, task: Task) -> str:
+        preferences = _preferences_from_widget(self)
+        time_label = _format_datetime(task.due_at, preferences) if task.due_at is not None else "시간 없음"
+        status = "완료" if task.completed else "진행"
+        duration = f" · {task.duration_minutes}분" if task.duration_minutes > 0 else ""
+        return f"{task.title}  ·  {time_label}  ·  {status}{duration}"
+
+    def set_all_tasks_checked(self, checked: bool) -> None:
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for row in range(self.tasks_list.count()):
+            item = self.tasks_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole) is not None:
+                item.setCheckState(state)
+
+    def task_ids_for_action(self) -> list[int]:
+        checked_ids: list[int] = []
+        for row in range(self.tasks_list.count()):
+            item = self.tasks_list.item(row)
+            task_id = item.data(Qt.ItemDataRole.UserRole)
+            if task_id is not None and item.checkState() == Qt.CheckState.Checked:
+                checked_ids.append(int(task_id))
+        if checked_ids:
+            return checked_ids
+        selected_ids: list[int] = []
+        for item in self.tasks_list.selectedItems():
+            task_id = item.data(Qt.ItemDataRole.UserRole)
+            if task_id is not None:
+                selected_ids.append(int(task_id))
+        return selected_ids
+
+    def add_task(self) -> None:
+        item_type = self.selected_item_type()
+        if item_type is None or item_type.id is None:
+            QMessageBox.information(self, "할 일 추가", "할 일을 추가할 폴더를 선택하세요.")
+            return
+        title = self.new_task_edit.text().strip()
+        if not title:
+            return
+        self.repository.save_task(
+            Task(
+                title=title,
+                duration_minutes=0,
+                category="today_checklist",
+                created_at=datetime.now(),
+                item_type_id=item_type.id,
+            )
+        )
+        self.new_task_edit.clear()
+        self.refresh_folders(item_type.id)
+        self.emit_changed()
+        self.show_status("할 일을 추가했습니다.")
+
+    def move_selected_tasks(self) -> None:
+        target_id = self.target_type_combo.currentData()
+        if target_id is None:
+            QMessageBox.information(self, "할 일 이동", "이동할 폴더를 선택하세요.")
+            return
+        self.move_tasks_to_type(int(target_id))
+
+    def move_tasks_to_type(self, target_id: int) -> None:
+        task_ids = self.task_ids_for_action()
+        if not task_ids:
+            QMessageBox.information(self, "할 일 이동", "이동할 할 일을 선택하세요.")
+            return
+        moved_count = self.repository.move_tasks_to_type(task_ids, target_id)
+        if moved_count == 0:
+            self.refresh()
+            return
+        self.refresh_folders(target_id)
+        self.emit_changed()
+        self.show_status(f"할 일 {moved_count}개를 이동했습니다.")
+
+    def set_task_completed(self, task_id: int, completed: bool) -> None:
+        self.repository.mark_task_completed(task_id, completed)
+        self.refresh()
+        self.emit_changed()
+
+    def edit_task_from_item(self, item: QListWidgetItem) -> None:
+        task_id = item.data(Qt.ItemDataRole.UserRole)
+        if task_id is not None:
+            self.edit_task(int(task_id))
+
+    def edit_task(self, task_id: int) -> None:
+        task = self.repository.get_task(task_id)
+        if task is None:
+            self.refresh()
+            return
+        dialog = ChecklistItemEditDialog(self.repository, "task", task, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        task.title = dialog.item_title()
+        task.duration_minutes = dialog.duration_minutes()
+        task.due_at = dialog.selected_datetime() if dialog.uses_time() else None
+        task.item_type_id = dialog.item_type_id()
+        self.repository.save_task(task)
+        self.refresh_folders(self.current_type_id())
+        self.emit_changed()
+
+    def delete_selected_tasks(self) -> None:
+        task_ids = self.task_ids_for_action()
+        if not task_ids:
+            QMessageBox.information(self, "할 일 삭제", "삭제할 할 일을 선택하세요.")
+            return
+        answer = QMessageBox.question(self, "할 일 삭제", f"선택한 할 일 {len(task_ids)}개를 삭제할까요?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        for task_id in task_ids:
+            self.repository.delete_task(task_id)
+        self.refresh()
+        self.emit_changed()
+        self.show_status(f"할 일 {len(task_ids)}개를 삭제했습니다.")
+
+    def show_task_context_menu(self, position: QPoint) -> None:
+        item = self.tasks_list.itemAt(position)
+        if item is None or item.data(Qt.ItemDataRole.UserRole) is None:
+            return
+        self.tasks_list.setCurrentItem(item)
+        task_id = int(item.data(Qt.ItemDataRole.UserRole))
+        task = self.repository.get_task(task_id)
+        if task is None:
+            self.refresh()
+            return
+        menu = _style_popup_menu(QMenu(self.tasks_list), self.tasks_list)
+        toggle_label = "완료 취소" if task.completed else "완료로 표시"
+        toggle_action = menu.addAction(toggle_label)
+        toggle_action.triggered.connect(
+            lambda _checked=False, target_id=task_id, completed=not task.completed: self.set_task_completed(
+                target_id, completed
+            )
+        )
+        edit_action = menu.addAction("수정")
+        edit_action.triggered.connect(lambda _checked=False, target_id=task_id: self.edit_task(target_id))
+        menu.addSeparator()
+        self._add_folder_move_menu(menu)
+        menu.addSeparator()
+        delete_action = menu.addAction("삭제")
+        delete_action.triggered.connect(lambda _checked=False: self.delete_selected_tasks())
+        menu.exec(self.tasks_list.mapToGlobal(position))
+
+    def _add_folder_move_menu(self, menu: QMenu) -> None:
+        move_menu = menu.addMenu("폴더 이동")
+        selected_id = self.current_type_id()
+        for item_type in self.item_types:
+            if item_type.id is None or item_type.id == selected_id:
+                continue
+            action = move_menu.addAction(item_type.name)
+            action.triggered.connect(
+                lambda _checked=False, target_id=item_type.id: self.move_tasks_to_type(int(target_id))
+            )
+
+    def open_folder_management(self) -> None:
+        dialog = ItemTypeSettingsDialog(self.repository, self)
+        dialog.exec()
+        self.refresh_folders(self.current_type_id())
+        self.emit_changed()
+
+    def emit_changed(self) -> None:
+        if self.on_changed is not None:
+            self.on_changed()
+
+    def show_status(self, message: str) -> None:
+        parent = self.parent()
+        if hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(message, 2200)
 
 
 class LayoutProfileLoadDialog(QDialog):

@@ -8,8 +8,8 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QSize, Qt, QTime
-from PySide6.QtGui import QColor, QIcon, QImage, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime
+from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -73,6 +73,7 @@ from app.ui.main_window import (
     QuickNoteFolderNotesDialog,
     QuickNoteTrashDialog,
     SettingsDialog,
+    TaskFolderTasksDialog,
     TodayChecklistWidget,
     TodayTimelineWidget,
     WindowControlButton,
@@ -2495,6 +2496,51 @@ def test_quick_memo_editor_ports_compact_header_actions(tmp_path) -> None:
     assert splitter_sizes[0] < splitter_sizes[1]
     assert len(window.findChildren(QPushButton, "memoSaveButton")) == 1
     assert len(window.findChildren(QPushButton, "memoAttachButton")) == 1
+    assert window.findChild(QLabel, "memoHintLabel") is None
+    assert "Ctrl+Enter" in window.quick_note_editor.placeholderText()
+    window.close()
+
+
+def test_quick_memo_ctrl_enter_shortcuts_save_through_repository(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1500, 900)
+    window.show()
+    app.processEvents()
+
+    return_shortcut = window.quick_note_ctrl_return_shortcut
+    enter_shortcut = window.quick_note_ctrl_enter_shortcut
+    assert return_shortcut.objectName() == "quickNoteCtrlReturnShortcut"
+    assert enter_shortcut.objectName() == "quickNoteCtrlEnterShortcut"
+    assert return_shortcut.key() == QKeySequence("Ctrl+Return")
+    assert enter_shortcut.key() == QKeySequence("Ctrl+Enter")
+    assert return_shortcut.parent() is window.quick_note_editor
+    assert enter_shortcut.parent() is window.quick_note_editor
+
+    assert repository.list_quick_notes() == []
+
+    window.quick_note_editor.setPlainText("엔터로 저장")
+    enter_shortcut.activated.emit()
+    app.processEvents()
+    notes_after_enter = repository.list_quick_notes()
+    assert len(notes_after_enter) == 1
+    assert notes_after_enter[0].body == "엔터로 저장"
+    assert window.quick_note_editor.toPlainText() == ""
+
+    window.quick_note_editor.setPlainText("리턴으로 저장")
+    return_shortcut.activated.emit()
+    app.processEvents()
+    notes_after_return = repository.list_quick_notes()
+    assert len(notes_after_return) == 2
+    assert notes_after_return[0].body == "리턴으로 저장"
+    assert window.quick_note_editor.toPlainText() == ""
+
+    window.quick_note_editor.setPlainText("   ")
+    enter_shortcut.activated.emit()
+    app.processEvents()
+    assert len(repository.list_quick_notes()) == 2
+
     window.close()
 
 
@@ -2544,7 +2590,7 @@ def test_quick_memo_prioritizes_editor_when_tiny(tmp_path) -> None:
     window.update_memo_panel_responsive_layout()
 
     assert window.memo_history_card.isHidden()
-    assert window.memo_shortcut_label.isHidden()
+    assert window.findChild(QLabel, "memoHintLabel") is None
     assert window.memo_folder_view_button.isHidden()
     assert window.memo_folder_settings_button.isHidden()
     assert window.quick_note_editor.isVisible()
@@ -2829,6 +2875,271 @@ def test_task_folder_dialog_moves_checked_tasks(tmp_path) -> None:
     dialog.close()
 
 
+def _task_folder_view_titles(dialog: TaskFolderTasksDialog) -> list[str]:
+    return [dialog.tasks_list.item(row).text() for row in range(dialog.tasks_list.count())]
+
+
+def test_today_checklist_exposes_folder_view_button(tmp_path) -> None:
+    # Given a checklist panel with a task folder and a task
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    folder = repository.save_item_type(ItemType("업무", "task"))
+    repository.save_task(Task("보고서 정리", 0, item_type_id=folder.id))
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    # Then the checklist exposes a visible "폴더 보기" control styled as a ghost button
+    button = window.today_checklist_widget.folder_view_button
+    assert button.text() == "폴더 보기"
+    assert button.objectName() == "ghostButton"
+    assert button.isVisible()
+
+    # When the control is used it opens a task-folder view window tracked by MainWindow
+    window.today_checklist_widget.open_folder_view()
+    app.processEvents()
+    dialog = window.task_folder_notes_window
+    assert isinstance(dialog, TaskFolderTasksDialog)
+    assert dialog.isVisible()
+    assert dialog.windowTitle() == "할 일 폴더 보기"
+    dialog.close()
+    window.close()
+
+
+def test_today_checklist_narrow_width_keeps_title_unclipped_and_drops_summary(tmp_path) -> None:
+    # Given a standalone checklist panel holding a task
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    repository.save_task(Task("보고서 정리", 0))
+    widget = TodayChecklistWidget(repository)
+
+    # The summary badge starts hidden so a static capture that never fires a resize
+    # event cannot render the wide badge and crowd the title at a narrow width.
+    assert widget.summary_label.isHidden()
+
+    widget.resize(293, 600)
+    widget.show()
+    app.processEvents()
+
+    # When the panel is laid out at the narrow default dashboard width
+    widget.update_panel_rhythm()
+
+    # Then the title stays visible with room for its full text (no clipping) and the
+    # folder control stays usable, while the redundant summary badge yields its room.
+    assert widget.title_label is not None
+    assert not widget.title_label.isHidden()
+    assert not widget.folder_view_button.isHidden()
+    assert widget.summary_label.isHidden()
+    assert widget.title_label.width() >= widget.title_label.sizeHint().width()
+
+    # When the panel widens back to a roomy width the summary badge returns
+    widget.resize(640, 600)
+    widget.update_panel_rhythm()
+    assert not widget.title_label.isHidden()
+    assert not widget.summary_label.isHidden()
+
+    # When the panel is squeezed to a genuinely cramped width the redundant internal
+    # title hides so it cannot clip, while the folder control stays reachable; the
+    # outer feature title still names the panel.
+    widget.resize(240, 600)
+    widget.update_panel_rhythm()
+    assert widget.title_label.isHidden()
+    assert not widget.folder_view_button.isHidden()
+    assert widget.summary_label.isHidden()
+    widget.close()
+
+
+def test_today_checklist_repeated_refresh_has_no_stale_rows(tmp_path) -> None:
+    # Given a checklist panel with two active tasks
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    repository.save_task(Task("청소", 0))
+    repository.save_task(Task("보고서 정리", 0))
+    widget = TodayChecklistWidget(repository)
+    widget.show()
+    app.processEvents()
+
+    # When the checklist is refreshed repeatedly without flushing the event loop
+    for _ in range(5):
+        widget.refresh_checklist()
+
+    # Then cleared rows detach immediately and do not pile up behind the live ones
+    rows = widget.findChildren(QWidget, "checklistRow")
+    empty_labels = widget.findChildren(QLabel, "mutedLabel")
+    assert len(rows) == 2
+    assert len(empty_labels) == 1
+    widget.close()
+
+
+def test_task_folder_view_lists_tasks_by_folder(tmp_path) -> None:
+    # Given two task folders each holding a task
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    work = repository.save_item_type(ItemType("업무", "task"))
+    personal = repository.save_item_type(ItemType("개인", "task"))
+    repository.save_task(Task("보고서 작성", 0, item_type_id=work.id))
+    repository.save_task(Task("장보기", 0, item_type_id=personal.id))
+
+    # When the folder view opens on the work folder
+    dialog = TaskFolderTasksDialog(repository, initial_type_id=work.id)
+    dialog.show()
+    app.processEvents()
+
+    # Then only the work folder's tasks are listed
+    assert dialog.current_type_id() == work.id
+    work_titles = _task_folder_view_titles(dialog)
+    assert any("보고서 작성" in title for title in work_titles)
+    assert all("장보기" not in title for title in work_titles)
+
+    # When another folder is selected its own tasks are shown
+    dialog.select_type(personal.id)
+    app.processEvents()
+    assert dialog.current_type_id() == personal.id
+    personal_titles = _task_folder_view_titles(dialog)
+    assert any("장보기" in title for title in personal_titles)
+    assert all("보고서 작성" not in title for title in personal_titles)
+    dialog.close()
+
+
+def test_task_folder_view_moves_checked_tasks_and_refreshes(tmp_path) -> None:
+    # Given two tasks in a source folder and a target folder
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    source = repository.save_item_type(ItemType("출발", "task"))
+    target = repository.save_item_type(ItemType("도착", "task"))
+    first = repository.save_task(Task("먼저", 0, item_type_id=source.id))
+    second = repository.save_task(Task("다음", 0, item_type_id=source.id))
+    changed = {"count": 0}
+
+    dialog = TaskFolderTasksDialog(
+        repository,
+        initial_type_id=source.id,
+        on_changed=lambda: changed.__setitem__("count", changed["count"] + 1),
+    )
+    dialog.show()
+    app.processEvents()
+    assert dialog.tasks_list.count() == 2
+
+    # When both tasks are checked and moved to the target folder
+    for row in range(dialog.tasks_list.count()):
+        dialog.tasks_list.item(row).setCheckState(Qt.CheckState.Checked)
+    target_index = dialog.target_type_combo.findData(target.id)
+    assert target_index >= 0
+    dialog.target_type_combo.setCurrentIndex(target_index)
+    dialog.move_selected_tasks()
+    app.processEvents()
+
+    # Then both tasks belong to the target folder and on_changed fired
+    assert repository.get_task(first.id).item_type_id == target.id
+    assert repository.get_task(second.id).item_type_id == target.id
+    assert changed["count"] >= 1
+    dialog.close()
+
+
+def test_task_folder_view_adds_task_to_selected_folder(tmp_path) -> None:
+    # Given an empty task folder open in the folder view
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    folder = repository.save_item_type(ItemType("새폴더", "task"))
+    changed = {"count": 0}
+    dialog = TaskFolderTasksDialog(
+        repository,
+        initial_type_id=folder.id,
+        on_changed=lambda: changed.__setitem__("count", changed["count"] + 1),
+    )
+    dialog.show()
+    app.processEvents()
+
+    # When a task is added through the folder view input
+    dialog.new_task_edit.setText("새 할 일")
+    dialog.add_task()
+    app.processEvents()
+
+    # Then the task is created in the selected folder, input clears, on_changed fires
+    matches = [
+        task
+        for task in repository.list_tasks(include_completed=True)
+        if task.title == "새 할 일" and task.item_type_id == folder.id
+    ]
+    assert matches
+    assert dialog.new_task_edit.text() == ""
+    assert changed["count"] >= 1
+    dialog.close()
+
+
+def test_task_folder_view_completes_and_deletes_task(tmp_path, monkeypatch) -> None:
+    # Given a task in a folder open in the folder view
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    folder = repository.save_item_type(ItemType("정리", "task"))
+    task = repository.save_task(Task("끝낼 일", 0, item_type_id=folder.id))
+    changed = {"count": 0}
+    dialog = TaskFolderTasksDialog(
+        repository,
+        initial_type_id=folder.id,
+        on_changed=lambda: changed.__setitem__("count", changed["count"] + 1),
+    )
+    dialog.show()
+    app.processEvents()
+
+    # When the task is completed from the folder view
+    dialog.set_task_completed(int(task.id), True)
+    app.processEvents()
+
+    # Then the task is marked completed and on_changed fires
+    assert repository.get_task(task.id).completed is True
+    assert changed["count"] >= 1
+
+    # When the task is checked and deleted (confirmation accepted)
+    monkeypatch.setattr(
+        "app.ui.main_window.QMessageBox.question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+    for row in range(dialog.tasks_list.count()):
+        item = dialog.tasks_list.item(row)
+        if item.data(Qt.ItemDataRole.UserRole) == task.id:
+            item.setCheckState(Qt.CheckState.Checked)
+    dialog.delete_selected_tasks()
+    app.processEvents()
+
+    # Then the task is removed
+    assert repository.get_task(task.id) is None
+    dialog.close()
+
+
+def test_task_folder_view_manage_button_opens_folder_management(tmp_path, monkeypatch) -> None:
+    # Given the folder view open on a folder
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    folder = repository.save_item_type(ItemType("관리대상", "task"))
+    changed = {"count": 0}
+    dialog = TaskFolderTasksDialog(
+        repository,
+        initial_type_id=folder.id,
+        on_changed=lambda: changed.__setitem__("count", changed["count"] + 1),
+    )
+    dialog.show()
+    app.processEvents()
+
+    # Then a clear "관리" path exists that routes to ItemTypeSettingsDialog
+    manage_buttons = [button for button in dialog.findChildren(QPushButton) if button.text() == "관리"]
+    assert manage_buttons
+
+    captured: dict[str, object] = {}
+
+    def fake_exec(self) -> int:
+        captured["dialog"] = self
+        return 0
+
+    monkeypatch.setattr(main_window_module.ItemTypeSettingsDialog, "exec", fake_exec)
+    dialog.open_folder_management()
+    app.processEvents()
+
+    assert isinstance(captured.get("dialog"), main_window_module.ItemTypeSettingsDialog)
+    assert changed["count"] >= 1
+    dialog.close()
+
+
 def test_feature_context_windows_use_new_window_label_and_always_on_top(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -2947,30 +3258,263 @@ def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
 
     media_box = window.feature_boxes["media_panel"]
     preview = window.media_preview_label
+    media_content = media_box.findChild(QWidget, "mediaPanel")
     pomodoro_box = window.feature_boxes["pomodoro"]
     pomodoro_content = pomodoro_box.findChild(QWidget, "pomodoroPanel")
     assert preview is not None
+    assert media_content is not None
     assert pomodoro_content is not None
 
-    expected_offset = PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP
-    assert preview.mapTo(media_box, QPoint(0, 0)).y() == expected_offset
-    assert pomodoro_content.mapTo(pomodoro_box, QPoint(0, 0)).y() == expected_offset
+    # The media panel now shows the same visible handle as titled panels, while its
+    # image body stays directly draggable.
+    titled_offset = PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP
+    assert media_box.header_band is not None
+    assert media_box.header_band.maximumHeight() == PANEL_HEADER_HEIGHT
+    assert media_box.move_bar is not None
+    assert media_box.move_bar.minimumHeight() == PANEL_MOVE_BAR_HEIGHT
+    assert media_box.move_bar.maximumHeight() == PANEL_MOVE_BAR_HEIGHT
+    assert media_box.title_label is None
+    assert media_box.content_drag_enabled is True
+    assert media_content.layout().contentsMargins().top() == 0
+
+    # Its preview now starts below the visible handle, matching titled panels.
+    assert media_content.mapTo(media_box, QPoint(0, 0)).y() == titled_offset
+    assert preview.mapTo(media_box, QPoint(0, 0)).y() == titled_offset
+
+    # A normal titled panel reserves the same visible handle-to-card gap.
+    assert pomodoro_content.mapTo(pomodoro_box, QPoint(0, 0)).y() == titled_offset
 
     media_box_top = media_box.mapTo(window, QPoint(0, 0)).y()
     pomodoro_box_top = pomodoro_box.mapTo(window, QPoint(0, 0)).y()
     assert media_box_top == pomodoro_box_top
     assert media_box_top + media_box.height() == pomodoro_box_top + pomodoro_box.height()
 
+    # The preview owns the card below the handle, down to the bottom edge.
     preview_top = preview.mapTo(window, QPoint(0, 0)).y()
-    pomodoro_content_top = pomodoro_content.mapTo(window, QPoint(0, 0)).y()
-    assert preview_top == pomodoro_content_top
-    assert preview_top + preview.height() == pomodoro_content_top + pomodoro_content.height()
-
-    assert preview.height() == media_box.height() - expected_offset
+    assert preview_top == media_box_top + titled_offset
+    assert preview.height() == media_box.height() - titled_offset
     assert preview_top + preview.height() == media_box_top + media_box.height()
 
     assert preview.pixmap() is not None
     assert not preview.pixmap().isNull()
+
+    window.close()
+
+
+def test_handle_panels_share_card_content_baseline(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = True
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = True
+    window.preferences.show_quick_memo_panel = False
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = False
+    window.preferences.show_today_checklist_inline = False
+    window.preferences.show_link_favorites_panel = False
+
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 3, "h": 5},
+        {"key": "header_banner", "x": 3, "y": 0, "w": 3, "h": 5},
+        {"key": "pomodoro", "x": 6, "y": 0, "w": 3, "h": 5},
+        {"key": "datetime", "x": 0, "y": 0, "w": 3, "h": 2},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    header_box = window.feature_boxes["header_banner"]
+    header_content = window.header_banner_widget
+    datetime_box = window.feature_boxes["datetime"]
+    datetime_content = window.datetime_content_panel
+    focus_box = window.feature_boxes["focus"]
+    focus_content = window.focus_content_panel
+    pomodoro_box = window.feature_boxes["pomodoro"]
+    pomodoro_content = pomodoro_box.findChild(QWidget, "pomodoroPanel")
+    assert pomodoro_content is not None
+
+    # The media/header/datetime panels now expose the same visible handle as titled
+    # panels, while their body stays directly draggable.
+    titled_offset = PANEL_HEADER_HEIGHT + PANEL_HANDLE_CONTENT_GAP
+    for handle_box in (datetime_box, header_box):
+        assert handle_box.title_label is None
+        assert handle_box.header_band is not None
+        assert handle_box.header_band.maximumHeight() == PANEL_HEADER_HEIGHT
+        assert handle_box.move_bar is not None
+        assert handle_box.move_bar.minimumHeight() == PANEL_MOVE_BAR_HEIGHT
+        assert handle_box.move_bar.maximumHeight() == PANEL_MOVE_BAR_HEIGHT
+        assert handle_box.content_drag_enabled is True
+
+    # The new handles react to hover exactly like other FeatureMoveBar controls.
+    for handle_box in (datetime_box, header_box):
+        move_bar = handle_box.move_bar
+        QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Enter))
+        assert move_bar.property("hovering") is True
+        QApplication.sendEvent(move_bar, QEvent(QEvent.Type.Leave))
+        assert move_bar.property("hovering") is False
+
+    # Handle content now starts below the visible gap, matching titled panels.
+    assert header_content.mapTo(header_box, QPoint(0, 0)).y() == titled_offset
+    assert datetime_content.mapTo(datetime_box, QPoint(0, 0)).y() == titled_offset
+
+    # Normal titled panels keep the same visible handle-to-card gap.
+    assert focus_content.mapTo(focus_box, QPoint(0, 0)).y() == titled_offset
+    assert pomodoro_content.mapTo(pomodoro_box, QPoint(0, 0)).y() == titled_offset
+
+    # All four boxes share the same row-0 top (datetime overlays focus at (0, 0)).
+    box_tops = {
+        focus_box.mapTo(window, QPoint(0, 0)).y(),
+        header_box.mapTo(window, QPoint(0, 0)).y(),
+        pomodoro_box.mapTo(window, QPoint(0, 0)).y(),
+        datetime_box.mapTo(window, QPoint(0, 0)).y(),
+    }
+    assert len(box_tops) == 1
+    shared_box_top = box_tops.pop()
+
+    # Every panel now shares the same handle-to-content baseline.
+    assert header_content.mapTo(window, QPoint(0, 0)).y() == shared_box_top + titled_offset
+    assert datetime_content.mapTo(window, QPoint(0, 0)).y() == shared_box_top + titled_offset
+    assert focus_content.mapTo(window, QPoint(0, 0)).y() == shared_box_top + titled_offset
+    assert pomodoro_content.mapTo(window, QPoint(0, 0)).y() == shared_box_top + titled_offset
+
+    # The datetime overlay floats above the grid rather than occupying a grid slot,
+    # yet still lands on the same container origin as focus.
+    datetime_cell = window.feature_cells["datetime"]
+    focus_cell = window.feature_cells["focus"]
+    assert datetime_cell.parent() is window.feature_grid_container
+    assert window.feature_dashboard_layout.indexOf(datetime_cell) == -1
+    focus_position = window.feature_dashboard_layout.getItemPosition(
+        window.feature_dashboard_layout.indexOf(focus_cell)
+    )
+    assert focus_position[:2] == (0, 0)
+    assert datetime_cell.geometry().topLeft() == focus_cell.geometry().topLeft()
+
+    window.close()
+
+
+def test_handle_panel_content_press_starts_reposition(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1500, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = True
+    window.preferences.show_header_banner = True
+    window.preferences.show_focus_panel = True
+    window.preferences.show_media_panel = True
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_quick_memo_panel = False
+    window.preferences.show_pomodoro_controls = False
+    window.preferences.show_today_timeline_inline = False
+    window.preferences.show_today_checklist_inline = False
+    window.preferences.show_link_favorites_panel = False
+
+    window.feature_dashboard_items = [
+        {"key": "header_banner", "x": 0, "y": 0, "w": 4, "h": 5},
+        {"key": "media_panel", "x": 4, "y": 0, "w": 3, "h": 5},
+        {"key": "focus", "x": 7, "y": 0, "w": 4, "h": 5},
+        {"key": "datetime", "x": 0, "y": 6, "w": 3, "h": 2},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    overlay = window.dashboard_guide_overlay
+    layout_before = [dict(item) for item in window._current_feature_dashboard_layout()]
+    stored_before = [dict(item) for item in getattr(window, "feature_dashboard_items", [])]
+    slots_before = {str(item.get("key", "")): _dashboard_slot(item) for item in layout_before}
+    stored_slots_before = {str(item.get("key", "")): _dashboard_slot(item) for item in stored_before}
+    assert not overlay.isVisible()
+
+    def press_at(widget, local_point):
+        return QMouseEvent(
+            QEvent.Type.MouseButtonPress,
+            QPointF(local_point),
+            QPointF(widget.mapToGlobal(local_point)),
+            Qt.MouseButton.LeftButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+    def move_at(widget, local_point):
+        return QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(local_point),
+            QPointF(widget.mapToGlobal(local_point)),
+            Qt.MouseButton.NoButton,
+            Qt.MouseButton.LeftButton,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+    handle_panel_contents = (
+        ("header_banner", window.header_banner_widget),
+        ("media_panel", window.media_preview_label),
+        ("datetime", window.datetime_content_panel),
+    )
+    drag_threshold = QApplication.startDragDistance()
+    for key, content in handle_panel_contents:
+        box = window.feature_boxes[key]
+        assert box.content_drag_enabled is True
+        center = QPoint(max(1, content.width() // 2), max(1, content.height() // 2))
+        # The box installs itself as the content event filter at runtime; body drag stays
+        # a move affordance for image/banner/clock panels even though they now show a handle.
+        consumed_press = box.eventFilter(content, press_at(content, center))
+        assert consumed_press is False
+        assert box.panel_drag_start is not None
+        assert box.panel_drag_active is False
+        moved = QPoint(center.x() + drag_threshold * 3, center.y())
+        box.eventFilter(content, move_at(content, moved))
+        assert box.panel_drag_start is not None
+        assert box.panel_drag_active is True
+        assert overlay.isVisible()
+        current_slots = {
+            str(item.get("key", "")): _dashboard_slot(item)
+            for item in window._current_feature_dashboard_layout()
+        }
+        current_stored_slots = {
+            str(item.get("key", "")): _dashboard_slot(item)
+            for item in getattr(window, "feature_dashboard_items", [])
+        }
+        assert current_slots == slots_before
+        assert current_stored_slots == stored_slots_before
+        box.finish_feature_reposition_gesture(content.mapToGlobal(center), content)
+        window._hide_dashboard_drag_guides()
+        assert box.panel_drag_start is None
+        assert box.panel_drag_active is False
+
+    # Previewing handle-panel body drags does not mutate the live layout until a drop happens.
+    current_slots = {
+        str(item.get("key", "")): _dashboard_slot(item)
+        for item in window._current_feature_dashboard_layout()
+    }
+    current_stored_slots = {
+        str(item.get("key", "")): _dashboard_slot(item)
+        for item in getattr(window, "feature_dashboard_items", [])
+    }
+    assert current_slots == slots_before
+    assert current_stored_slots == stored_slots_before
+
+    # A normal titled panel still arms a reposition gesture from its visible handle.
+    focus_box = window.feature_boxes["focus"]
+    move_bar = focus_box.move_bar
+    assert move_bar is not None
+    bar_center = QPoint(max(1, move_bar.width() // 2), max(1, move_bar.height() // 2))
+    move_bar.mousePressEvent(press_at(move_bar, bar_center))
+    assert focus_box.panel_drag_start is not None
+    focus_box.finish_feature_reposition_gesture(move_bar.mapToGlobal(bar_center), move_bar)
+    window._hide_dashboard_drag_guides()
+    assert not overlay.isVisible()
 
     window.close()
 
@@ -3508,8 +4052,10 @@ def test_datetime_panel_overlays_other_dashboard_items(tmp_path) -> None:
 
     datetime_box = window.feature_boxes["datetime"]
     assert datetime_box.title_label is None
-    assert datetime_box.move_bar is None
-    assert datetime_box.content_drag_enabled
+    assert datetime_box.header_band is not None
+    assert datetime_box.move_bar is not None
+    assert datetime_box.move_bar.maximumHeight() == PANEL_MOVE_BAR_HEIGHT
+    assert datetime_box.content_drag_enabled is True
 
     window.feature_dashboard_items = [
         {"key": "datetime", "x": 0, "y": 0, "w": 4, "h": 2},
@@ -3520,14 +4066,16 @@ def test_datetime_panel_overlays_other_dashboard_items(tmp_path) -> None:
 
     datetime_cell = window.feature_cells["datetime"]
     focus_cell = window.feature_cells["focus"]
-    datetime_position = window.feature_dashboard_layout.getItemPosition(
-        window.feature_dashboard_layout.indexOf(datetime_cell)
-    )
+    # datetime renders as a floating overlay child (direct child positioned by geometry),
+    # not a grid item, so it never consumes a grid slot.
+    assert datetime_cell.parent() is window.feature_grid_container
+    assert window.feature_dashboard_layout.indexOf(datetime_cell) == -1
     focus_position = window.feature_dashboard_layout.getItemPosition(
         window.feature_dashboard_layout.indexOf(focus_cell)
     )
-    assert datetime_position[:2] == (0, 0)
     assert focus_position[:2] == (0, 0)
+    # The overlay still sits on top of focus at the same container origin.
+    assert datetime_cell.geometry().topLeft() == focus_cell.geometry().topLeft()
 
     window.close()
 
@@ -3537,6 +4085,17 @@ def test_datetime_overlay_moves_and_resizes_without_repacking_neighbors(tmp_path
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
     preferences.show_datetime_panel = True
+    preferences.show_focus_panel = True
+    preferences.show_quick_memo_panel = True
+    preferences.show_pomodoro_controls = True
+    preferences.show_today_checklist_inline = True
+    preferences.show_header_banner = False
+    preferences.show_today_timeline_inline = False
+    preferences.show_link_favorites_panel = False
+    preferences.show_media_panel = False
+    preferences.show_media_panel_2 = False
+    preferences.show_media_panel_3 = False
+    preferences.show_media_panel_4 = False
     repository.save_preferences(preferences)
 
     window = MainWindow(repository)
@@ -3544,40 +4103,73 @@ def test_datetime_overlay_moves_and_resizes_without_repacking_neighbors(tmp_path
     window.show()
     app.processEvents()
 
+    # datetime overlaps row 0 where focus/quick_memo/pomodoro live; today_checklist
+    # sits below at row 4. Moving or resizing the floating datetime overlay must only
+    # change datetime's own geometry, never nudge these neighbors.
     window.feature_dashboard_items = [
-        {"key": "datetime", "x": 0, "y": 0, "w": 3, "h": 1},
+        {"key": "datetime", "x": 0, "y": 0, "w": 3, "h": 2},
         {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 4},
+        {"key": "quick_memo", "x": 4, "y": 0, "w": 4, "h": 4},
+        {"key": "pomodoro", "x": 8, "y": 0, "w": 4, "h": 4},
+        {"key": "today_checklist", "x": 0, "y": 4, "w": 4, "h": 4},
     ]
     window._render_feature_dashboard()
     app.processEvents()
 
-    column_step = int(window._dashboard_column_width() + DASHBOARD_GRID_GAP)
+    neighbor_keys = ("focus", "quick_memo", "pomodoro", "today_checklist")
+
+    def neighbor_geometries() -> dict[str, tuple[int, int, int, int]]:
+        geometries: dict[str, tuple[int, int, int, int]] = {}
+        for key in neighbor_keys:
+            rect = window.feature_cells[key].geometry()
+            geometries[key] = (rect.x(), rect.y(), rect.width(), rect.height())
+        return geometries
+
+    before_geometries = neighbor_geometries()
+
+    # The floating datetime overlay is a direct child positioned by geometry, not a
+    # grid item that consumes row space.
+    datetime_cell = window.feature_cells["datetime"]
+    assert datetime_cell.parent() is window.feature_grid_container
+    assert window.feature_dashboard_layout.indexOf(datetime_cell) == -1
+
     row_step = int(DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP)
-    target = window.feature_grid_container.mapToGlobal(QPoint(column_step * 6, row_step * 5))
+    target = window.feature_grid_container.mapToGlobal(QPoint(0, row_step))
     assert window._move_feature_to_dashboard_position("datetime", target, QPoint(0, 0))
+    app.processEvents()
 
     moved = {
         str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
         for item in window._current_feature_dashboard_layout()
     }
+    assert moved["datetime"][:2] == (0, 1)
     assert moved["focus"][:2] == (0, 0)
-    assert moved["datetime"][:2] == (6, 5)
+    assert moved["quick_memo"][:2] == (4, 0)
+    assert moved["pomodoro"][:2] == (8, 0)
+    assert moved["today_checklist"][:2] == (0, 4)
+    # The regression: neighbor widget geometry must stay pixel-identical because their
+    # slots did not change.
+    assert neighbor_geometries() == before_geometries
 
     window._resize_feature_dashboard_item("datetime", width=window._dashboard_item_pixel_width(2))
+    app.processEvents()
     resized = {
         str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
         for item in window._current_feature_dashboard_layout()
     }
     assert resized["focus"][:2] == (0, 0)
     assert resized["datetime"][2] == 2
+    assert neighbor_geometries() == before_geometries
 
-    window._resize_feature_dashboard_item("datetime", height=window._dashboard_item_pixel_height(2))
+    window._resize_feature_dashboard_item("datetime", height=window._dashboard_item_pixel_height(3))
+    app.processEvents()
     resized_height = {
         str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
         for item in window._current_feature_dashboard_layout()
     }
     assert resized_height["focus"][:2] == (0, 0)
-    assert resized_height["datetime"][3] == 2
+    assert resized_height["datetime"][3] == 3
+    assert neighbor_geometries() == before_geometries
 
     window.close()
 
@@ -4282,10 +4874,12 @@ def test_show_dashboard_drag_guides_preserves_layout_and_matches_preview(tmp_pat
     overlay = window.dashboard_guide_overlay
     assert overlay.isVisible()
 
-    # preview_rect mirrors the previewed final position of the dragged source panel.
-    preview_item = window._dashboard_preview_item("focus", target_global)
-    assert preview_item is not None
-    assert overlay.preview_rect == window._dashboard_item_rect(preview_item)
+    # preview_rect now follows the grabbed source panel (its own size plus the
+    # pointer/grab offset), instead of snapping onto the previewed target grid slot.
+    source_cell = window.feature_cells["focus"]
+    assert overlay.preview_rect.width() == float(source_cell.width())
+    assert overlay.preview_rect.height() == float(source_cell.height())
+    assert overlay.preview_rect == window._dashboard_drag_preview_rect("focus", target_global)
 
     # impact_rects correspond exactly to the non-source panels whose slots change.
     preview_layout = window._dashboard_preview_layout("focus", target_global)
@@ -4339,6 +4933,183 @@ def test_hide_dashboard_drag_guides_clears_state_and_preserves_layout(tmp_path) 
     assert [dict(item) for item in window._current_feature_dashboard_layout()] == layout_before
     assert [dict(item) for item in getattr(window, "feature_dashboard_items", [])] == stored_before
 
+    window.close()
+
+
+def test_dashboard_drag_preview_follows_grab_not_snapped_slot(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1500, 900)
+    window.show()
+    app.processEvents()
+
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 5},
+        {"key": "quick_memo", "x": 8, "y": 0, "w": 3, "h": 3},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    container = window.feature_grid_container
+    source_cell = window.feature_cells["focus"]
+    column_step = window._dashboard_column_width() + DASHBOARD_GRID_GAP
+    row_step = DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP
+
+    # Grab the panel near its top-left corner and drag toward a far grid slot.
+    drag_offset = QPoint(30, 18)
+    # Followed top-left sits a little past slot (4, 5) yet still snaps onto it.
+    followed = QPoint(int(round(column_step * 4)) + 20, int(round(row_step * 5)) + 12)
+    cursor_local = QPoint(followed.x() + drag_offset.x(), followed.y() + drag_offset.y())
+    cursor_global = container.mapToGlobal(cursor_local)
+
+    window._show_dashboard_drag_guides("focus", cursor_global, drag_offset)
+    app.processEvents()
+
+    overlay = window.dashboard_guide_overlay
+    assert overlay.isVisible()
+
+    # Preview size mirrors the grabbed source cell, not a stand-in grid slot.
+    assert overlay.preview_rect.width() == float(source_cell.width())
+    assert overlay.preview_rect.height() == float(source_cell.height())
+
+    # Preview top-left tracks the pointer minus the grab offset.
+    assert abs(overlay.preview_rect.left() - followed.x()) <= 1.0
+    assert abs(overlay.preview_rect.top() - followed.y()) <= 1.0
+
+    # The preview does NOT collapse onto the snapped target grid slot rectangle.
+    preview_item = window._dashboard_preview_item("focus", cursor_global, drag_offset)
+    assert preview_item is not None
+    assert (int(preview_item["x"]), int(preview_item["y"])) == (4, 5)
+    snapped_rect = window._dashboard_item_rect(preview_item)
+    assert overlay.preview_rect != snapped_rect
+    assert overlay.preview_rect.topLeft() != snapped_rect.topLeft()
+
+    window._hide_dashboard_drag_guides()
+    window.close()
+
+
+def test_show_dashboard_drag_guides_repeated_same_values_no_flicker(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1440, 900)
+    window.show()
+    app.processEvents()
+
+    target_cell = window.feature_cells["today_timeline"]
+    target_global = target_cell.mapToGlobal(target_cell.rect().center())
+
+    window._show_dashboard_drag_guides("focus", target_global)
+    app.processEvents()
+    overlay = window.dashboard_guide_overlay
+    assert overlay.isVisible()
+
+    first_preview = QRectF(overlay.preview_rect)
+    first_impacts = [QRectF(rect) for rect in overlay.impact_rects]
+    layout_after_first = [dict(item) for item in window._current_feature_dashboard_layout()]
+
+    hide_calls = {"count": 0}
+    update_calls = {"count": 0}
+    original_hide = overlay.hide
+    original_update = overlay.update
+
+    def counting_hide(*args, **kwargs):
+        hide_calls["count"] += 1
+        return original_hide(*args, **kwargs)
+
+    def counting_update(*args, **kwargs):
+        update_calls["count"] += 1
+        return original_update(*args, **kwargs)
+
+    overlay.hide = counting_hide
+    overlay.update = counting_update
+    try:
+        # Re-show with byte-identical inputs: the overlay is already visible.
+        window._show_dashboard_drag_guides("focus", target_global)
+        app.processEvents()
+    finally:
+        overlay.hide = original_hide
+        overlay.update = original_update
+
+    # An identical re-show must not hide the visible overlay (no hide/show flicker)...
+    assert hide_calls["count"] == 0
+    assert overlay.isVisible()
+    # ...nor schedule a repaint for unchanged preview/impact state...
+    assert update_calls["count"] == 0
+    # ...and the preview/impact geometry stays identical.
+    assert overlay.preview_rect == first_preview
+    assert overlay.impact_rects == first_impacts
+    # The repeated non-destructive preview must not mutate the live layout.
+    assert [dict(item) for item in window._current_feature_dashboard_layout()] == layout_after_first
+
+    window._hide_dashboard_drag_guides()
+    window.close()
+
+
+def test_reposition_gesture_keeps_closed_hand_over_resize_edges(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1500, 900)
+    window.show()
+    app.processEvents()
+
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 4, "h": 5},
+        {"key": "quick_memo", "x": 8, "y": 0, "w": 3, "h": 3},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    box = window.feature_boxes["focus"]
+    box.content_drag_enabled = True
+    width = box.width()
+    height = box.height()
+    # The panel must be large enough to expose both resize edges.
+    assert width >= box._minimum_resize_pixel_width()
+    assert height >= 80
+    assert box.resize_callback is not None or box.resize_edge_callback is not None
+    assert box.height_callback is not None
+
+    def move_event(local_point, buttons):
+        return QMouseEvent(
+            QEvent.Type.MouseMove,
+            QPointF(local_point),
+            box.mapToGlobal(local_point),
+            Qt.MouseButton.NoButton,
+            buttons,
+            Qt.KeyboardModifier.NoModifier,
+        )
+
+    right_edge = QPoint(width - 2, height // 2)
+    bottom_edge = QPoint(width // 2, height - 2)
+
+    # Baseline: hovering the right edge without holding shows the width-resize cursor.
+    box.mouseMoveEvent(move_event(right_edge, Qt.MouseButton.NoButton))
+    assert box.cursor().shape() == Qt.CursorShape.SizeHorCursor
+
+    # Begin holding a reposition gesture right on the width-resize edge.
+    box.begin_feature_reposition_gesture(box.mapToGlobal(right_edge), box)
+    assert box.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+
+    # A nudge below the drag threshold must NOT revert to the resize cursor.
+    nudge_px = max(1, QApplication.startDragDistance() // 2)
+    box.mouseMoveEvent(move_event(QPoint(width - 2 - nudge_px, height // 2), Qt.MouseButton.LeftButton))
+    assert box.panel_drag_active is False
+    assert box.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+
+    # Crossing the threshold over the bottom (height) resize edge stays grabbing.
+    box.mouseMoveEvent(move_event(bottom_edge, Qt.MouseButton.LeftButton))
+    assert box.panel_drag_active is True
+    assert box.cursor().shape() == Qt.CursorShape.ClosedHandCursor
+
+    # Releasing ends the gesture; resize cursors work again when not holding.
+    box.finish_feature_reposition_gesture(box.mapToGlobal(right_edge), box)
+    box.mouseMoveEvent(move_event(right_edge, Qt.MouseButton.NoButton))
+    assert box.cursor().shape() == Qt.CursorShape.SizeHorCursor
+
+    window._hide_dashboard_drag_guides()
     window.close()
 
 
