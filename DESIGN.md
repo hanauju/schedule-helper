@@ -186,9 +186,10 @@ The main window is frameless, so the header supplies its own controls.
   grip so the strip reads as grabbable without adding another button. During drag the strip switches to
   solid accent with light grip marks and a closed-hand cursor.
 - **Drag preview** (`DashboardGridGuideOverlay#dashboardGridGuideOverlay`): dashboard moves render a
-  non-mutating preview of the source panel's final slot plus dashed impact cards for neighbors that would
-  move. Hiding/cancelling the guides clears only the overlay state; the stored dashboard layout is unchanged
-  until the drop finishes.
+  non-mutating preview that keeps the grabbed source panel's current size and follows the cursor from the
+  original grab offset, plus dashed impact cards for neighbors whose slots would move after the drop.
+  Hiding/cancelling the guides clears only the overlay state; the stored dashboard layout is unchanged until
+  the drop finishes.
 
 ## 6. Motion & Interaction
 
