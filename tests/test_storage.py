@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime, time
 from pathlib import Path
+
+import pytest
 
 from app.models import (
     AppUsageSession,
@@ -16,6 +19,8 @@ from app.models import (
     Preference,
     QuickNote,
     QuickNoteFolder,
+    Tag,
+    TagLink,
     Task,
     TrackedProgram,
 )
@@ -161,6 +166,507 @@ def test_repository_persists_tasks_and_events(tmp_path) -> None:
     assert events[0].id == event.id
     assert events[0].task_id == task.id
     assert events[0].item_type_id == custom_event_type.id
+
+
+def test_repository_migrates_metadata_schema_without_data_loss(tmp_path) -> None:
+    db_path = tmp_path / "legacy_metadata.sqlite3"
+    connection = sqlite3.connect(db_path)
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE tasks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                duration_minutes INTEGER NOT NULL,
+                due_at TEXT,
+                priority INTEGER NOT NULL,
+                category TEXT NOT NULL DEFAULT '',
+                completed INTEGER NOT NULL DEFAULT 0,
+                completed_at TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                start_at TEXT NOT NULL,
+                end_at TEXT NOT NULL,
+                fixed INTEGER NOT NULL DEFAULT 1,
+                task_id INTEGER,
+                category TEXT NOT NULL DEFAULT '',
+                completed INTEGER NOT NULL DEFAULT 0,
+                completed_at TEXT
+            );
+            CREATE TABLE quick_notes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                body TEXT NOT NULL,
+                content_html TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                focus_session_id INTEGER,
+                task_id INTEGER,
+                process_name TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE preferences (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                day_max_minutes INTEGER NOT NULL,
+                break_minutes INTEGER NOT NULL,
+                strategy TEXT NOT NULL
+            );
+            INSERT INTO tasks (title, duration_minutes, priority, created_at)
+            VALUES ('legacy task', 20, 3, '2026-06-08T09:00:00');
+            INSERT INTO events (title, start_at, end_at)
+            VALUES ('legacy event', '2026-06-08T10:00:00', '2026-06-08T10:30:00');
+            INSERT INTO quick_notes (body, content_html, created_at, process_name)
+            VALUES ('legacy note', '', '2026-06-08T12:00:00', '');
+            INSERT INTO preferences (id, day_max_minutes, break_minutes, strategy)
+            VALUES (1, 480, 10, 'deadline_priority');
+            """
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    repository = ScheduleRepository(db_path)
+
+    task = repository.list_tasks()[0]
+    event = repository.list_events(include_completed=True)[0]
+    note = repository.list_quick_notes()[0]
+    preferences = repository.get_preferences()
+    assert task.title == "legacy task"
+    assert event.title == "legacy event"
+    assert note.body == "legacy note"
+    assert task.pinned is False
+    assert event.pinned is False
+    assert note.pinned is False
+    assert preferences.quick_note_sort_direction == "desc"
+    assert preferences.checklist_sort_direction == "desc"
+    assert preferences.active_workspace_id is None
+
+    with repository.connect() as migrated:
+        task_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(tasks)")}
+        event_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(events)")}
+        note_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(quick_notes)")}
+        preference_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(preferences)")}
+        tag_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(tags)")}
+        tag_link_columns = {row["name"] for row in migrated.execute("PRAGMA table_info(tag_links)")}
+
+    assert "pinned" in task_columns
+    assert "pinned" in event_columns
+    assert "pinned" in note_columns
+    assert {"quick_note_sort_direction", "checklist_sort_direction", "active_workspace_id"} <= preference_columns
+    assert {"id", "name", "created_at"} <= tag_columns
+    assert {"id", "target_type", "target_id", "tag_id"} <= tag_link_columns
+
+
+def test_repository_round_trips_pinned_items(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+
+    task = repository.save_task(Task("Default pin task", 15))
+    event = repository.save_event(Event("Default pin event", datetime(2026, 6, 9, 9, 0), datetime(2026, 6, 9, 9, 30)))
+    note = repository.save_quick_note(QuickNote(body="default pin note", created_at=datetime(2026, 6, 9, 10, 0)))
+
+    reloaded = ScheduleRepository(db_path)
+    assert reloaded.get_task(task.id).pinned is False
+    assert reloaded.get_event(event.id).pinned is False
+    assert reloaded.get_quick_note(note.id).pinned is False
+
+    task.pinned = True
+    event.pinned = True
+    note.pinned = True
+    repository.save_task(task)
+    repository.save_event(event)
+    repository.save_quick_note(note)
+
+    reloaded = ScheduleRepository(db_path)
+    assert reloaded.get_task(task.id).pinned is True
+    assert reloaded.get_event(event.id).pinned is True
+    assert reloaded.get_quick_note(note.id).pinned is True
+
+
+def test_repository_persists_sort_directions_and_active_workspace(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    profile = repository.save_layout_profile(LayoutProfile(name="Project", data='{"layout": "focus"}'))
+
+    preferences = repository.get_preferences()
+    preferences.quick_note_sort_direction = "asc"
+    preferences.checklist_sort_direction = "asc"
+    preferences.active_workspace_id = profile.id
+    repository.save_preferences(preferences)
+
+    reloaded = ScheduleRepository(db_path)
+    saved_preferences = reloaded.get_preferences()
+    assert saved_preferences.quick_note_sort_direction == "asc"
+    assert saved_preferences.checklist_sort_direction == "asc"
+    assert saved_preferences.active_workspace_id == profile.id
+
+    saved_preferences.active_workspace_id = None
+    reloaded.save_preferences(saved_preferences)
+    assert ScheduleRepository(db_path).get_preferences().active_workspace_id is None
+
+    missing_profile_preferences = ScheduleRepository(db_path).get_preferences()
+    missing_profile_preferences.active_workspace_id = 999_999
+    ScheduleRepository(db_path).save_preferences(missing_profile_preferences)
+    assert ScheduleRepository(db_path).get_preferences().active_workspace_id == 999_999
+
+
+def test_tags_are_case_insensitively_unique_and_trimmed(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    tag = Tag(" Focus ")
+
+    with repository.connect() as connection:
+        cursor = connection.execute(
+            "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+            (tag.name.strip(), tag.created_at.isoformat()),
+        )
+        tag.id = int(cursor.lastrowid)
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+                ("focus", datetime(2026, 6, 9, 11, 0).isoformat()),
+            )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+                (" spaced ", datetime(2026, 6, 9, 11, 5).isoformat()),
+            )
+
+    assert tag.id is not None
+    with repository.connect() as connection:
+        row = connection.execute("SELECT name FROM tags WHERE id = ?", (tag.id,)).fetchone()
+    assert row["name"] == "Focus"
+
+
+def test_tag_links_survive_reload_and_reject_duplicates(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    task = repository.save_task(Task("Tagged task", 25))
+
+    with repository.connect() as connection:
+        tag_id = int(
+            connection.execute(
+                "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+                ("Planning", datetime(2026, 6, 9, 11, 0).isoformat()),
+            ).lastrowid
+        )
+        tag_link = TagLink("task", int(task.id), tag_id)
+        tag_link.id = int(
+            connection.execute(
+                "INSERT INTO tag_links (target_type, target_id, tag_id) VALUES (?, ?, ?)",
+                (tag_link.target_type, tag_link.target_id, tag_link.tag_id),
+            ).lastrowid
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                "INSERT INTO tag_links (target_type, target_id, tag_id) VALUES (?, ?, ?)",
+                (tag_link.target_type, tag_link.target_id, tag_link.tag_id),
+            )
+
+    with ScheduleRepository(db_path).connect() as connection:
+        row = connection.execute("SELECT * FROM tag_links WHERE id = ?", (tag_link.id,)).fetchone()
+    assert row["target_type"] == "task"
+    assert row["target_id"] == task.id
+    assert row["tag_id"] == tag_id
+
+
+def test_deleting_tag_unlinks_assignments_and_preserves_targets(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("Keep target", 25))
+
+    with repository.connect() as connection:
+        tag_id = int(
+            connection.execute(
+                "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+                ("Archive", datetime(2026, 6, 9, 11, 0).isoformat()),
+            ).lastrowid
+        )
+        connection.execute(
+            "INSERT INTO tag_links (target_type, target_id, tag_id) VALUES (?, ?, ?)",
+            ("task", task.id, tag_id),
+        )
+        connection.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+
+    assert repository.get_task(task.id).title == "Keep target"
+    with repository.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM tag_links").fetchone()[0] == 0
+
+
+def test_workspace_filter_payload_round_trips_in_layout_profile_data(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    filters = {
+        "memo.folder_id": 7,
+        "memo.tag_ids": [1, 3, 5],
+        "checklist.item_type_ids": [2, 4],
+        "checklist.tag_ids": [6, 8],
+        "checklist.show_completed": False,
+    }
+    profile_data = json.dumps({"workspace_filters": filters}, ensure_ascii=False, sort_keys=True)
+
+    saved = repository.save_layout_profile(LayoutProfile(name="Filtered workspace", data=profile_data))
+
+    reloaded = ScheduleRepository(db_path).get_layout_profile("Filtered workspace")
+    assert saved.id is not None
+    assert reloaded is not None
+    assert json.loads(reloaded.data)["workspace_filters"] == filters
+
+
+def test_repository_workspace_profile_apis_and_filter_normalization(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    first = repository.save_layout_profile(LayoutProfile(name="First", data='{"layout":"first"}'))
+    second = repository.save_layout_profile(LayoutProfile(name="Second", data='{"layout":"second"}'))
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET updated_at = ? WHERE id = ?",
+            (datetime(2026, 6, 8, 12, 0).isoformat(), first.id),
+        )
+        connection.execute(
+            "UPDATE layout_profiles SET updated_at = ? WHERE id = ?",
+            (datetime(2026, 6, 8, 12, 1).isoformat(), second.id),
+        )
+
+    assert [profile.id for profile in repository.list_workspace_profiles()] == [second.id, first.id]
+    assert repository.get_active_workspace() is None
+
+    repository.set_active_workspace(first.id)
+    active = repository.get_active_workspace()
+
+    assert active is not None
+    assert active.id == first.id
+
+    repository.clear_active_workspace()
+    assert repository.get_active_workspace() is None
+
+    repository.set_active_workspace(999_999)
+    assert repository.get_preferences().active_workspace_id == 999_999
+    assert repository.get_active_workspace() is None
+
+    filters = repository.normalize_workspace_filters(
+        {
+            "workspace_filters": {
+                "memo.folder_id": 7,
+                "memo.tag_ids": [1, 3, 5],
+                "checklist.item_type_ids": [2, 4],
+                "checklist.tag_ids": [6, 8],
+                "checklist.show_completed": False,
+                "ignored": True,
+            }
+        }
+    )
+
+    assert filters == {
+        "memo.folder_id": 7,
+        "memo.tag_ids": [1, 3, 5],
+        "checklist.item_type_ids": [2, 4],
+        "checklist.tag_ids": [6, 8],
+        "checklist.show_completed": False,
+    }
+    assert repository.normalize_workspace_filters({}) == {
+        "memo.folder_id": None,
+        "memo.tag_ids": [],
+        "checklist.item_type_ids": [],
+        "checklist.tag_ids": [],
+        "checklist.show_completed": True,
+    }
+
+
+def test_repository_tag_apis_manage_names_links_and_deletion(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("Tagged task", 25))
+    event = repository.save_event(Event("Tagged event", datetime(2026, 6, 8, 9, 0), datetime(2026, 6, 8, 9, 30)))
+    note = repository.save_quick_note(QuickNote(body="tagged note", created_at=datetime(2026, 6, 8, 10, 0)))
+
+    focus = repository.create_tag(" Focus ")
+    planning = repository.create_tag("Planning")
+
+    assert isinstance(focus, Tag)
+    assert focus.name == "Focus"
+    assert [tag.name for tag in repository.list_tags()] == ["Focus", "Planning"]
+    assert repository.get_tag(focus.id).name == "Focus"
+    with pytest.raises(ValueError):
+        repository.create_tag("focus")
+    with pytest.raises(ValueError):
+        repository.create_tag("   ")
+
+    renamed = repository.rename_tag(planning.id, " Plan ")
+
+    assert renamed is not None
+    assert renamed.name == "Plan"
+    with pytest.raises(ValueError):
+        repository.rename_tag(renamed.id, "FOCUS")
+
+    repository.add_tag_to_target("task", task.id, focus.id)
+    repository.add_tag_to_target("task", task.id, focus.id)
+    repository.set_tags_for_target("event", event.id, [focus.id, renamed.id, focus.id])
+    repository.add_tag_to_target("quick_note", note.id, renamed.id)
+
+    assert [tag.name for tag in repository.list_tags_for_target("task", task.id)] == ["Focus"]
+    assert [tag.name for tag in repository.list_tags_for_target("event", event.id)] == ["Focus", "Plan"]
+    assert [tag.name for tag in repository.list_tags_for_target("quick_note", note.id)] == ["Plan"]
+
+    repository.remove_tag_from_target("quick_note", note.id, renamed.id)
+    repository.remove_tag_from_target("quick_note", note.id, renamed.id)
+
+    assert repository.list_tags_for_target("quick_note", note.id) == []
+
+    repository.delete_tag(focus.id)
+
+    assert repository.get_tag(focus.id) is None
+    assert repository.get_task(task.id).title == "Tagged task"
+    assert repository.get_event(event.id).title == "Tagged event"
+    assert repository.get_quick_note(note.id).body == "tagged note"
+    assert [tag.name for tag in repository.list_tags_for_target("event", event.id)] == ["Plan"]
+
+
+def test_repository_tag_target_validation_rejects_without_mutation(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("Stable tag target", 25))
+    tag = repository.create_tag("Stable")
+    repository.add_tag_to_target("task", task.id, tag.id)
+
+    with pytest.raises(ValueError):
+        repository.list_tags_for_target("unknown", task.id)
+    with pytest.raises(ValueError):
+        repository.set_tags_for_target("unknown", task.id, [tag.id])
+    with pytest.raises(ValueError):
+        repository.set_tags_for_target("task", 999_999, [tag.id])
+    with pytest.raises(ValueError):
+        repository.set_tags_for_target("task", task.id, [999_999])
+    with pytest.raises(ValueError):
+        repository.add_tag_to_target("event", 999_999, tag.id)
+    with pytest.raises(ValueError):
+        repository.remove_tag_from_target("quick_note", 999_999, tag.id)
+
+    assert [tag.id for tag in repository.list_tags_for_target("task", task.id)] == [tag.id]
+
+
+def test_repository_lists_tasks_sorted_with_pins_and_completed_times(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    due = repository.save_task(
+        Task("due", 15, due_at=datetime(2026, 6, 8, 8, 0), created_at=datetime(2026, 6, 8, 12, 0))
+    )
+    created = repository.save_task(Task("created", 15, created_at=datetime(2026, 6, 8, 9, 0)))
+    pinned_early = repository.save_task(
+        Task("pinned early", 15, due_at=datetime(2026, 6, 8, 10, 0), created_at=datetime(2026, 6, 8, 10, 0))
+    )
+    pinned_late = repository.save_task(
+        Task("pinned late", 15, due_at=datetime(2026, 6, 8, 11, 0), created_at=datetime(2026, 6, 8, 11, 0))
+    )
+    repository.save_task(
+        Task(
+            "completed",
+            15,
+            due_at=datetime(2026, 6, 8, 7, 0),
+            completed=True,
+            completed_at=datetime(2026, 6, 8, 13, 0),
+            created_at=datetime(2026, 6, 8, 7, 0),
+        )
+    )
+
+    assert repository.set_pinned_task(pinned_early.id, True)
+    assert repository.set_pinned_task(pinned_late.id, True)
+    assert not repository.set_pinned_task(999_999, True)
+
+    assert [task.title for task in repository.list_tasks_sorted("asc", include_completed=False)] == [
+        "pinned early",
+        "pinned late",
+        "due",
+        "created",
+    ]
+    assert [task.title for task in repository.list_tasks_sorted("desc", include_completed=True)] == [
+        "pinned late",
+        "pinned early",
+        "completed",
+        "created",
+        "due",
+    ]
+    assert repository.get_task(pinned_early.id).pinned is True
+    assert repository.get_task(due.id).pinned is False
+
+
+def test_repository_lists_events_sorted_with_pins_range_and_completed_times(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window_start = datetime(2026, 6, 8, 8, 0)
+    window_end = datetime(2026, 6, 8, 14, 0)
+    open_event = repository.save_event(
+        Event("open", datetime(2026, 6, 8, 9, 0), datetime(2026, 6, 8, 9, 30))
+    )
+    pinned_early = repository.save_event(
+        Event("pinned early", datetime(2026, 6, 8, 10, 0), datetime(2026, 6, 8, 10, 30))
+    )
+    pinned_late = repository.save_event(
+        Event("pinned late", datetime(2026, 6, 8, 11, 0), datetime(2026, 6, 8, 11, 30))
+    )
+    repository.save_event(
+        Event(
+            "completed",
+            datetime(2026, 6, 8, 8, 30),
+            datetime(2026, 6, 8, 8, 45),
+            completed=True,
+            completed_at=datetime(2026, 6, 8, 13, 0),
+        )
+    )
+    repository.save_event(Event("outside", datetime(2026, 6, 9, 9, 0), datetime(2026, 6, 9, 9, 30)))
+
+    assert repository.set_pinned_event(pinned_early.id, True)
+    assert repository.set_pinned_event(pinned_late.id, True)
+    assert not repository.set_pinned_event(999_999, True)
+
+    assert [event.title for event in repository.list_events_sorted("asc", window_start, window_end, False)] == [
+        "pinned early",
+        "pinned late",
+        "open",
+    ]
+    assert [event.title for event in repository.list_events_sorted("desc", window_start, window_end, True)] == [
+        "pinned late",
+        "pinned early",
+        "completed",
+        "open",
+    ]
+    assert repository.get_event(pinned_early.id).pinned is True
+    assert repository.get_event(open_event.id).pinned is False
+
+
+def test_repository_lists_quick_notes_sorted_with_pins_before_limit(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    folder = repository.save_quick_note_folder(QuickNoteFolder(name="Sorted notes"))
+    repository.save_quick_note(
+        QuickNote(body="unpinned old", created_at=datetime(2026, 6, 8, 12, 0), folder_id=folder.id)
+    )
+    pinned_old = repository.save_quick_note(
+        QuickNote(body="pinned old", created_at=datetime(2026, 6, 8, 12, 1), folder_id=folder.id)
+    )
+    pinned_new = repository.save_quick_note(
+        QuickNote(body="pinned new", created_at=datetime(2026, 6, 8, 12, 2), folder_id=folder.id)
+    )
+    repository.save_quick_note(
+        QuickNote(body="unpinned new", created_at=datetime(2026, 6, 8, 12, 3), folder_id=folder.id)
+    )
+    deleted = repository.save_quick_note(
+        QuickNote(
+            body="deleted pinned",
+            created_at=datetime(2026, 6, 8, 12, 4),
+            folder_id=folder.id,
+            deleted_at=datetime(2026, 6, 8, 13, 0),
+        )
+    )
+    repository.save_quick_note(QuickNote(body="other folder pinned", created_at=datetime(2026, 6, 8, 12, 5)))
+
+    assert repository.set_pinned_note(pinned_old.id, True)
+    assert repository.set_pinned_note(pinned_new.id, True)
+    assert repository.set_pinned_note(deleted.id, True)
+    assert not repository.set_pinned_note(999_999, True)
+
+    assert [note.body for note in repository.list_quick_notes_sorted("asc", 2, folder.id, None, False)] == [
+        "pinned old",
+        "pinned new",
+    ]
+    assert [note.body for note in repository.list_quick_notes_sorted("desc", 2, folder.id, None, False)] == [
+        "pinned new",
+        "pinned old",
+    ]
+    assert [note.body for note in repository.list_quick_notes_sorted("desc", 1, folder.id, None, True)] == ["deleted pinned"]
+    assert repository.get_quick_note(pinned_old.id).pinned is True
 
 
 def test_repository_manages_item_types(tmp_path) -> None:
@@ -323,6 +829,45 @@ def test_repository_tracks_completed_events(tmp_path) -> None:
     assert updated.completed_at == completed_at
 
 
+def test_repository_marks_today_checklist_items_completed_with_timestamps(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    open_task = repository.save_task(Task("Open task", 15, created_at=datetime(2026, 6, 8, 8, 0)))
+    completed_task = repository.save_task(Task("Done task", 25, created_at=datetime(2026, 6, 8, 9, 0)))
+    open_event = repository.save_event(
+        Event(
+            "Open event",
+            datetime(2026, 6, 8, 10, 0),
+            datetime(2026, 6, 8, 10, 30),
+        )
+    )
+    completed_event = repository.save_event(
+        Event(
+            "Done event",
+            datetime(2026, 6, 8, 11, 0),
+            datetime(2026, 6, 8, 11, 30),
+        )
+    )
+
+    repository.mark_task_completed(completed_task.id, True)
+    repository.mark_event_completed(completed_event.id, True)
+
+    reloaded = ScheduleRepository(db_path)
+    completed_tasks = reloaded.list_completed_tasks()
+    completed_events = reloaded.list_completed_events()
+
+    assert [task.id for task in completed_tasks] == [completed_task.id]
+    assert completed_tasks[0].completed
+    assert completed_tasks[0].completed_at is not None
+    assert reloaded.get_task(completed_task.id).completed_at == completed_tasks[0].completed_at
+    assert reloaded.get_task(open_task.id).completed_at is None
+    assert [event.id for event in completed_events] == [completed_event.id]
+    assert completed_events[0].completed
+    assert completed_events[0].completed_at is not None
+    assert reloaded.get_event(completed_event.id).completed_at == completed_events[0].completed_at
+    assert reloaded.get_event(open_event.id).completed_at is None
+
+
 def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     repository.reset_default_availability()
@@ -475,6 +1020,17 @@ def test_repository_manages_availability_and_preferences(tmp_path) -> None:
     assert reloaded_preferences.last_layout_state == '{"splitters":{"body":[300,700]}}'
 
 
+def test_repository_round_trips_last_layout_state_across_reloads(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    preferences = repository.get_preferences()
+    preferences.last_layout_state = '{"splitters":{"main":[240,560],"side":[120,320]},"panels":["today","memo"]}'
+
+    repository.save_preferences(preferences)
+
+    assert ScheduleRepository(db_path).get_preferences().last_layout_state == preferences.last_layout_state
+
+
 def test_repository_normalizes_datetime_text_outline(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
 
@@ -515,16 +1071,62 @@ def test_repository_copies_media_assets_next_to_database(tmp_path) -> None:
 def test_repository_saves_named_layout_profiles(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     profile = repository.save_layout_profile(LayoutProfile(name="작업 배치", data='{"body":[700,300]}'))
+    secondary_profile = repository.save_layout_profile(LayoutProfile(name="보조 배치", data='{"body":[300,700]}'))
 
     assert profile.id is not None
     assert repository.get_layout_profile("작업 배치").data == '{"body":[700,300]}'
 
     repository.save_layout_profile(LayoutProfile(name="작업 배치", data='{"body":[600,400]}'))
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET updated_at = ? WHERE id = ?",
+            (datetime(2026, 6, 8, 12, 1).isoformat(), profile.id),
+        )
+        connection.execute(
+            "UPDATE layout_profiles SET updated_at = ? WHERE id = ?",
+            (datetime(2026, 6, 8, 12, 0).isoformat(), secondary_profile.id),
+        )
     profiles = repository.list_layout_profiles()
 
-    assert len(profiles) == 1
+    assert len(profiles) == 2
     assert profiles[0].name == "작업 배치"
     assert profiles[0].data == '{"body":[600,400]}'
+    assert profiles[1].name == "보조 배치"
+    assert profiles[1].id == secondary_profile.id
+
+    original_timestamp = datetime(2026, 6, 8, 12, 1)
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET updated_at = ? WHERE id = ?",
+            (original_timestamp.isoformat(), profile.id),
+        )
+
+    updated_profile = repository.update_layout_profile_data(profile.id, '{"body":[500,500]}')
+
+    assert updated_profile is not None
+    assert updated_profile.id == profile.id
+    assert updated_profile.name == "작업 배치"
+    assert updated_profile.data == '{"body":[500,500]}'
+    assert updated_profile.updated_at >= original_timestamp
+
+    renamed_profile = repository.rename_layout_profile(profile.id, "  집중 배치  ")
+
+    assert renamed_profile is not None
+    assert renamed_profile.id == profile.id
+    assert renamed_profile.name == "집중 배치"
+    assert renamed_profile.data == '{"body":[500,500]}'
+    assert renamed_profile.updated_at >= updated_profile.updated_at
+    assert repository.update_layout_profile_data(999_999, "{}") is None
+    assert repository.rename_layout_profile(999_999, "없는 배치") is None
+    with pytest.raises(ValueError):
+        repository.rename_layout_profile(profile.id, "   ")
+
+    saved_profile = repository.get_layout_profile("집중 배치")
+    assert saved_profile is not None
+    repository.delete_layout_profile(saved_profile.id)
+
+    assert repository.get_layout_profile("집중 배치") is None
+    assert [item.name for item in repository.list_layout_profiles()] == ["보조 배치"]
 
 
 def test_repository_persists_app_usage_and_summaries(tmp_path) -> None:
@@ -624,6 +1226,33 @@ def test_repository_updates_quick_note_body(tmp_path) -> None:
     assert reloaded.body == "after"
     assert reloaded.content_html == "<p><u>after</u></p>"
     assert reloaded.created_at == datetime(2026, 6, 8, 12, 0)
+
+
+def test_repository_lists_all_quick_notes_newest_first_unless_limited(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    for index in range(6):
+        repository.save_quick_note(
+            QuickNote(
+                body=f"note-{index}",
+                created_at=datetime(2026, 6, 8, 12, index),
+            )
+        )
+    repository.save_quick_note(QuickNote(body="tie-first", created_at=datetime(2026, 6, 8, 12, 6)))
+    repository.save_quick_note(QuickNote(body="tie-second", created_at=datetime(2026, 6, 8, 12, 6)))
+
+    all_notes = repository.list_quick_notes()
+
+    assert [note.body for note in all_notes] == [
+        "tie-second",
+        "tie-first",
+        "note-5",
+        "note-4",
+        "note-3",
+        "note-2",
+        "note-1",
+        "note-0",
+    ]
+    assert [note.body for note in repository.list_quick_notes(limit=3)] == ["tie-second", "tie-first", "note-5"]
 
 
 def test_repository_migrates_legacy_quick_notes_without_folder_column(tmp_path) -> None:

@@ -16,6 +16,7 @@ class Task:
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None
     item_type_id: int | None = None
+    pinned: bool = False
 
 
 @dataclass(slots=True)
@@ -30,6 +31,7 @@ class Event:
     completed_at: datetime | None = None
     id: int | None = None
     item_type_id: int | None = None
+    pinned: bool = False
 
     @property
     def duration_minutes(self) -> int:
@@ -117,6 +119,9 @@ class Preference:
     last_window_width: int = 1280
     last_window_height: int = 820
     last_layout_state: str = ""
+    quick_note_sort_direction: str = "desc"
+    checklist_sort_direction: str = "desc"
+    active_workspace_id: int | None = None
     id: int = 1
 
 
@@ -126,6 +131,21 @@ class LayoutProfile:
     data: str
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class Tag:
+    name: str
+    id: int | None = None
+    created_at: datetime = field(default_factory=datetime.now)
+
+
+@dataclass(slots=True)
+class TagLink:
+    target_type: str
+    target_id: int
+    tag_id: int
     id: int | None = None
 
 
@@ -215,6 +235,7 @@ class QuickNote:
     focus_session_id: int | None = None
     task_id: int | None = None
     folder_id: int | None = None
+    pinned: bool = False
     process_name: str = ""
     window_title: str = ""
     deleted_at: datetime | None = None

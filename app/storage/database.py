@@ -8,7 +8,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Iterator
+from typing import Final, Iterator, TypedDict
 
 from app.models import (
     AppUsageSession,
@@ -24,6 +24,7 @@ from app.models import (
     QuickNote,
     QuickNoteAttachment,
     QuickNoteFolder,
+    Tag,
     Task,
     TrackedProgram,
 )
@@ -40,6 +41,22 @@ _FOCUS_SESSION_COLOR_PALETTE = (
 )
 _DEFAULT_APP_TITLE = "오롯"
 _LEGACY_DEFAULT_APP_TITLE = "Focus Desk"
+_TAG_TARGET_TABLES: Final[dict[str, str]] = {
+    "task": "tasks",
+    "event": "events",
+    "quick_note": "quick_notes",
+}
+
+WorkspaceFilters = TypedDict(
+    "WorkspaceFilters",
+    {
+        "memo.folder_id": int | None,
+        "memo.tag_ids": list[int],
+        "checklist.item_type_ids": list[int],
+        "checklist.tag_ids": list[int],
+        "checklist.show_completed": bool,
+    },
+)
 
 
 def _app_title(value: object) -> str:
@@ -137,6 +154,34 @@ def _favorite_display_mode(value: str) -> str:
 
 def _time_format(value: str) -> str:
     return value if value in {"24h", "12h"} else "24h"
+
+
+def _sort_direction(value: str) -> str:
+    normalized = value.strip().lower()
+    return normalized if normalized in {"asc", "desc"} else "desc"
+
+
+def _sql_sort_direction(value: str) -> str:
+    return _sort_direction(value).upper()
+
+
+def _filter_int_or_none(value: object) -> int | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    return None
+
+
+def _filter_int_list(value: object) -> list[int]:
+    if not isinstance(value, list):
+        return []
+    return [item for item in value if isinstance(item, int) and not isinstance(item, bool)]
+
+
+def _filter_bool(value: object, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
+
 
 
 def _default_focus_session_color(title: str) -> str:
@@ -308,6 +353,7 @@ class ScheduleRepository:
                     priority INTEGER NOT NULL,
                     category TEXT NOT NULL DEFAULT '',
                     item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
                     completed INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT,
                     created_at TEXT NOT NULL
@@ -322,6 +368,7 @@ class ScheduleRepository:
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     category TEXT NOT NULL DEFAULT '',
                     item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
                     completed INTEGER NOT NULL DEFAULT 0,
                     completed_at TEXT
                 );
@@ -405,7 +452,10 @@ class ScheduleRepository:
                     focus_rate_display TEXT NOT NULL DEFAULT 'ring',
                     last_window_width INTEGER NOT NULL DEFAULT 1280,
                     last_window_height INTEGER NOT NULL DEFAULT 820,
-                    last_layout_state TEXT NOT NULL DEFAULT ''
+                    last_layout_state TEXT NOT NULL DEFAULT '',
+                    quick_note_sort_direction TEXT NOT NULL DEFAULT 'desc',
+                    checklist_sort_direction TEXT NOT NULL DEFAULT 'desc',
+                    active_workspace_id INTEGER
                 );
 
                 CREATE TABLE IF NOT EXISTS layout_profiles (
@@ -415,6 +465,29 @@ class ScheduleRepository:
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+
+                CREATE TABLE IF NOT EXISTS tags (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT NOT NULL CHECK (name = trim(name) AND name <> ''),
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_tags_name_nocase
+                    ON tags (name COLLATE NOCASE);
+
+                CREATE TABLE IF NOT EXISTS tag_links (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    target_type TEXT NOT NULL,
+                    target_id INTEGER NOT NULL,
+                    tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
+                    UNIQUE(target_type, target_id, tag_id)
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tag_links_target
+                    ON tag_links (target_type, target_id);
+
+                CREATE INDEX IF NOT EXISTS idx_tag_links_tag
+                    ON tag_links (tag_id);
 
                 CREATE TABLE IF NOT EXISTS app_targets (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -478,6 +551,7 @@ class ScheduleRepository:
                     focus_session_id INTEGER REFERENCES focus_sessions(id) ON DELETE SET NULL,
                     task_id INTEGER REFERENCES tasks(id) ON DELETE SET NULL,
                     folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL,
+                    pinned INTEGER NOT NULL DEFAULT 0,
                     process_name TEXT NOT NULL DEFAULT '',
                     window_title TEXT NOT NULL DEFAULT '',
                     deleted_at TEXT
@@ -517,11 +591,15 @@ class ScheduleRepository:
             task_columns = {row["name"] for row in connection.execute("PRAGMA table_info(tasks)")}
             if "item_type_id" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL")
+            if "pinned" not in task_columns:
+                connection.execute("ALTER TABLE tasks ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             if "completed_at" not in task_columns:
                 connection.execute("ALTER TABLE tasks ADD COLUMN completed_at TEXT")
             event_columns = {row["name"] for row in connection.execute("PRAGMA table_info(events)")}
             if "item_type_id" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN item_type_id INTEGER REFERENCES item_types(id) ON DELETE SET NULL")
+            if "pinned" not in event_columns:
+                connection.execute("ALTER TABLE events ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             if "completed" not in event_columns:
                 connection.execute("ALTER TABLE events ADD COLUMN completed INTEGER NOT NULL DEFAULT 0")
             if "completed_at" not in event_columns:
@@ -726,6 +804,16 @@ class ScheduleRepository:
                 )
             if "last_layout_state" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN last_layout_state TEXT NOT NULL DEFAULT ''")
+            if "quick_note_sort_direction" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN quick_note_sort_direction TEXT NOT NULL DEFAULT 'desc'"
+                )
+            if "checklist_sort_direction" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN checklist_sort_direction TEXT NOT NULL DEFAULT 'desc'"
+                )
+            if "active_workspace_id" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN active_workspace_id INTEGER")
 
             favorite_columns = {row["name"] for row in connection.execute("PRAGMA table_info(link_favorites)")}
             if "icon_text" not in favorite_columns:
@@ -741,6 +829,8 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN content_html TEXT NOT NULL DEFAULT ''")
             if "folder_id" not in quick_note_columns:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN folder_id INTEGER REFERENCES quick_note_folders(id) ON DELETE SET NULL")
+            if "pinned" not in quick_note_columns:
+                connection.execute("ALTER TABLE quick_notes ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
             if "window_title" not in quick_note_columns:
                 connection.execute("ALTER TABLE quick_notes ADD COLUMN window_title TEXT NOT NULL DEFAULT ''")
             if "deleted_at" not in quick_note_columns:
@@ -934,8 +1024,8 @@ class ScheduleRepository:
                 cursor = connection.execute(
                     """
                     INSERT INTO tasks
-                      (title, duration_minutes, due_at, priority, category, item_type_id, completed, completed_at, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      (title, duration_minutes, due_at, priority, category, item_type_id, pinned, completed, completed_at, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task.title,
@@ -944,6 +1034,7 @@ class ScheduleRepository:
                         task.priority,
                         task.category,
                         task.item_type_id,
+                        int(task.pinned),
                         int(task.completed),
                         _dt_exact(task.completed_at),
                         _dt(task.created_at),
@@ -960,6 +1051,7 @@ class ScheduleRepository:
                         priority = ?,
                         category = ?,
                         item_type_id = ?,
+                        pinned = ?,
                         completed = ?,
                         completed_at = ?,
                         created_at = ?
@@ -972,6 +1064,7 @@ class ScheduleRepository:
                         task.priority,
                         task.category,
                         task.item_type_id,
+                        int(task.pinned),
                         int(task.completed),
                         _dt_exact(task.completed_at),
                         _dt(task.created_at),
@@ -994,6 +1087,23 @@ class ScheduleRepository:
             rows = connection.execute(query, params).fetchall()
         return [self._task_from_row(row) for row in rows]
 
+    def list_tasks_sorted(self, sort_direction: str, include_completed: bool = True) -> list[Task]:
+        direction = _sql_sort_direction(sort_direction)
+        sort_time = """
+            CASE
+                WHEN completed = 1 THEN COALESCE(completed_at, COALESCE(due_at, created_at))
+                ELSE COALESCE(due_at, created_at)
+            END
+        """
+        query = "SELECT * FROM tasks"
+        if not include_completed:
+            query += " WHERE completed = 0"
+        query += f" ORDER BY pinned DESC, {sort_time} {direction}, id {direction}"
+
+        with self.connect() as connection:
+            rows = connection.execute(query).fetchall()
+        return [self._task_from_row(row) for row in rows]
+
     def list_completed_tasks(self, limit: int | None = None) -> list[Task]:
         query = """
             SELECT * FROM tasks
@@ -1013,6 +1123,9 @@ class ScheduleRepository:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
         return self._task_from_row(row) if row else None
+
+    def set_pinned_task(self, task_id: int, pinned: bool) -> bool:
+        return self._set_pinned("tasks", task_id, pinned)
 
     def delete_task(self, task_id: int) -> None:
         with self.connect() as connection:
@@ -1064,8 +1177,8 @@ class ScheduleRepository:
                 cursor = connection.execute(
                     """
                     INSERT INTO events
-                      (title, start_at, end_at, fixed, task_id, category, item_type_id, completed, completed_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      (title, start_at, end_at, fixed, task_id, category, item_type_id, pinned, completed, completed_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         event.title,
@@ -1075,6 +1188,7 @@ class ScheduleRepository:
                         event.task_id,
                         event.category,
                         event.item_type_id,
+                        int(event.pinned),
                         int(event.completed),
                         _dt_exact(event.completed_at),
                     ),
@@ -1091,6 +1205,7 @@ class ScheduleRepository:
                         task_id = ?,
                         category = ?,
                         item_type_id = ?,
+                        pinned = ?,
                         completed = ?,
                         completed_at = ?
                     WHERE id = ?
@@ -1103,6 +1218,7 @@ class ScheduleRepository:
                         event.task_id,
                         event.category,
                         event.item_type_id,
+                        int(event.pinned),
                         int(event.completed),
                         _dt_exact(event.completed_at),
                         event.id,
@@ -1114,6 +1230,9 @@ class ScheduleRepository:
         with self.connect() as connection:
             row = connection.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
         return self._event_from_row(row) if row else None
+
+    def set_pinned_event(self, event_id: int, pinned: bool) -> bool:
+        return self._set_pinned("events", event_id, pinned)
 
     def list_events(
         self,
@@ -1132,6 +1251,36 @@ class ScheduleRepository:
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
         query += " ORDER BY start_at ASC, end_at ASC"
+
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._event_from_row(row) for row in rows]
+
+    def list_events_sorted(
+        self,
+        sort_direction: str,
+        start_at: datetime | None = None,
+        end_at: datetime | None = None,
+        include_completed: bool = False,
+    ) -> list[Event]:
+        direction = _sql_sort_direction(sort_direction)
+        sort_time = """
+            CASE
+                WHEN completed = 1 THEN COALESCE(completed_at, start_at)
+                ELSE start_at
+            END
+        """
+        query = "SELECT * FROM events"
+        params: list[object] = []
+        conditions: list[str] = []
+        if not include_completed:
+            conditions.append("completed = 0")
+        if start_at and end_at:
+            conditions.append("start_at < ? AND end_at > ?")
+            params.extend([_dt_exact(end_at), _dt_exact(start_at)])
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += f" ORDER BY pinned DESC, {sort_time} {direction}, id {direction}"
 
         with self.connect() as connection:
             rows = connection.execute(query, tuple(params)).fetchall()
@@ -1302,10 +1451,17 @@ class ScheduleRepository:
             last_window_width=_window_dimension(row["last_window_width"], 1280, 430, 4000),
             last_window_height=_window_dimension(row["last_window_height"], 820, 320, 3000),
             last_layout_state=str(row["last_layout_state"]),
+            quick_note_sort_direction=_sort_direction(str(row["quick_note_sort_direction"])),
+            checklist_sort_direction=_sort_direction(str(row["checklist_sort_direction"])),
+            active_workspace_id=(
+                int(row["active_workspace_id"]) if row["active_workspace_id"] is not None else None
+            ),
         )
 
     def save_preferences(self, preferences: Preference) -> Preference:
         preferences.week_start_day = 6 if preferences.week_start_day == 6 else 0
+        preferences.quick_note_sort_direction = _sort_direction(preferences.quick_note_sort_direction)
+        preferences.checklist_sort_direction = _sort_direction(preferences.checklist_sort_direction)
         preferences.time_format = _time_format(preferences.time_format)
         preferences.appearance_theme = _appearance_theme(preferences.appearance_theme)
         preferences.accent_color = _accent_color(preferences.accent_color)
@@ -1491,7 +1647,10 @@ class ScheduleRepository:
                     media_panel_4_image_view = ?,
                     media_rounded_corners = ?,
                     header_banner_image_position = ?,
-                    header_banner_image_view = ?
+                    header_banner_image_view = ?,
+                    quick_note_sort_direction = ?,
+                    checklist_sort_direction = ?,
+                    active_workspace_id = ?
                 WHERE id = 1
                 """,
                 (
@@ -1521,6 +1680,9 @@ class ScheduleRepository:
                     int(preferences.media_rounded_corners),
                     preferences.header_banner_image_position,
                     preferences.header_banner_image_view,
+                    preferences.quick_note_sort_direction,
+                    preferences.checklist_sort_direction,
+                    preferences.active_workspace_id,
                 ),
             )
         return preferences
@@ -1577,6 +1739,9 @@ class ScheduleRepository:
             ).fetchall()
         return [self._layout_profile_from_row(row) for row in rows]
 
+    def list_workspace_profiles(self) -> list[LayoutProfile]:
+        return self.list_layout_profiles()
+
     def get_layout_profile(self, name: str) -> LayoutProfile | None:
         with self.connect() as connection:
             row = connection.execute(
@@ -1585,9 +1750,167 @@ class ScheduleRepository:
             ).fetchone()
         return self._layout_profile_from_row(row) if row else None
 
+    def rename_layout_profile(self, profile_id: int, name: str) -> LayoutProfile | None:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Layout profile name is required")
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE layout_profiles
+                SET name = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (normalized_name, _dt_exact(datetime.now()), profile_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM layout_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+        return self._layout_profile_from_row(row) if row else None
+
+    def update_layout_profile_data(self, profile_id: int, data: str) -> LayoutProfile | None:
+        with self.connect() as connection:
+            connection.execute(
+                """
+                UPDATE layout_profiles
+                SET data = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (data, _dt_exact(datetime.now()), profile_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM layout_profiles WHERE id = ?",
+                (profile_id,),
+            ).fetchone()
+        return self._layout_profile_from_row(row) if row else None
+
     def delete_layout_profile(self, profile_id: int) -> None:
         with self.connect() as connection:
             connection.execute("DELETE FROM layout_profiles WHERE id = ?", (profile_id,))
+
+    def get_active_workspace(self) -> LayoutProfile | None:
+        active_workspace_id = self.get_preferences().active_workspace_id
+        if active_workspace_id is None:
+            return None
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM layout_profiles WHERE id = ?",
+                (active_workspace_id,),
+            ).fetchone()
+        return self._layout_profile_from_row(row) if row else None
+
+    def set_active_workspace(self, profile_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE preferences SET active_workspace_id = ? WHERE id = 1", (profile_id,))
+
+    def clear_active_workspace(self) -> None:
+        with self.connect() as connection:
+            connection.execute("UPDATE preferences SET active_workspace_id = NULL WHERE id = 1")
+
+    def normalize_workspace_filters(self, data_dict: dict[str, object]) -> WorkspaceFilters:
+        raw_filters = data_dict.get("workspace_filters")
+        filters = raw_filters if isinstance(raw_filters, dict) else data_dict
+        return {
+            "memo.folder_id": _filter_int_or_none(filters.get("memo.folder_id")),
+            "memo.tag_ids": _filter_int_list(filters.get("memo.tag_ids")),
+            "checklist.item_type_ids": _filter_int_list(filters.get("checklist.item_type_ids")),
+            "checklist.tag_ids": _filter_int_list(filters.get("checklist.tag_ids")),
+            "checklist.show_completed": _filter_bool(filters.get("checklist.show_completed"), True),
+        }
+
+    def create_tag(self, name: str) -> Tag:
+        normalized_name = name.strip()
+        if not normalized_name:
+            raise ValueError("Tag name is required")
+        tag = Tag(name=normalized_name, created_at=datetime.now())
+        with self.connect() as connection:
+            self._raise_for_duplicate_tag_name(connection, normalized_name)
+            cursor = connection.execute(
+                "INSERT INTO tags (name, created_at) VALUES (?, ?)",
+                (tag.name, _dt_exact(tag.created_at)),
+            )
+            tag.id = int(cursor.lastrowid)
+        return tag
+
+    def list_tags(self) -> list[Tag]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM tags ORDER BY name COLLATE NOCASE ASC, id ASC"
+            ).fetchall()
+        return [self._tag_from_row(row) for row in rows]
+
+    def get_tag(self, tag_id: int) -> Tag | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        return self._tag_from_row(row) if row else None
+
+    def rename_tag(self, tag_id: int, new_name: str) -> Tag | None:
+        normalized_name = new_name.strip()
+        if not normalized_name:
+            raise ValueError("Tag name is required")
+        with self.connect() as connection:
+            existing = connection.execute("SELECT * FROM tags WHERE id = ?", (tag_id,)).fetchone()
+            if existing is None:
+                return None
+            self._raise_for_duplicate_tag_name(connection, normalized_name, exclude_tag_id=tag_id)
+            connection.execute("UPDATE tags SET name = ? WHERE id = ?", (normalized_name, tag_id))
+            row = connection.execute("SELECT * FROM tags WHERE id = ?", (tag_id,)).fetchone()
+        return self._tag_from_row(row) if row else None
+
+    def delete_tag(self, tag_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM tags WHERE id = ?", (tag_id,))
+
+    def list_tags_for_target(self, target_type: str, target_id: int) -> list[Tag]:
+        with self.connect() as connection:
+            self._validate_tag_target(connection, target_type, target_id)
+            rows = connection.execute(
+                """
+                SELECT tags.* FROM tags
+                INNER JOIN tag_links ON tag_links.tag_id = tags.id
+                WHERE tag_links.target_type = ? AND tag_links.target_id = ?
+                ORDER BY tags.name COLLATE NOCASE ASC, tags.id ASC
+                """,
+                (target_type, target_id),
+            ).fetchall()
+        return [self._tag_from_row(row) for row in rows]
+
+    def set_tags_for_target(
+        self,
+        target_type: str,
+        target_id: int,
+        tag_ids: list[int] | tuple[int, ...] | set[int],
+    ) -> None:
+        with self.connect() as connection:
+            self._validate_tag_target(connection, target_type, target_id)
+            unique_tag_ids = self._validated_tag_ids(connection, tag_ids)
+            connection.execute(
+                "DELETE FROM tag_links WHERE target_type = ? AND target_id = ?",
+                (target_type, target_id),
+            )
+            connection.executemany(
+                "INSERT INTO tag_links (target_type, target_id, tag_id) VALUES (?, ?, ?)",
+                [(target_type, target_id, tag_id) for tag_id in unique_tag_ids],
+            )
+
+    def add_tag_to_target(self, target_type: str, target_id: int, tag_id: int) -> None:
+        with self.connect() as connection:
+            self._validate_tag_target(connection, target_type, target_id)
+            unique_tag_ids = self._validated_tag_ids(connection, [tag_id])
+            connection.execute(
+                "INSERT OR IGNORE INTO tag_links (target_type, target_id, tag_id) VALUES (?, ?, ?)",
+                (target_type, target_id, unique_tag_ids[0]),
+            )
+
+    def remove_tag_from_target(self, target_type: str, target_id: int, tag_id: int) -> None:
+        with self.connect() as connection:
+            self._validate_tag_target(connection, target_type, target_id)
+            unique_tag_ids = self._validated_tag_ids(connection, [tag_id])
+            connection.execute(
+                "DELETE FROM tag_links WHERE target_type = ? AND target_id = ? AND tag_id = ?",
+                (target_type, target_id, unique_tag_ids[0]),
+            )
 
     def save_tracked_program(self, program: TrackedProgram) -> TrackedProgram:
         program.process_name = normalize_process_name(program.process_name)
@@ -2019,8 +2342,8 @@ class ScheduleRepository:
                 cursor = connection.execute(
                     """
                     INSERT INTO quick_notes
-                      (body, content_html, created_at, focus_session_id, task_id, folder_id, process_name, window_title, deleted_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                      (body, content_html, created_at, focus_session_id, task_id, folder_id, pinned, process_name, window_title, deleted_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         note.body.strip(),
@@ -2029,6 +2352,7 @@ class ScheduleRepository:
                         note.focus_session_id,
                         note.task_id,
                         folder_id,
+                        int(note.pinned),
                         normalize_process_name(note.process_name) if note.process_name else "",
                         note.window_title.strip(),
                         _dt_exact(note.deleted_at),
@@ -2045,6 +2369,7 @@ class ScheduleRepository:
                         focus_session_id = ?,
                         task_id = ?,
                         folder_id = ?,
+                        pinned = ?,
                         process_name = ?,
                         window_title = ?,
                         deleted_at = ?
@@ -2057,6 +2382,7 @@ class ScheduleRepository:
                         note.focus_session_id,
                         note.task_id,
                         folder_id,
+                        int(note.pinned),
                         normalize_process_name(note.process_name) if note.process_name else "",
                         note.window_title.strip(),
                         _dt_exact(note.deleted_at),
@@ -2099,6 +2425,47 @@ class ScheduleRepository:
             rows = connection.execute(query, tuple(params)).fetchall()
         return [self._quick_note_from_row(row) for row in rows]
 
+    def list_quick_notes_sorted(
+        self,
+        sort_direction: str,
+        limit: int | None = None,
+        folder_id: int | None = None,
+        tag_ids: list[int] | tuple[int, ...] | set[int] | None = None,
+        include_deleted: bool = False,
+    ) -> list[QuickNote]:
+        direction = _sql_sort_direction(sort_direction)
+        query = "SELECT * FROM quick_notes"
+        params: list[object] = []
+        conditions: list[str] = []
+        normalized_tag_ids = sorted({tag_id for tag_id in tag_ids or [] if not isinstance(tag_id, bool)})
+        if not include_deleted:
+            conditions.append("deleted_at IS NULL")
+        if folder_id is not None:
+            conditions.append("folder_id = ?")
+            params.append(folder_id)
+        if normalized_tag_ids:
+            placeholders = ", ".join("?" for _tag_id in normalized_tag_ids)
+            conditions.append(
+                f"""
+                id IN (
+                    SELECT target_id FROM tag_links
+                    WHERE target_type = ? AND tag_id IN ({placeholders})
+                )
+                """
+            )
+            params.append("quick_note")
+            params.extend(normalized_tag_ids)
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+        query += f" ORDER BY pinned DESC, created_at {direction}, id {direction}"
+        if limit is not None:
+            query += " LIMIT ?"
+            params.append(limit)
+
+        with self.connect() as connection:
+            rows = connection.execute(query, tuple(params)).fetchall()
+        return [self._quick_note_from_row(row) for row in rows]
+
     def list_deleted_quick_notes(self, limit: int | None = None) -> list[QuickNote]:
         return self.list_quick_notes(limit=limit, deleted_only=True)
 
@@ -2109,6 +2476,9 @@ class ScheduleRepository:
                 (note_id,),
             ).fetchone()
         return self._quick_note_from_row(row) if row else None
+
+    def set_pinned_note(self, note_id: int, pinned: bool) -> bool:
+        return self._set_pinned("quick_notes", note_id, pinned)
 
     def get_quick_note_any(self, note_id: int) -> QuickNote | None:
         with self.connect() as connection:
@@ -2354,6 +2724,61 @@ class ScheduleRepository:
         with self.connect() as connection:
             connection.execute("DELETE FROM link_favorites WHERE id = ?", (favorite_id,))
 
+    def _set_pinned(self, table: str, item_id: int, pinned: bool) -> bool:
+        with self.connect() as connection:
+            cursor = connection.execute(
+                f"UPDATE {table} SET pinned = ? WHERE id = ?",
+                (int(pinned), item_id),
+            )
+        return int(cursor.rowcount) > 0
+
+    @staticmethod
+    def _tag_target_table(target_type: str) -> str:
+        try:
+            return _TAG_TARGET_TABLES[target_type]
+        except KeyError as error:
+            raise ValueError("Unknown tag target type") from error
+
+    @classmethod
+    def _validate_tag_target(cls, connection: sqlite3.Connection, target_type: str, target_id: int) -> None:
+        table = cls._tag_target_table(target_type)
+        row = connection.execute(f"SELECT id FROM {table} WHERE id = ?", (target_id,)).fetchone()
+        if row is None:
+            raise ValueError("Tag target does not exist")
+
+    @staticmethod
+    def _validated_tag_ids(
+        connection: sqlite3.Connection,
+        tag_ids: list[int] | tuple[int, ...] | set[int],
+    ) -> list[int]:
+        unique_tag_ids = sorted({int(tag_id) for tag_id in tag_ids})
+        if not unique_tag_ids:
+            return []
+        placeholders = ", ".join("?" for _ in unique_tag_ids)
+        rows = connection.execute(
+            f"SELECT id FROM tags WHERE id IN ({placeholders})",
+            tuple(unique_tag_ids),
+        ).fetchall()
+        existing_tag_ids = {int(row["id"]) for row in rows}
+        if len(existing_tag_ids) != len(unique_tag_ids):
+            raise ValueError("Tag does not exist")
+        return unique_tag_ids
+
+    @staticmethod
+    def _raise_for_duplicate_tag_name(
+        connection: sqlite3.Connection,
+        name: str,
+        exclude_tag_id: int | None = None,
+    ) -> None:
+        query = "SELECT id FROM tags WHERE name = ? COLLATE NOCASE"
+        params: tuple[object, ...] = (name,)
+        if exclude_tag_id is not None:
+            query += " AND id <> ?"
+            params = (name, exclude_tag_id)
+        row = connection.execute(query, params).fetchone()
+        if row is not None:
+            raise ValueError("Tag name already exists")
+
     @staticmethod
     def _task_from_row(row: sqlite3.Row) -> Task:
         keys = set(row.keys())
@@ -2368,6 +2793,7 @@ class ScheduleRepository:
             completed_at=_parse_dt(row["completed_at"]),
             created_at=_parse_dt(row["created_at"]) or datetime.now(),
             item_type_id=row["item_type_id"] if "item_type_id" in keys else None,
+            pinned=bool(row["pinned"]) if "pinned" in keys else False,
         )
 
     @staticmethod
@@ -2388,6 +2814,7 @@ class ScheduleRepository:
             completed=bool(row["completed"]),
             completed_at=_parse_dt(row["completed_at"]),
             item_type_id=row["item_type_id"] if "item_type_id" in keys else None,
+            pinned=bool(row["pinned"]) if "pinned" in keys else False,
         )
 
     @staticmethod
@@ -2569,6 +2996,7 @@ class ScheduleRepository:
             focus_session_id=row["focus_session_id"],
             task_id=row["task_id"],
             folder_id=row["folder_id"] if "folder_id" in keys else None,
+            pinned=bool(row["pinned"]) if "pinned" in keys else False,
             process_name=str(row["process_name"]),
             window_title=str(row["window_title"]) if "window_title" in keys else "",
             deleted_at=_parse_dt(row["deleted_at"]) if "deleted_at" in keys else None,
@@ -2612,6 +3040,15 @@ class ScheduleRepository:
             data=str(row["data"]),
             created_at=created_at,
             updated_at=updated_at,
+        )
+
+    @staticmethod
+    def _tag_from_row(row: sqlite3.Row) -> Tag:
+        created_at = _parse_dt(row["created_at"]) or datetime.now()
+        return Tag(
+            id=int(row["id"]),
+            name=str(row["name"]),
+            created_at=created_at,
         )
 
 
