@@ -8,7 +8,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime
+from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, QTimer
 from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtWidgets import (
     QApplication,
@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QMessageBox,
+    QMenu,
     QPushButton,
     QSizePolicy,
     QSpinBox,
@@ -30,11 +31,12 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.models import FocusSession, ItemType, LayoutProfile, LinkFavorite, QuickNote, Task
+from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorite, QuickNote, QuickNoteFolder, Task
 from app.services.app_usage import ActiveWindowSnapshot
 from app.storage.database import ScheduleRepository
 from app.ui import main_window as main_window_module
 from app.ui.main_window import (
+    COMMISSION_SUMMARY_KEY,
     DASHBOARD_GRID_GAP,
     DASHBOARD_GRID_COLUMNS,
     DASHBOARD_GRID_ROW_HEIGHT,
@@ -47,6 +49,9 @@ from app.ui.main_window import (
     WINDOW_RESIZE_MARGIN,
     WINDOW_FRAME_BORDER_COLOR,
     WINDOW_FRAME_CORNER_RADIUS,
+    WEEKLY_PLAN_KEY,
+    WRITING_EDITOR_KEY,
+    WRITING_LIBRARY_KEY,
     HTBOTTOM,
     HTBOTTOMLEFT,
     HTBOTTOMRIGHT,
@@ -72,11 +77,16 @@ from app.ui.main_window import (
     QuickNoteDetailDialog,
     QuickNoteFolderNotesDialog,
     QuickNoteTrashDialog,
+    PinBadge,
     SettingsDialog,
+    SortDirectionButton,
+    TagAssignmentDialog,
+    TagBadge,
     TaskFolderTasksDialog,
     TodayChecklistWidget,
     TodayTimelineWidget,
     WindowControlButton,
+    WorkspaceManagerDialog,
     _hit_test_for_edges,
     _is_resize_eligible_widget,
     _resize_edges_for_point,
@@ -103,6 +113,58 @@ def _app() -> QApplication:
 def _margins_tuple(layout) -> tuple[int, int, int, int]:
     margins = layout.contentsMargins()
     return margins.left(), margins.top(), margins.right(), margins.bottom()
+
+
+def _checklist_section_titles(layout, title_object_name: str) -> list[str]:
+    titles: list[str] = []
+    for index in range(layout.count()):
+        widget = layout.itemAt(index).widget()
+        if widget is None:
+            continue
+        title = widget.findChild(QLabel, title_object_name)
+        if title is not None:
+            titles.append(title.text())
+    return titles
+
+
+def _click_light_popup_button(app: QApplication, text: str) -> None:
+    popup = getattr(app, "_active_light_action_popup", None)
+    assert popup is not None
+    button = next(button for button in popup.findChildren(QPushButton) if button.text() == text)
+    button.click()
+    app.processEvents()
+
+
+def _workspace_filters(show_completed: bool = True) -> dict[str, object]:
+    return {
+        "memo.folder_id": None,
+        "memo.tag_ids": [],
+        "checklist.item_type_ids": [],
+        "checklist.tag_ids": [],
+        "checklist.show_completed": show_completed,
+    }
+
+
+def _workspace_state(
+    window: MainWindow,
+    *,
+    show_focus: bool,
+    show_quick_memo: bool,
+    show_completed: bool = True,
+) -> dict[str, object]:
+    state = window.current_layout_state()
+    visible = dict(state["visible"])
+    visible["focus"] = show_focus
+    visible["quick_memo"] = show_quick_memo
+    state["visible"] = visible
+    state["filters"] = _workspace_filters(show_completed)
+    return state
+
+
+def _profile_data(repository: ScheduleRepository, name: str) -> str:
+    profile = repository.get_layout_profile(name)
+    assert profile is not None
+    return profile.data
 
 
 def _dashboard_support_items(start_y: int = 8, omit: set[str] | None = None) -> list[dict[str, object]]:
@@ -714,6 +776,31 @@ def test_app_bar_ports_title_and_focus_status_card(tmp_path) -> None:
     window.close()
 
 
+def test_app_bar_shows_workspace_selector_before_settings(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    repository.save_layout_profile(LayoutProfile(name="업무", data='{"layout":{}}'))
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    top_buttons = window.findChildren(QPushButton, "topBarButton")
+    button_texts = [button.text() for button in top_buttons]
+
+    assert "작업공간" in button_texts
+    assert button_texts.index("작업공간") < button_texts.index("설정")
+    workspace_button = next(button for button in top_buttons if button.text() == "작업공간")
+    assert workspace_button.objectName() == "topBarButton"
+
+    menu = window._build_workspace_menu()
+    action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
+    assert action_texts[-1] == "워크스페이스 관리..."
+    assert "업무" in action_texts
+    window.close()
+
+
 def test_app_bar_shows_default_orot_branding(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -1266,6 +1353,21 @@ def test_settings_dialog_opens_roomy_with_minimum_size(tmp_path) -> None:
     assert (dialog.size().width(), dialog.size().height()) == (980, 760)
     assert (dialog.minimumSize().width(), dialog.minimumSize().height()) == (860, 680)
     dialog.close()
+
+
+def test_settings_dialog_launches_workspace_manager(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
+
+    assert "워크스페이스 관리" in button_texts
+    dialog.close()
+    window.close()
 
 
 def test_settings_color_picker_uses_eyedropper_cursor(tmp_path) -> None:
@@ -2368,6 +2470,297 @@ def test_quick_memo_context_copy_copies_note_body(tmp_path) -> None:
     window.close()
 
 
+def _note_row_bodies(window: MainWindow) -> list[str]:
+    bodies: list[str] = []
+    for row_index in range(window.notes_list.count()):
+        item = window.notes_list.item(row_index)
+        if item is None:
+            continue
+        row = window.notes_list.itemWidget(item)
+        body_label = row.findChild(QLabel, "noteBodyLabel") if row is not None else None
+        if body_label is not None:
+            bodies.append(body_label.text())
+    return bodies
+
+
+def test_quick_memo_main_list_shows_all_notes_for_selected_folder(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    selected_folder = repository.save_quick_note_folder(QuickNoteFolder("프로젝트"))
+    other_folder = repository.save_quick_note_folder(QuickNoteFolder("다른 폴더"))
+    assert selected_folder.id is not None
+    assert other_folder.id is not None
+    expected_bodies = {f"선택 폴더 메모 {index:02d}" for index in range(15)}
+    for index, body in enumerate(sorted(expected_bodies)):
+        repository.save_quick_note(
+            QuickNote(
+                body,
+                datetime(2026, 6, 14, 9, index),
+                folder_id=selected_folder.id,
+            )
+        )
+    repository.save_quick_note(
+        QuickNote("다른 폴더 메모", datetime(2026, 6, 14, 10, 0), folder_id=other_folder.id)
+    )
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    folder_index = window.note_filter_combo.findData(selected_folder.id)
+    assert folder_index >= 0
+    window.note_filter_combo.setCurrentIndex(folder_index)
+    window.refresh_notes()
+    app.processEvents()
+
+    assert window.notes_list.count() == 15
+    assert set(_note_row_bodies(window)) == expected_bodies
+    window.close()
+
+
+def test_quick_memo_compact_notes_keep_five_item_limit_with_saved_sort(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.quick_note_sort_direction = "asc"
+    repository.save_preferences(preferences)
+    for index in range(7):
+        repository.save_quick_note(QuickNote(f"compact memo {index}", datetime(2026, 6, 14, 9, index)))
+
+    window = MainWindow(repository)
+    window.refresh_compact_notes()
+    app.processEvents()
+
+    compact_texts = [window.compact_notes_list.item(index).text() for index in range(window.compact_notes_list.count())]
+    assert window.compact_notes_list.count() == 5
+    assert "compact memo 0" in compact_texts[0]
+    assert "compact memo 4" in compact_texts[-1]
+    assert all("compact memo 5" not in text for text in compact_texts)
+    window.close()
+
+
+def test_quick_memo_sort_toggle_persists_across_reload(tmp_path) -> None:
+    app = _app()
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    repository.save_quick_note(QuickNote("오래된 정렬 메모", datetime(2026, 6, 14, 8, 0)))
+    repository.save_quick_note(QuickNote("새 정렬 메모", datetime(2026, 6, 14, 9, 0)))
+
+    window = MainWindow(repository)
+    window.show()
+    window.refresh_notes()
+    app.processEvents()
+
+    assert isinstance(window.memo_sort_button, SortDirectionButton)
+    assert window.memo_sort_button.direction == "desc"
+    assert _note_row_bodies(window)[:2] == ["새 정렬 메모", "오래된 정렬 메모"]
+
+    window.memo_sort_button.click()
+    app.processEvents()
+
+    assert repository.get_preferences().quick_note_sort_direction == "asc"
+    assert window.memo_sort_button.direction == "asc"
+    assert _note_row_bodies(window)[:2] == ["오래된 정렬 메모", "새 정렬 메모"]
+    window.close()
+
+    reloaded_repository = ScheduleRepository(db_path)
+    reloaded_window = MainWindow(reloaded_repository)
+    reloaded_window.show()
+    reloaded_window.refresh_notes()
+    app.processEvents()
+
+    assert reloaded_window.memo_sort_button.direction == "asc"
+    assert _note_row_bodies(reloaded_window)[:2] == ["오래된 정렬 메모", "새 정렬 메모"]
+    reloaded_window.close()
+
+
+def test_quick_memo_pinned_notes_sort_above_unpinned_notes(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    pinned_old = repository.save_quick_note(QuickNote("고정된 오래된 메모", datetime(2026, 6, 14, 8, 0)))
+    repository.save_quick_note(QuickNote("일반 최신 메모", datetime(2026, 6, 14, 9, 0)))
+    assert pinned_old.id is not None
+    assert repository.set_pinned_note(pinned_old.id, True)
+
+    window = MainWindow(repository)
+    window.show()
+    window.refresh_notes()
+    app.processEvents()
+
+    assert _note_row_bodies(window)[:2] == ["고정된 오래된 메모", "일반 최신 메모"]
+    first_item = window.notes_list.item(0)
+    first_row = window.notes_list.itemWidget(first_item)
+    assert first_row is not None
+    assert first_row.findChild(PinBadge, "pinBadge") is not None
+    window.close()
+
+
+def test_quick_memo_tag_badges_render_in_note_rows(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    note = repository.save_quick_note(QuickNote("태그가 있는 메모", datetime(2026, 6, 14, 8, 0)))
+    tag = repository.create_tag("집중")
+    assert note.id is not None
+    assert tag.id is not None
+    repository.set_tags_for_target("quick_note", note.id, [tag.id])
+
+    window = MainWindow(repository)
+    window.show()
+    window.refresh_notes()
+    app.processEvents()
+
+    item = window.notes_list.item(0)
+    row = window.notes_list.itemWidget(item)
+    assert row is not None
+    assert [badge.text() for badge in row.findChildren(TagBadge, "tagBadge")] == ["집중"]
+    window.close()
+
+
+def test_quick_memo_context_menu_exposes_pin_and_tag_actions(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    note = repository.save_quick_note(QuickNote("메뉴 메모", datetime(2026, 6, 14, 8, 0)))
+    assert note.id is not None
+    captured_menus: list[QMenu] = []
+
+    def capture_style(menu: QMenu, _parent: QWidget) -> QMenu:
+        captured_menus.append(menu)
+        return menu
+
+    monkeypatch.setattr(main_window_module, "_style_popup_menu", capture_style)
+    window = MainWindow(repository)
+    window.show()
+    window.refresh_notes()
+    app.processEvents()
+
+    item = window.notes_list.item(0)
+    position = window.notes_list.visualItemRect(item).center()
+    QTimer.singleShot(0, lambda: captured_menus[-1].close() if captured_menus else None)
+    window.show_note_context_menu(position)
+
+    actions = {action.text(): action for action in captured_menus[-1].actions() if not action.isSeparator()}
+    assert "고정" in actions
+    assert "태그 관리" in actions
+
+    actions["고정"].trigger()
+    app.processEvents()
+
+    reloaded_note = repository.get_quick_note(note.id)
+    assert reloaded_note is not None
+    assert reloaded_note.pinned is True
+
+    item = window.notes_list.item(0)
+    position = window.notes_list.visualItemRect(item).center()
+    QTimer.singleShot(0, lambda: captured_menus[-1].close() if captured_menus else None)
+    window.show_note_context_menu(position)
+    pinned_actions = {action.text(): action for action in captured_menus[-1].actions() if not action.isSeparator()}
+    assert "고정 해제" in pinned_actions
+    assert "태그 관리" in pinned_actions
+    window.close()
+
+
+def test_metadata_badges_use_expected_object_names() -> None:
+    _app()
+
+    tag_badge = TagBadge("집중")
+    pin_badge = PinBadge()
+
+    assert tag_badge.objectName() == "tagBadge"
+    assert tag_badge.text() == "집중"
+    assert pin_badge.objectName() == "pinBadge"
+    assert pin_badge.text() == "PIN"
+
+
+def test_sort_direction_button_updates_accessible_text_and_bar_widths() -> None:
+    _app()
+
+    button = SortDirectionButton("asc")
+
+    assert button.text() == ""
+    assert button.accessibleName() == "오름차순 정렬"
+    assert button.toolTip() == "오름차순 정렬"
+    assert button.bar_widths() == (4, 8, 12, 16)
+
+    button.direction = "desc"
+
+    assert button.accessibleName() == "내림차순 정렬"
+    assert button.toolTip() == "내림차순 정렬"
+    assert button.bar_widths() == (16, 12, 8, 4)
+
+
+def test_tag_assignment_dialog_creates_renames_assigns_removes_and_deletes_tags(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    note = repository.save_quick_note(QuickNote("태그 대상 메모", datetime(2026, 6, 14, 8, 5)))
+    task = repository.save_task(Task("태그 대상 할 일", 25))
+    event = repository.save_event(
+        Event(
+            "태그 대상 일정",
+            datetime(2026, 6, 14, 9, 0),
+            datetime(2026, 6, 14, 10, 0),
+        )
+    )
+
+    dialog = TagAssignmentDialog(repository, "quick_note", int(note.id))
+    dialog.show()
+    app.processEvents()
+    dialog.new_tag_edit.setText("집중")
+
+    dialog.create_tag()
+
+    created_item = dialog.tag_list.findItems("집중", Qt.MatchFlag.MatchExactly)[0]
+    assert repository.list_tags()[0].name == "집중"
+
+    created_item.setCheckState(Qt.CheckState.Checked)
+    dialog.accept()
+    assert [tag.name for tag in repository.list_tags_for_target("quick_note", int(note.id))] == ["집중"]
+
+    rename_dialog = TagAssignmentDialog(repository, "quick_note", int(note.id))
+    renamed_item = rename_dialog.tag_list.findItems("집중", Qt.MatchFlag.MatchExactly)[0]
+    rename_dialog.tag_list.setCurrentItem(renamed_item)
+    monkeypatch.setattr(
+        "app.ui.metadata_widgets.QInputDialog.getText",
+        lambda *_args, **_kwargs: ("중요", True),
+    )
+
+    rename_dialog.rename_selected_tag()
+
+    assert repository.list_tags()[0].name == "중요"
+
+    remove_dialog = TagAssignmentDialog(repository, "quick_note", int(note.id))
+    checked_item = remove_dialog.tag_list.findItems("중요", Qt.MatchFlag.MatchExactly)[0]
+    assert checked_item.checkState() == Qt.CheckState.Checked
+    checked_item.setCheckState(Qt.CheckState.Unchecked)
+    remove_dialog.accept()
+    assert repository.list_tags_for_target("quick_note", int(note.id)) == []
+
+    delete_tag = repository.create_tag("삭제할 태그")
+    repository.set_tags_for_target("quick_note", int(note.id), [int(delete_tag.id)])
+    repository.set_tags_for_target("task", int(task.id), [int(delete_tag.id)])
+    repository.set_tags_for_target("event", int(event.id), [int(delete_tag.id)])
+    delete_dialog = TagAssignmentDialog(repository, "quick_note", int(note.id))
+    delete_item = delete_dialog.tag_list.findItems("삭제할 태그", Qt.MatchFlag.MatchExactly)[0]
+    delete_dialog.tag_list.setCurrentItem(delete_item)
+    monkeypatch.setattr(
+        "app.ui.metadata_widgets.QMessageBox.question",
+        lambda *_args, **_kwargs: QMessageBox.StandardButton.Yes,
+    )
+
+    delete_dialog.delete_selected_tag()
+
+    assert "삭제할 태그" not in {tag.name for tag in repository.list_tags()}
+    assert repository.list_tags_for_target("quick_note", int(note.id)) == []
+    assert repository.list_tags_for_target("task", int(task.id)) == []
+    assert repository.list_tags_for_target("event", int(event.id)) == []
+    assert repository.get_quick_note(int(note.id)) is not None
+    assert repository.get_task(int(task.id)) is not None
+    assert repository.get_event(int(event.id)) is not None
+
+    dialog.close()
+    rename_dialog.close()
+    remove_dialog.close()
+    delete_dialog.close()
+
+
 def test_note_folder_window_copy_and_refreshes_main_folder_combo(tmp_path, monkeypatch) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -2969,6 +3362,230 @@ def test_today_checklist_repeated_refresh_has_no_stale_rows(tmp_path) -> None:
     assert len(rows) == 2
     assert len(empty_labels) == 1
     widget.close()
+
+
+def test_today_checklist_sort_direction_persists_and_reorders_items(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.checklist_sort_direction = "asc"
+    repository.save_preferences(preferences)
+    today = datetime.now().replace(second=0, microsecond=0)
+    repository.save_task(Task("아침 정리", 0, created_at=today.replace(hour=8, minute=0)))
+    repository.save_task(Task("저녁 정리", 0, created_at=today.replace(hour=18, minute=0)))
+
+    widget = TodayChecklistWidget(repository)
+    widget.show()
+    app.processEvents()
+
+    assert widget.checklist_sort_button.direction == "asc"
+    assert _checklist_section_titles(widget.active_items_layout, "checklistItemTitle") == ["아침 정리", "저녁 정리"]
+
+    widget.checklist_sort_button.click()
+    app.processEvents()
+
+    assert repository.get_preferences().checklist_sort_direction == "desc"
+    assert widget.checklist_sort_button.direction == "desc"
+    assert _checklist_section_titles(widget.active_items_layout, "checklistItemTitle") == ["저녁 정리", "아침 정리"]
+    widget.close()
+
+
+def test_today_checklist_pinned_items_stay_first_in_active_and_completed_sections(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    today = datetime.now().replace(second=0, microsecond=0)
+    repository.save_task(Task("일찍 만든 할 일", 0, created_at=today.replace(hour=8, minute=0)))
+    repository.save_event(
+        Event(
+            "늦은 고정 일정",
+            today.replace(hour=18, minute=0),
+            today.replace(hour=19, minute=0),
+            pinned=True,
+        )
+    )
+    repository.save_task(
+        Task(
+            "늦게 완료한 할 일",
+            0,
+            completed=True,
+            completed_at=today.replace(hour=20, minute=0),
+            created_at=today.replace(hour=7, minute=0),
+        )
+    )
+    repository.save_event(
+        Event(
+            "이른 완료 고정 일정",
+            today.replace(hour=9, minute=0),
+            today.replace(hour=10, minute=0),
+            completed=True,
+            completed_at=today.replace(hour=9, minute=30),
+            pinned=True,
+        )
+    )
+
+    widget = TodayChecklistWidget(repository)
+    widget.show()
+    app.processEvents()
+
+    assert _checklist_section_titles(widget.active_items_layout, "checklistItemTitle")[0] == "늦은 고정 일정"
+    assert _checklist_section_titles(widget.completed_items_layout, "checklistItemTitleDone")[0] == "이른 완료 고정 일정"
+    assert [badge.text() for badge in widget.findChildren(QLabel, "pinBadge")] == ["PIN", "PIN"]
+    widget.close()
+
+
+def test_today_checklist_renders_tag_badges(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("태그 있는 할 일", 0))
+    tag = repository.create_tag("집중")
+    repository.set_tags_for_target("task", int(task.id), [int(tag.id)])
+
+    widget = TodayChecklistWidget(repository)
+    widget.show()
+    app.processEvents()
+
+    assert [badge.text() for badge in widget.findChildren(QLabel, "tagBadge")] == ["집중"]
+    widget.close()
+
+
+def test_today_checklist_context_menu_toggles_pin_and_assigns_tags(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("메뉴 대상", 0))
+    tag = repository.create_tag("중요")
+    widget = TodayChecklistWidget(repository)
+    widget.show()
+    app.processEvents()
+
+    row = widget.findChild(QWidget, "checklistRow")
+    assert row is not None
+    widget.show_item_context_menu(row, QPoint(8, 8), "task", int(task.id), task.title)
+    app.processEvents()
+    popup_buttons = {button.text() for button in getattr(app, "_active_light_action_popup").findChildren(QPushButton)}
+    assert {"고정", "태그 관리", "수정", "삭제"} <= popup_buttons
+
+    _click_light_popup_button(app, "고정")
+
+    assert repository.get_task(int(task.id)).pinned is True
+    assert widget.findChild(QLabel, "pinBadge") is not None
+
+    row = widget.findChild(QWidget, "checklistRow")
+    assert row is not None
+    widget.show_item_context_menu(row, QPoint(8, 8), "task", int(task.id), task.title)
+    app.processEvents()
+
+    _click_light_popup_button(app, "고정 해제")
+
+    assert repository.get_task(int(task.id)).pinned is False
+
+    opened: dict[str, object] = {}
+
+    class FakeTagAssignmentDialog:
+        def __init__(self, repository_arg, target_type: str, target_id: int, parent=None) -> None:
+            opened["repository"] = repository_arg
+            opened["target_type"] = target_type
+            opened["target_id"] = target_id
+            opened["parent"] = parent
+
+        def exec(self):
+            opened["exec"] = True
+            repository.set_tags_for_target("task", int(task.id), [int(tag.id)])
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module, "TagAssignmentDialog", FakeTagAssignmentDialog)
+    row = widget.findChild(QWidget, "checklistRow")
+    assert row is not None
+    widget.show_item_context_menu(row, QPoint(8, 8), "task", int(task.id), task.title)
+    app.processEvents()
+
+    _click_light_popup_button(app, "태그 관리")
+
+    assert opened == {
+        "repository": repository,
+        "target_type": "task",
+        "target_id": int(task.id),
+        "parent": widget,
+        "exec": True,
+    }
+    assert [tag.name for tag in repository.list_tags_for_target("task", int(task.id))] == ["중요"]
+    assert [badge.text() for badge in widget.findChildren(QLabel, "tagBadge")] == ["중요"]
+    widget.close()
+
+
+def test_today_checklist_workspace_filters_hide_completed_and_restrict_metadata(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    work = repository.save_item_type(ItemType("업무", "task"))
+    personal = repository.save_item_type(ItemType("개인", "task"))
+    focus_tag = repository.create_tag("집중")
+    other_tag = repository.create_tag("기타")
+    visible = repository.save_task(Task("보이는 업무", 0, item_type_id=work.id))
+    repository.set_tags_for_target("task", int(visible.id), [int(focus_tag.id)])
+    untagged = repository.save_task(Task("태그 없는 업무", 0, item_type_id=work.id))
+    hidden_personal = repository.save_task(Task("개인 업무", 0, item_type_id=personal.id))
+    repository.set_tags_for_target("task", int(hidden_personal.id), [int(focus_tag.id)])
+    hidden_other_tag = repository.save_task(Task("다른 태그 업무", 0, item_type_id=work.id))
+    repository.set_tags_for_target("task", int(hidden_other_tag.id), [int(other_tag.id)])
+    completed = repository.save_task(
+        Task(
+            "완료된 업무",
+            0,
+            item_type_id=work.id,
+            completed=True,
+            completed_at=datetime.now().replace(second=0, microsecond=0),
+        )
+    )
+    repository.set_tags_for_target("task", int(completed.id), [int(focus_tag.id)])
+
+    window = MainWindow(repository)
+    window.show()
+    state = window.current_layout_state()
+    state["filters"] = {
+        "memo.folder_id": None,
+        "memo.tag_ids": [],
+        "checklist.item_type_ids": [int(work.id)],
+        "checklist.tag_ids": [int(focus_tag.id)],
+        "checklist.show_completed": False,
+    }
+    window.apply_layout_state(state)
+    window.today_checklist_widget.refresh_checklist()
+    app.processEvents()
+
+    assert _checklist_section_titles(window.today_checklist_widget.active_items_layout, "checklistItemTitle") == ["보이는 업무"]
+    assert _checklist_section_titles(window.today_checklist_widget.completed_items_layout, "checklistItemTitleDone") == []
+    assert repository.get_task(int(untagged.id)) is not None
+    assert repository.get_task(int(hidden_personal.id)) is not None
+    assert repository.get_task(int(hidden_other_tag.id)) is not None
+    assert repository.get_task(int(completed.id)).completed is True
+    window.close()
+
+
+def test_today_flow_focus_selected_task_still_loads_task(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    task = repository.save_task(Task("집중할 업무", 35))
+    repository.save_event(Event("선택하면 무시할 일정", datetime.now(), datetime.now() + timedelta(minutes=30)))
+    window = MainWindow(repository)
+    today_panel = window._build_today_panel()
+    window.show()
+    today_panel.show()
+    window.refresh_today()
+    app.processEvents()
+
+    for row in range(window.today_list.count()):
+        item = window.today_list.item(row)
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if data and data.get("type") == "task" and data.get("id") == task.id:
+            window.today_list.setCurrentItem(item)
+            break
+
+    window.focus_selected_task()
+
+    assert window.selected_task_id == task.id
+    assert window.focus_title_edit.text() == "집중할 업무"
+    assert window.planned_minutes_spin.value() == 35
+    today_panel.close()
+    window.close()
 
 
 def test_task_folder_view_lists_tasks_by_folder(tmp_path) -> None:
@@ -3812,6 +4429,464 @@ def test_main_window_restores_last_feature_sizes(tmp_path) -> None:
     restored_dashboard = restored.current_layout_state()["layout"]["dashboard"]
     assert restored_dashboard == expected_dashboard
     restored.close()
+
+
+def test_workspace_filter_round_trips_through_layout_state(tmp_path) -> None:
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+
+    state = window.current_layout_state()
+    filters = state["filters"]
+    expected_default_filters = {
+        "memo.folder_id": None,
+        "memo.tag_ids": [],
+        "checklist.item_type_ids": [],
+        "checklist.tag_ids": [],
+        "checklist.show_completed": True,
+    }
+    assert filters == expected_default_filters
+    assert set(filters) == set(expected_default_filters)
+
+    updated_filters = {
+        "memo.folder_id": 3,
+        "memo.tag_ids": [11, 13],
+        "checklist.item_type_ids": [2, 5],
+        "checklist.tag_ids": [7, 17],
+        "checklist.show_completed": False,
+    }
+    state["filters"] = updated_filters
+    window.apply_layout_state(state)
+
+    assert window._active_workspace_filters == updated_filters
+    window.close()
+
+
+def test_workspace_switch_applies_memo_folder_filter(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    project_folder = repository.save_quick_note_folder(QuickNoteFolder("프로젝트"))
+    archive_folder = repository.save_quick_note_folder(QuickNoteFolder("보관"))
+    assert project_folder.id is not None
+    assert archive_folder.id is not None
+    repository.save_quick_note(
+        QuickNote("프로젝트 메모", datetime(2026, 6, 14, 9, 0), folder_id=project_folder.id)
+    )
+    repository.save_quick_note(
+        QuickNote("보관 메모", datetime(2026, 6, 14, 10, 0), folder_id=archive_folder.id)
+    )
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "memo.folder_id": int(project_folder.id),
+    }
+    profile = repository.save_layout_profile(LayoutProfile(name="프로젝트", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    assert _note_row_bodies(window) == ["프로젝트 메모"]
+    window.close()
+
+
+def test_workspace_switch_applies_memo_tag_filter(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    focus_tag = repository.create_tag("집중")
+    other_tag = repository.create_tag("기타")
+    visible = repository.save_quick_note(QuickNote("태그 메모", datetime(2026, 6, 14, 9, 0)))
+    hidden = repository.save_quick_note(QuickNote("다른 태그 메모", datetime(2026, 6, 14, 10, 0)))
+    assert focus_tag.id is not None
+    assert other_tag.id is not None
+    assert visible.id is not None
+    assert hidden.id is not None
+    repository.set_tags_for_target("quick_note", int(visible.id), [int(focus_tag.id)])
+    repository.set_tags_for_target("quick_note", int(hidden.id), [int(other_tag.id)])
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "memo.tag_ids": [int(focus_tag.id)],
+    }
+    profile = repository.save_layout_profile(LayoutProfile(name="메모 태그", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    assert _note_row_bodies(window) == ["태그 메모"]
+    window.close()
+
+
+def test_workspace_switch_applies_checklist_tag_filter(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    focus_tag = repository.create_tag("집중")
+    other_tag = repository.create_tag("기타")
+    visible = repository.save_task(Task("보이는 할 일", 0))
+    hidden = repository.save_task(Task("숨겨질 할 일", 0))
+    assert focus_tag.id is not None
+    assert other_tag.id is not None
+    assert visible.id is not None
+    assert hidden.id is not None
+    repository.set_tags_for_target("task", int(visible.id), [int(focus_tag.id)])
+    repository.set_tags_for_target("task", int(hidden.id), [int(other_tag.id)])
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "checklist.tag_ids": [int(focus_tag.id)],
+    }
+    profile = repository.save_layout_profile(LayoutProfile(name="집중", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    assert _checklist_section_titles(window.today_checklist_widget.active_items_layout, "checklistItemTitle") == [
+        "보이는 할 일"
+    ]
+    window.close()
+
+
+def test_manual_folder_combo_change_does_not_overwrite_workspace_filters(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    workspace_folder = repository.save_quick_note_folder(QuickNoteFolder("작업공간"))
+    manual_folder = repository.save_quick_note_folder(QuickNoteFolder("수동"))
+    assert workspace_folder.id is not None
+    assert manual_folder.id is not None
+    repository.save_quick_note(
+        QuickNote("작업공간 메모", datetime(2026, 6, 14, 9, 0), folder_id=workspace_folder.id)
+    )
+    repository.save_quick_note(
+        QuickNote("수동 메모", datetime(2026, 6, 14, 10, 0), folder_id=manual_folder.id)
+    )
+
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "memo.folder_id": int(workspace_folder.id),
+    }
+    window.apply_layout_state(state)
+    original_filters = dict(window._active_workspace_filters)
+
+    manual_index = window.note_filter_combo.findData(manual_folder.id)
+    assert manual_index >= 0
+    window.note_filter_combo.setCurrentIndex(manual_index)
+    app.processEvents()
+
+    assert window._active_workspace_filters == original_filters
+    assert _note_row_bodies(window) == ["수동 메모"]
+    window.close()
+
+
+def test_future_panel_keys_do_not_create_visible_panels(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    future_keys = {
+        WRITING_EDITOR_KEY,
+        WRITING_LIBRARY_KEY,
+        COMMISSION_SUMMARY_KEY,
+        WEEKLY_PLAN_KEY,
+    }
+    default_column_items = {
+        key
+        for column_items in window.default_feature_layout().values()
+        for key in column_items
+    }
+    default_dashboard_items = {str(item["key"]) for item in window.default_feature_grid_layout()}
+
+    assert not future_keys.intersection(window.feature_boxes)
+    assert not future_keys.intersection(default_column_items)
+    assert not future_keys.intersection(default_dashboard_items)
+    settings = SettingsDialog(repository.get_preferences(), window)
+    settings.show()
+    app.processEvents()
+    settings_values = {settings.windowTitle(), settings.objectName()}
+    settings_values.update(widget.objectName() for widget in settings.findChildren(QWidget) if widget.objectName())
+    settings_values.update(label.text() for label in settings.findChildren(QLabel))
+    settings_values.update(button.text() for button in settings.findChildren(QPushButton))
+    settings_values.update(check.text() for check in settings.findChildren(QCheckBox))
+    for combo in settings.findChildren(QComboBox):
+        for index in range(combo.count()):
+            settings_values.add(combo.itemText(index))
+            settings_values.add(str(combo.itemData(index)))
+
+    assert not future_keys.intersection(settings_values)
+    settings.close()
+    window.close()
+
+
+def test_workspace_switch_refreshes_existing_feature_widget_windows_safely(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    class RefreshingDialog(QDialog):
+        def __init__(self, parent: QWidget) -> None:
+            super().__init__(parent)
+            self.refresh_count = 0
+
+        def refresh(self) -> None:
+            self.refresh_count += 1
+
+    dialog = RefreshingDialog(window)
+    window.feature_widget_windows["focus"] = dialog
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "checklist.show_completed": False,
+    }
+    profile = repository.save_layout_profile(LayoutProfile(name="열린 위젯", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    assert dialog.refresh_count == 1
+    dialog.close()
+    window.close()
+
+
+def test_workspace_switch_preserves_current_window_geometry(tmp_path) -> None:
+    # Given: a shown window sized/positioned by the user, and a workspace profile
+    # whose saved window geometry deliberately differs from the current window.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    window.resize(1180, 760)
+    app.processEvents()
+    before_size = (window.width(), window.height())
+    before_pos = window.pos()
+
+    state = _workspace_state(window, show_focus=False, show_quick_memo=True)
+    state["window"] = {"width": before_size[0] + 320, "height": before_size[1] + 240}
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="다른 크기", data=json.dumps(state, ensure_ascii=False))
+    )
+    assert profile.id is not None
+
+    # When: the user selects that workspace.
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    # Then: the window neither resizes nor moves, while the workspace still applies.
+    assert (window.width(), window.height()) == before_size
+    assert window.pos() == before_pos
+    assert window.preferences.active_workspace_id == profile.id
+    assert window._active_workspace_filters["checklist.show_completed"] is True
+    window.close()
+
+
+def test_workspace_menu_selection_applies_state_without_mutating_previous_profile(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    work_state = _workspace_state(window, show_focus=False, show_quick_memo=True, show_completed=False)
+    review_state = _workspace_state(window, show_focus=True, show_quick_memo=False, show_completed=True)
+    work_profile = repository.save_layout_profile(
+        LayoutProfile(name="업무", data=json.dumps(work_state, ensure_ascii=False))
+    )
+    review_profile = repository.save_layout_profile(
+        LayoutProfile(name="리뷰", data=json.dumps(review_state, ensure_ascii=False))
+    )
+    assert work_profile.id is not None
+    assert review_profile.id is not None
+    original_work_data = _profile_data(repository, "업무")
+
+    menu = window._build_workspace_menu()
+    work_action = next(action for action in menu.actions() if action.text() == "업무")
+    work_action.trigger()
+    app.processEvents()
+
+    assert window.preferences.active_workspace_id == work_profile.id
+    assert not window.preferences.show_focus_panel
+    assert window.preferences.show_quick_memo_panel
+    assert window._active_workspace_filters["checklist.show_completed"] is False
+
+    window.preferences.show_focus_panel = True
+    window.preferences.show_quick_memo_panel = False
+    window.apply_preferences(refresh_content=False)
+    review_action = next(action for action in window._build_workspace_menu().actions() if action.text() == "리뷰")
+    review_action.trigger()
+    app.processEvents()
+
+    assert window.preferences.active_workspace_id == review_profile.id
+    assert window.preferences.show_focus_panel
+    assert not window.preferences.show_quick_memo_panel
+    assert _profile_data(repository, "업무") == original_work_data
+    window.close()
+
+
+def test_active_workspace_restores_on_reload_and_ignores_malformed_json(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seed_window = MainWindow(repository)
+    workspace_state = _workspace_state(seed_window, show_focus=False, show_quick_memo=True, show_completed=False)
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="저장된 작업공간", data=json.dumps(workspace_state, ensure_ascii=False))
+    )
+    assert profile.id is not None
+    seed_window.switch_workspace(profile.id)
+    seed_window.close()
+
+    restored = MainWindow(repository)
+    restored.show()
+    app.processEvents()
+
+    assert restored.preferences.active_workspace_id == profile.id
+    assert not restored.preferences.show_focus_panel
+    assert restored._active_workspace_filters["checklist.show_completed"] is False
+    restored.close()
+
+    broken = repository.save_layout_profile(LayoutProfile(name="깨진 작업공간", data="{"))
+    assert broken.id is not None
+    repository.set_active_workspace(broken.id)
+    broken_restored = MainWindow(repository)
+    broken_restored.show()
+    app.processEvents()
+
+    assert "작업공간" in broken_restored.statusBar().currentMessage()
+    assert broken_restored.preferences.active_workspace_id == broken.id
+    broken_restored.close()
+
+
+def test_legacy_layout_state_without_filters_applies_safely(tmp_path) -> None:
+    _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+
+    legacy_state = window.current_layout_state()
+    legacy_state.pop("filters")
+    window.apply_layout_state(legacy_state)
+
+    assert window._active_workspace_filters == {
+        "memo.folder_id": None,
+        "memo.tag_ids": [],
+        "checklist.item_type_ids": [],
+        "checklist.tag_ids": [],
+        "checklist.show_completed": True,
+    }
+    window.close()
+
+
+def test_workspace_manager_create_update_rename_and_delete(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+    window.apply_layout_state(_workspace_state(window, show_focus=False, show_quick_memo=True, show_completed=False))
+
+    names = iter(["새 작업공간", "이름 바꿈"])
+    monkeypatch.setattr(
+        main_window_module.QInputDialog,
+        "getText",
+        lambda *args: (next(names), True),
+    )
+    dialog = WorkspaceManagerDialog(repository, window)
+    dialog.show()
+    app.processEvents()
+
+    dialog.create_workspace()
+    created = repository.get_layout_profile("새 작업공간")
+    assert created is not None
+    assert json.loads(created.data)["filters"]["checklist.show_completed"] is False
+    created_data = created.data
+
+    window.apply_layout_state(_workspace_state(window, show_focus=True, show_quick_memo=False, show_completed=True))
+    dialog.rename_selected_workspace()
+    renamed = repository.get_layout_profile("이름 바꿈")
+    assert renamed is not None
+    assert renamed.id == created.id
+    assert renamed.data == created_data
+
+    repository.set_active_workspace(renamed.id)
+    window.preferences.active_workspace_id = renamed.id
+    dialog.update_current_workspace()
+    updated = repository.get_layout_profile("이름 바꿈")
+    assert updated is not None
+    assert updated.id == created.id
+    assert json.loads(updated.data)["filters"]["checklist.show_completed"] is True
+    assert json.loads(updated.data)["visible"]["quick_memo"] is False
+    assert repository.get_preferences().active_workspace_id == renamed.id
+
+    dialog.delete_selected_workspace(confirm=False)
+    assert repository.get_layout_profile("이름 바꿈") is None
+    assert repository.get_preferences().active_workspace_id is None
+    dialog.close()
+    window.close()
+
+
+def test_workspace_manager_delete_active_workspace_falls_back_safely(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="활성", data=json.dumps(window.current_layout_state(), ensure_ascii=False))
+    )
+    assert profile.id is not None
+    window.switch_workspace(profile.id)
+
+    dialog = WorkspaceManagerDialog(repository, window)
+    dialog.show()
+    app.processEvents()
+
+    dialog.delete_selected_workspace(confirm=False)
+    app.processEvents()
+
+    assert repository.get_preferences().active_workspace_id is None
+    assert window.preferences.active_workspace_id is None
+    assert dialog.profile_list.count() == 0
+    dialog.close()
+    window.close()
+
+
+def test_legacy_layout_profiles_are_visible_as_workspaces_with_default_filters(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    legacy_profile = repository.save_layout_profile(LayoutProfile(name="예전 화면", data='{"layout":{}}'))
+    assert legacy_profile.id is not None
+    window = MainWindow(repository)
+    dialog = WorkspaceManagerDialog(repository, window)
+    dialog.show()
+    app.processEvents()
+
+    assert [dialog.profile_list.item(row).text() for row in range(dialog.profile_list.count())] == ["예전 화면"]
+
+    window.switch_workspace(legacy_profile.id)
+    app.processEvents()
+
+    assert window._active_workspace_filters == _workspace_filters()
+    dialog.close()
+    window.close()
 
 
 def test_feature_width_resize_keeps_neighbors_packed(tmp_path) -> None:
@@ -5378,7 +6453,7 @@ def test_quick_memo_narrow_tall_keeps_history_scrollable(tmp_path) -> None:
     assert sizes[1] > 0
     window.refresh_notes()
     app.processEvents()
-    assert window.notes_list.count() == 12
+    assert window.notes_list.count() == 20
     scroll_bar = window.notes_list.verticalScrollBar()
     scroll_bar.setValue(scroll_bar.maximum())
     app.processEvents()

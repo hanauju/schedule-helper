@@ -13,6 +13,7 @@ from html.parser import HTMLParser
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
+from typing import Final
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
@@ -86,12 +87,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorite, Preference, QuickNote, QuickNoteFolder, Task
+from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorite, Preference, QuickNote, QuickNoteFolder, Tag, Task
 from app.services.app_usage import WindowsActiveWindowProvider
 from app.services.focus_timer import FocusTimerService, decode_focus_targets
+from app.ui.metadata_widgets import PinBadge, SortDirectionButton, TagAssignmentDialog, TagBadge
 from app.ui.orot_brand import OROT_RING_COLOR, build_orot_brand
 from app.storage.database import (
     ScheduleRepository,
+    WorkspaceFilters,
     default_database_path,
     set_configured_database_path,
 )
@@ -112,6 +115,10 @@ PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
 PANEL_CORNER_RADIUS = 16  # keep in sync with normal card "border-radius: 16px" in the stylesheet
 DASHBOARD_GRID_GAP = 12
 MEDIA_PANEL_KEYS = ("media_panel", "media_panel_2", "media_panel_3", "media_panel_4")
+WRITING_EDITOR_KEY: Final = "writing_editor"  # reserved for deferred writing/commission/weekly-plan features
+WRITING_LIBRARY_KEY: Final = "writing_library"  # reserved for deferred writing/commission/weekly-plan features
+COMMISSION_SUMMARY_KEY: Final = "commission_summary"  # reserved for deferred writing/commission/weekly-plan features
+WEEKLY_PLAN_KEY: Final = "weekly_plan"  # reserved for deferred writing/commission/weekly-plan features
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
 KOREAN_FONT_FILES = (
     "malgun.ttf",
@@ -2919,6 +2926,7 @@ class MainWindow(QMainWindow):
         self._suppress_normal_size_tracking = False
         self.break_until: datetime | None = None
         self.preferences = self.repository.get_preferences()
+        self._active_workspace_filters = self._normalize_workspace_filters({})
         stored_preferences = self._preferences_with_stored_media_assets(self.preferences)
         if stored_preferences != self.preferences:
             self.preferences = self.repository.save_preferences(stored_preferences)
@@ -2953,6 +2961,7 @@ class MainWindow(QMainWindow):
         self.restore_last_window_size()
         self.apply_preferences(refresh_content=False)
         self.restore_last_layout_state()
+        self._restore_active_workspace()
         self.schedule_startup_refresh()
 
     def _initialize_focus_timer(self) -> None:
@@ -3147,6 +3156,12 @@ class MainWindow(QMainWindow):
         _stabilize_control(task_folder_button, 104)
         task_folder_button.clicked.connect(self.show_task_folder_settings)
         actions_layout.addWidget(task_folder_button)
+
+        self.workspace_button = QPushButton("작업공간")
+        self.workspace_button.setObjectName("topBarButton")
+        _stabilize_control(self.workspace_button, 92)
+        self.workspace_button.clicked.connect(self.show_workspace_menu)
+        actions_layout.addWidget(self.workspace_button)
 
         settings_button = QPushButton("설정")
         settings_button.setObjectName("topBarButton")
@@ -4534,6 +4549,9 @@ class MainWindow(QMainWindow):
         _stabilize_panel_caption(saved_notes_label)
         self.memo_saved_notes_label = saved_notes_label
         notes_filter_row.addWidget(saved_notes_label)
+        self.memo_sort_button = SortDirectionButton(self.preferences.quick_note_sort_direction, notes_container)
+        self.memo_sort_button.clicked.connect(self.toggle_memo_sort_direction)
+        notes_filter_row.addWidget(self.memo_sort_button)
         notes_filter_row.addStretch(1)
         self.note_filter_combo = QComboBox()
         _stabilize_control(self.note_filter_combo, 150)
@@ -4588,6 +4606,7 @@ class MainWindow(QMainWindow):
             "memo_history_card",
             "memo_history_layout",
             "memo_saved_notes_label",
+            "memo_sort_button",
             "note_filter_combo",
             "memo_splitter",
         )
@@ -4612,6 +4631,7 @@ class MainWindow(QMainWindow):
         self.memo_folder_settings_button.setVisible(False)
         self.memo_editor_title.setVisible(True)
         self.memo_saved_notes_label.setVisible(not short)
+        self.memo_sort_button.setVisible(not short)
         self.note_filter_combo.setVisible(not tiny)
         self.memo_history_card.setVisible(not short)
         self.quick_note_editor.setMinimumHeight(40 if tiny else 48 if compact else 56)
@@ -6574,6 +6594,91 @@ class MainWindow(QMainWindow):
         self.preferences.last_layout_state = data
         self.preferences = self.repository.save_preferences(self.preferences)
 
+    def _workspace_profile_by_id(self, profile_id: int) -> LayoutProfile | None:
+        return next(
+            (profile for profile in self.repository.list_workspace_profiles() if profile.id == profile_id),
+            None,
+        )
+
+    def _workspace_state_from_profile(self, profile: LayoutProfile) -> dict[str, object] | None:
+        try:
+            state = json.loads(profile.data)
+        except json.JSONDecodeError:
+            self.statusBar().showMessage(f"'{profile.name}' 작업공간을 읽을 수 없습니다.", 3500)
+            return None
+        if not isinstance(state, dict):
+            self.statusBar().showMessage(f"'{profile.name}' 작업공간 형식이 올바르지 않습니다.", 3500)
+            return None
+        return state
+
+    def _restore_active_workspace(self) -> None:
+        active_workspace_id = self.preferences.active_workspace_id
+        if active_workspace_id is None:
+            return
+        profile = self._workspace_profile_by_id(active_workspace_id)
+        if profile is None:
+            self.repository.clear_active_workspace()
+            self.preferences.active_workspace_id = None
+            self.preferences = self.repository.save_preferences(self.preferences)
+            self.statusBar().showMessage("활성 작업공간을 찾을 수 없어 기본 배치를 유지합니다.", 3500)
+            return
+        state = self._workspace_state_from_profile(profile)
+        if state is None:
+            return
+        self.apply_layout_state(state, include_window=False)
+        self.statusBar().showMessage(f"'{profile.name}' 작업공간을 복원했습니다.", 2500)
+
+    def _build_workspace_menu(self) -> QMenu:
+        menu = _style_popup_menu(QMenu(self), self)
+        active_workspace_id = self.preferences.active_workspace_id
+        profiles = self.repository.list_workspace_profiles()
+        if not profiles:
+            empty_action = menu.addAction("저장된 작업공간 없음")
+            empty_action.setEnabled(False)
+        for profile in profiles:
+            if profile.id is None:
+                continue
+            profile_id = int(profile.id)
+            action = menu.addAction(profile.name)
+            if profile_id == active_workspace_id:
+                action.setCheckable(True)
+                action.setChecked(True)
+            action.triggered.connect(
+                lambda _checked=False, selected_profile_id=profile_id: self.switch_workspace(selected_profile_id)
+            )
+        menu.addSeparator()
+        manage_action = menu.addAction("워크스페이스 관리...")
+        manage_action.triggered.connect(self.show_workspace_manager)
+        return menu
+
+    def show_workspace_menu(self) -> None:
+        if not hasattr(self, "workspace_button"):
+            return
+        menu = self._build_workspace_menu()
+        self._workspace_menu = menu
+        menu.popup(self.workspace_button.mapToGlobal(QPoint(0, self.workspace_button.height())))
+
+    def show_workspace_manager(self) -> None:
+        dialog = WorkspaceManagerDialog(self.repository, self)
+        dialog.exec()
+
+    def switch_workspace(self, profile_id: int) -> None:
+        profile = self._workspace_profile_by_id(profile_id)
+        if profile is None:
+            self.statusBar().showMessage("선택한 작업공간을 찾을 수 없습니다.", 3000)
+            return
+        state = self._workspace_state_from_profile(profile)
+        if state is None:
+            return
+        self.apply_layout_state(state, include_window=False)
+        self.refresh_notes()
+        self.refresh_today_checklist()
+        self.refresh_feature_widget()
+        self.repository.set_active_workspace(profile_id)
+        self.preferences.active_workspace_id = profile_id
+        self.preferences = self.repository.save_preferences(self.preferences)
+        self.statusBar().showMessage(f"'{profile.name}' 작업공간으로 전환했습니다.", 2500)
+
     def update_current_datetime_display(self) -> None:
         if not hasattr(self, "current_date_label"):
             return
@@ -6854,14 +6959,42 @@ class MainWindow(QMainWindow):
 
     def refresh_notes(self) -> None:
         self.notes_list.clear()
+        workspace_filters = getattr(self, "_active_workspace_filters", {})
+        workspace_folder_id: int | None = None
+        workspace_tag_ids: list[int] = []
+        if isinstance(workspace_filters, dict):
+            memo_folder_id = workspace_filters.get("memo.folder_id")
+            if isinstance(memo_folder_id, int) and not isinstance(memo_folder_id, bool):
+                workspace_folder_id = memo_folder_id
+            memo_tag_ids = workspace_filters.get("memo.tag_ids")
+            if isinstance(memo_tag_ids, list):
+                workspace_tag_ids = [
+                    tag_id for tag_id in memo_tag_ids if isinstance(tag_id, int) and not isinstance(tag_id, bool)
+                ]
         folder_id = self._folder_id_from_combo("note_filter_combo")
-        for note in self.repository.list_quick_notes(limit=12, folder_id=folder_id):
+        if folder_id is None:
+            folder_id = workspace_folder_id
+        if hasattr(self, "memo_sort_button"):
+            self.memo_sort_button.direction = self.preferences.quick_note_sort_direction
+        for note in self.repository.list_quick_notes_sorted(
+            self.preferences.quick_note_sort_direction,
+            folder_id=folder_id,
+            tag_ids=workspace_tag_ids,
+        ):
             item = QListWidgetItem()
             item.setData(Qt.ItemDataRole.UserRole, note.id)
             item.setToolTip(self._note_list_label(note, compact=False))
             item.setSizeHint(QSize(0, self._quick_note_row_height()))
             self.notes_list.addItem(item)
             self.notes_list.setItemWidget(item, self._build_note_list_row(note))
+
+    def toggle_memo_sort_direction(self) -> None:
+        self.preferences.quick_note_sort_direction = (
+            "asc" if self.preferences.quick_note_sort_direction == "desc" else "desc"
+        )
+        self.preferences = self.repository.save_preferences(self.preferences)
+        self.memo_sort_button.direction = self.preferences.quick_note_sort_direction
+        self.refresh_notes()
 
     def _quick_note_body_min_height(self) -> int:
         content_size = _normalize_content_font_size(getattr(self.preferences, "content_font_size", 13))
@@ -6921,6 +7054,17 @@ class MainWindow(QMainWindow):
         folder_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         meta_row.addWidget(folder_badge)
 
+        if note.pinned:
+            pin_badge = PinBadge()
+            pin_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            meta_row.addWidget(pin_badge)
+
+        if note.id is not None:
+            for tag in self.repository.list_tags_for_target("quick_note", note.id):
+                tag_badge = TagBadge(tag.name)
+                tag_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                meta_row.addWidget(tag_badge)
+
         attachments = self.repository.list_quick_note_attachments(note.id) if note.id is not None else []
         if attachments:
             attachment_badge = QLabel(f"첨부 {len(attachments)}")
@@ -6945,7 +7089,7 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "compact_notes_list"):
             return
         self.compact_notes_list.clear()
-        notes = self.repository.list_quick_notes(limit=5)
+        notes = self.repository.list_quick_notes_sorted(self.preferences.quick_note_sort_direction, limit=5)
         if not notes:
             empty = QListWidgetItem("저장된 메모가 없습니다.")
             empty.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -8457,7 +8601,11 @@ class MainWindow(QMainWindow):
                 "media_panel_4": self.preferences.show_media_panel_4,
                 "compact_favorites": self.preferences.show_compact_favorites_panel,
             },
+            "filters": self._normalize_workspace_filters(getattr(self, "_active_workspace_filters", {})),
         }
+
+    def _normalize_workspace_filters(self, data: dict[str, object]) -> WorkspaceFilters:
+        return self.repository.normalize_workspace_filters(data)
 
     def default_layout_state(self) -> dict[str, object]:
         default_preferences = Preference()
@@ -8504,20 +8652,33 @@ class MainWindow(QMainWindow):
             "visible": default_visible,
         }
 
-    def apply_layout_state(self, state: dict[str, object], include_visibility: bool = True) -> None:
+    def apply_layout_state(
+        self,
+        state: dict[str, object],
+        include_visibility: bool = True,
+        include_window: bool = True,
+    ) -> None:
         if self.stack.currentWidget() == self.compact_page:
             self.set_compact_mode(False)
 
-        window_state = state.get("window")
-        if isinstance(window_state, dict):
-            width = int(window_state.get("width", self.width()))
-            height = int(window_state.get("height", self.height()))
-            self.resize(max(720, width), max(520, height))
+        filters_state = state.get("filters")
+        self._active_workspace_filters = self._normalize_workspace_filters(
+            filters_state if isinstance(filters_state, dict) else {}
+        )
+
+        if include_window:
+            window_state = state.get("window")
+            if isinstance(window_state, dict):
+                width = int(window_state.get("width", self.width()))
+                height = int(window_state.get("height", self.height()))
+                self.resize(max(720, width), max(520, height))
 
         if include_visibility:
             self._apply_layout_visibility(state.get("visible"))
 
         self._apply_feature_layout(state.get("layout"))
+        if hasattr(self, "today_checklist_widget"):
+            self.today_checklist_widget.refresh_checklist()
 
         splitters = state.get("splitters")
         if not isinstance(splitters, dict):
@@ -11456,6 +11617,10 @@ class MainWindow(QMainWindow):
             return
 
         note_id = int(item.data(Qt.ItemDataRole.UserRole))
+        note = self.repository.get_quick_note(note_id)
+        if note is None:
+            self.refresh_notes()
+            return
         attachments = self.repository.list_quick_note_attachments(note_id)
         menu = _style_popup_menu(QMenu(self.notes_list), self.notes_list)
         copy_action = menu.addAction("복사")
@@ -11463,6 +11628,15 @@ class MainWindow(QMainWindow):
         menu.addSeparator()
         edit_action = menu.addAction("수정")
         edit_action.triggered.connect(self.edit_selected_quick_note)
+        pin_action = menu.addAction("고정 해제" if note.pinned else "고정")
+        pin_action.triggered.connect(
+            lambda _checked=False, target_id=note_id, pinned=note.pinned: self.set_quick_note_pinned(
+                target_id,
+                not pinned,
+            )
+        )
+        tag_action = menu.addAction("태그 관리")
+        tag_action.triggered.connect(lambda _checked=False, target_id=note_id: self.manage_quick_note_tags(target_id))
         self._add_note_folder_menu(menu, note_id)
         if attachments:
             attachment_menu = menu.addMenu("첨부 열기")
@@ -11475,6 +11649,17 @@ class MainWindow(QMainWindow):
         delete_action = menu.addAction("삭제")
         delete_action.triggered.connect(self.delete_selected_quick_note)
         menu.exec(self.notes_list.mapToGlobal(position))
+
+    def set_quick_note_pinned(self, note_id: int, pinned: bool) -> None:
+        self.repository.set_pinned_note(note_id, pinned)
+        self.refresh_notes()
+        self.refresh_compact_notes()
+        self.refresh_feature_widget("quick_memo")
+
+    def manage_quick_note_tags(self, note_id: int) -> None:
+        dialog = TagAssignmentDialog(self.repository, "quick_note", note_id, self)
+        dialog.exec()
+        self.refresh_notes()
 
     def copy_selected_quick_note(self) -> None:
         item = self.notes_list.currentItem()
@@ -14312,6 +14497,9 @@ class TodayChecklistWidget(QWidget):
             _stabilize_panel_caption(self.title_label)
             title_row.addWidget(self.title_label)
         title_row.addStretch(1)
+        self.checklist_sort_button = SortDirectionButton(self.repository.get_preferences().checklist_sort_direction, self)
+        self.checklist_sort_button.clicked.connect(self.toggle_checklist_sort_direction)
+        title_row.addWidget(self.checklist_sort_button)
         self.folder_view_button = QPushButton("폴더 보기")
         self.folder_view_button.setObjectName("ghostButton")
         self.folder_view_button.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -14457,15 +14645,14 @@ class TodayChecklistWidget(QWidget):
                 current_type_id = _selected_item_type_id(self.new_task_type_combo)
                 _populate_item_type_combo(self.new_task_type_combo, self.repository, "task", current_type_id)
 
+            sort_direction = self._checklist_sort_direction()
+            self.checklist_sort_button.direction = sort_direction
             items = self._collect_items()
             active_items = [item for item in items if not item["completed"]]
             completed_items = [item for item in items if item["completed"]]
 
-            active_items.sort(key=lambda item: (item["sort_at"] is None, item["sort_at"] or datetime.max, str(item["label"])))
-            completed_items.sort(
-                key=lambda item: item["completed_at"] or item["sort_at"] or datetime.min,
-                reverse=True,
-            )
+            self._sort_checklist_section(active_items, sort_direction, completed=False)
+            self._sort_checklist_section(completed_items, sort_direction, completed=True)
 
             total_count = len(active_items) + len(completed_items)
             completed_ratio = 0 if total_count <= 0 else int(1000 * len(completed_items) / total_count)
@@ -14494,11 +14681,16 @@ class TodayChecklistWidget(QWidget):
     def _collect_items(self) -> list[dict[str, object]]:
         selected_date = date.today()
         start_at, end_at = _day_window(selected_date)
+        sort_direction = self._checklist_sort_direction()
+        checklist_filters = self._checklist_filters()
         items: list[dict[str, object]] = []
         listed_event_ids: set[int] = set()
 
-        for event in self.repository.list_events(start_at, end_at, include_completed=True):
+        for event in self.repository.list_events_sorted(sort_direction, start_at, end_at, include_completed=True):
             if event.id is None:
+                continue
+            tags = self.repository.list_tags_for_target("event", event.id)
+            if not self._matches_checklist_filters(event.item_type_id, tags, event.completed, checklist_filters):
                 continue
             listed_event_ids.add(event.id)
             display_parts = self._event_display_parts(event, selected_date)
@@ -14510,6 +14702,10 @@ class TodayChecklistWidget(QWidget):
                     "completed_at": event.completed_at,
                     "sort_at": event.start_at,
                     "label": self._event_label(event, selected_date),
+                    "item_type_id": event.item_type_id,
+                    "pinned": event.pinned,
+                    "tags": [tag.name for tag in tags],
+                    "tag_ids": [tag.id for tag in tags if tag.id is not None],
                     **display_parts,
                 }
             )
@@ -14518,6 +14714,9 @@ class TodayChecklistWidget(QWidget):
             if event.id is None or event.id in listed_event_ids:
                 continue
             if event.completed_at is None or event.completed_at.date() != selected_date:
+                continue
+            tags = self.repository.list_tags_for_target("event", event.id)
+            if not self._matches_checklist_filters(event.item_type_id, tags, True, checklist_filters):
                 continue
             display_parts = self._event_display_parts(event, selected_date)
             items.append(
@@ -14528,17 +14727,24 @@ class TodayChecklistWidget(QWidget):
                     "completed_at": event.completed_at,
                     "sort_at": event.completed_at,
                     "label": self._event_label(event, selected_date),
+                    "item_type_id": event.item_type_id,
+                    "pinned": event.pinned,
+                    "tags": [tag.name for tag in tags],
+                    "tag_ids": [tag.id for tag in tags if tag.id is not None],
                     **display_parts,
                 }
             )
 
-        for task in self.repository.list_tasks(include_completed=True):
+        for task in self.repository.list_tasks_sorted(sort_direction, include_completed=True):
             if task.id is None:
                 continue
             due_today = task.due_at is not None and task.due_at.date() == selected_date
             completed_today = task.completed_at is not None and task.completed_at.date() == selected_date
             created_today = task.created_at.date() == selected_date
             if task.completed and not (due_today or completed_today or created_today):
+                continue
+            tags = self.repository.list_tags_for_target("task", task.id)
+            if not self._matches_checklist_filters(task.item_type_id, tags, task.completed, checklist_filters):
                 continue
             sort_at = task.due_at or task.completed_at or task.created_at
             display_parts = self._task_display_parts(task, selected_date)
@@ -14550,11 +14756,93 @@ class TodayChecklistWidget(QWidget):
                     "completed_at": task.completed_at,
                     "sort_at": sort_at,
                     "label": self._task_label(task, selected_date),
+                    "item_type_id": task.item_type_id,
+                    "pinned": task.pinned,
+                    "tags": [tag.name for tag in tags],
+                    "tag_ids": [tag.id for tag in tags if tag.id is not None],
                     **display_parts,
                 }
             )
 
         return items
+
+    def _checklist_sort_direction(self) -> str:
+        return self.repository.get_preferences().checklist_sort_direction
+
+    def toggle_checklist_sort_direction(self) -> None:
+        preferences = self.repository.get_preferences()
+        preferences.checklist_sort_direction = "asc" if preferences.checklist_sort_direction == "desc" else "desc"
+        saved_preferences = self.repository.save_preferences(preferences)
+        owner = self.window()
+        if hasattr(owner, "preferences"):
+            owner.preferences = saved_preferences
+        self.checklist_sort_button.direction = saved_preferences.checklist_sort_direction
+        self.refresh_checklist()
+
+    def _sort_checklist_section(self, items: list[dict[str, object]], sort_direction: str, completed: bool) -> None:
+        descending = sort_direction == "desc"
+
+        def item_time(item: dict[str, object]) -> datetime | None:
+            primary_value = item.get("completed_at") if completed else item.get("sort_at")
+            if isinstance(primary_value, datetime):
+                return primary_value
+            fallback_value = item.get("sort_at")
+            return fallback_value if isinstance(fallback_value, datetime) else None
+
+        def ordered_bucket(bucket: list[dict[str, object]]) -> list[dict[str, object]]:
+            dated = [item for item in bucket if item_time(item) is not None]
+            undated = [item for item in bucket if item_time(item) is None]
+            dated.sort(key=lambda item: (item_time(item) or datetime.min, str(item["label"])), reverse=descending)
+            undated.sort(key=lambda item: str(item["label"]), reverse=descending)
+            return dated + undated
+
+        pinned_items = [item for item in items if bool(item.get("pinned"))]
+        unpinned_items = [item for item in items if not bool(item.get("pinned"))]
+        items[:] = ordered_bucket(pinned_items) + ordered_bucket(unpinned_items)
+
+    def _checklist_filters(self) -> dict[str, object]:
+        candidates: list[QWidget | None] = [self.window(), self.parentWidget()]
+        current = self.parentWidget()
+        while current is not None:
+            current = current.parentWidget()
+            candidates.append(current)
+        for candidate in candidates:
+            filters = getattr(candidate, "_active_workspace_filters", None)
+            if isinstance(filters, dict):
+                return filters
+        return {
+            "memo.folder_id": None,
+            "memo.tag_ids": [],
+            "checklist.item_type_ids": [],
+            "checklist.tag_ids": [],
+            "checklist.show_completed": True,
+        }
+
+    def _matches_checklist_filters(
+        self,
+        item_type_id: int | None,
+        tags: list[Tag],
+        completed: bool,
+        filters: dict[str, object],
+    ) -> bool:
+        show_completed = filters.get("checklist.show_completed")
+        if completed and isinstance(show_completed, bool) and not show_completed:
+            return False
+        item_type_ids = self._filter_id_set(filters.get("checklist.item_type_ids"))
+        if item_type_ids and (item_type_id is None or int(item_type_id) not in item_type_ids):
+            return False
+        tag_ids = self._filter_id_set(filters.get("checklist.tag_ids"))
+        if tag_ids:
+            assigned_tag_ids = {int(tag.id) for tag in tags if tag.id is not None}
+            if not assigned_tag_ids.intersection(tag_ids):
+                return False
+        return True
+
+    @staticmethod
+    def _filter_id_set(value: object) -> set[int]:
+        if not isinstance(value, list):
+            return set()
+        return {int(item) for item in value if isinstance(item, int) and not isinstance(item, bool)}
 
     def _add_checkbox(self, layout: QVBoxLayout, item: dict[str, object]) -> None:
         completed = bool(item["completed"])
@@ -14601,13 +14889,30 @@ class TodayChecklistWidget(QWidget):
         text_box.setContentsMargins(0, 0, 0, 0)
         text_box.setSpacing(8)
 
+        title_row = QHBoxLayout()
+        title_row.setContentsMargins(0, 0, 0, 0)
+        title_row.setSpacing(6)
+
         title_label = QLabel(str(item.get("title") or label))
         title_label.setObjectName("checklistItemTitleDone" if completed else "checklistItemTitle")
         title_label.setWordWrap(True)
         title_label.setMinimumWidth(0)
         title_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         title_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
-        text_box.addWidget(title_label)
+        title_row.addWidget(title_label, 1)
+        if bool(item.get("pinned")):
+            pin_badge = PinBadge(parent=row)
+            pin_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            title_row.addWidget(pin_badge)
+        tag_names = item.get("tags")
+        if isinstance(tag_names, list):
+            for tag_name in tag_names:
+                if not isinstance(tag_name, str) or not tag_name.strip():
+                    continue
+                tag_badge = TagBadge(tag_name, row)
+                tag_badge.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+                title_row.addWidget(tag_badge)
+        text_box.addLayout(title_row)
 
         meta_values = [
             str(item.get(key) or "").strip()
@@ -14721,10 +15026,34 @@ class TodayChecklistWidget(QWidget):
             widget,
             position,
             [
+                ("고정 해제" if self._item_pinned(item_type, item_id) else "고정", lambda: self.set_item_pinned(item_type, item_id), True),
+                ("태그 관리", lambda: self.manage_item_tags(item_type, item_id), True),
                 ("수정", lambda: self.edit_item(item_type, item_id), True),
                 ("삭제", lambda: self.delete_item(item_type, item_id, label), True),
             ],
         )
+
+    def _item_pinned(self, item_type: str, item_id: int) -> bool:
+        if item_type == "task":
+            task = self.repository.get_task(item_id)
+            return bool(task.pinned) if task is not None else False
+        if item_type == "event":
+            event = self.repository.get_event(item_id)
+            return bool(event.pinned) if event is not None else False
+        return False
+
+    def set_item_pinned(self, item_type: str, item_id: int) -> None:
+        pinned = not self._item_pinned(item_type, item_id)
+        if item_type == "task":
+            self.repository.set_pinned_task(item_id, pinned)
+        elif item_type == "event":
+            self.repository.set_pinned_event(item_id, pinned)
+        self.refresh_after_change()
+
+    def manage_item_tags(self, item_type: str, item_id: int) -> None:
+        dialog = TagAssignmentDialog(self.repository, item_type, item_id, self)
+        dialog.exec()
+        self.refresh_after_change()
 
     def edit_item(self, item_type: str, item_id: int) -> None:
         item: Task | Event | None
@@ -17471,6 +17800,200 @@ class LayoutProfileLoadDialog(QDialog):
         self.refresh_profiles()
 
 
+class WorkspaceManagerDialog(QDialog):
+    def __init__(self, repository: ScheduleRepository, parent: MainWindow | None = None) -> None:
+        super().__init__(parent)
+        self.repository = repository
+        self.profiles: list[LayoutProfile] = []
+        self.setWindowTitle("워크스페이스 관리")
+        self.setMinimumSize(QSize(460, 380))
+        self.resize(520, 440)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(18, 16, 18, 16)
+        layout.setSpacing(10)
+
+        title = QLabel("작업공간")
+        title.setObjectName("sectionTitle")
+        layout.addWidget(title)
+
+        self.profile_list = QListWidget()
+        self.profile_list.setObjectName("workspaceManagerList")
+        self.profile_list.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.profile_list.itemDoubleClicked.connect(lambda _item=None: self.switch_selected_workspace())
+        layout.addWidget(self.profile_list, 1)
+
+        hint = QLabel("더블클릭하면 작업공간을 즉시 전환합니다. 현재 배치 저장은 '현재 상태로 업데이트'에서만 수행됩니다.")
+        hint.setObjectName("mutedLabel")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+        button_row = QHBoxLayout()
+        create_button = QPushButton("새 워크스페이스")
+        _stabilize_control(create_button, 120)
+        create_button.clicked.connect(self.create_workspace)
+        update_button = QPushButton("현재 상태로 업데이트")
+        _stabilize_control(update_button, 150)
+        update_button.clicked.connect(self.update_current_workspace)
+        rename_button = QPushButton("이름 변경")
+        _stabilize_control(rename_button, 92)
+        rename_button.clicked.connect(self.rename_selected_workspace)
+        delete_button = QPushButton("삭제")
+        _stabilize_control(delete_button, 76)
+        delete_button.clicked.connect(self.delete_selected_workspace)
+        button_row.addWidget(create_button)
+        button_row.addWidget(update_button)
+        button_row.addWidget(rename_button)
+        button_row.addWidget(delete_button)
+        button_row.addStretch(1)
+        close_button = QPushButton("닫기")
+        _stabilize_control(close_button, 84)
+        close_button.clicked.connect(self.close)
+        button_row.addWidget(close_button)
+        layout.addLayout(button_row)
+
+        self.refresh_profiles()
+
+    def refresh_profiles(self, selected_profile_id: int | None = None) -> None:
+        current_id = selected_profile_id if selected_profile_id is not None else self.current_profile_id()
+        self.profiles = self.repository.list_workspace_profiles()
+        self.profile_list.clear()
+        active_id = self.repository.get_preferences().active_workspace_id
+        for profile in self.profiles:
+            item = QListWidgetItem(profile.name)
+            item.setData(Qt.ItemDataRole.UserRole, profile.id)
+            updated_at = profile.updated_at.strftime("%Y-%m-%d %H:%M")
+            active_suffix = "\n현재 작업공간" if profile.id == active_id else ""
+            item.setToolTip(f"{profile.name}\n수정 {updated_at}{active_suffix}")
+            self.profile_list.addItem(item)
+        if current_id is not None:
+            for row in range(self.profile_list.count()):
+                item = self.profile_list.item(row)
+                if item.data(Qt.ItemDataRole.UserRole) == current_id:
+                    self.profile_list.setCurrentRow(row)
+                    return
+        if self.profile_list.count() > 0:
+            self.profile_list.setCurrentRow(0)
+
+    def current_profile_id(self) -> int | None:
+        item = self.profile_list.currentItem()
+        if item is None:
+            return None
+        profile_id = item.data(Qt.ItemDataRole.UserRole)
+        return int(profile_id) if profile_id is not None else None
+
+    def current_profile(self) -> LayoutProfile | None:
+        profile_id = self.current_profile_id()
+        if profile_id is None:
+            return None
+        return next((profile for profile in self.profiles if profile.id == profile_id), None)
+
+    def current_layout_data(self) -> str:
+        parent = self.parent()
+        if hasattr(parent, "current_layout_state"):
+            return json.dumps(parent.current_layout_state(), ensure_ascii=False)
+        return json.dumps({"version": 1}, ensure_ascii=False)
+
+    def create_workspace(self, _checked: bool = False) -> None:
+        default_name = f"작업공간 {datetime.now():%m%d %H%M}"
+        name, accepted = QInputDialog.getText(
+            self,
+            "새 워크스페이스",
+            "작업공간 이름",
+            QLineEdit.EchoMode.Normal,
+            default_name,
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.information(self, "새 워크스페이스", "작업공간 이름을 입력하세요.")
+            return
+        if self.repository.get_layout_profile(name) is not None:
+            QMessageBox.information(self, "새 워크스페이스", "같은 이름의 작업공간이 이미 있습니다.")
+            return
+        profile = self.repository.save_layout_profile(LayoutProfile(name=name, data=self.current_layout_data()))
+        self.refresh_profiles(profile.id)
+        self.show_status(f"'{profile.name}' 작업공간을 만들었습니다.")
+
+    def update_current_workspace(self, _checked: bool = False) -> None:
+        profile = self.current_profile()
+        if profile is None or profile.id is None:
+            QMessageBox.information(self, "작업공간 업데이트", "업데이트할 작업공간을 선택하세요.")
+            return
+        self._update_profile_data(profile.id, self.current_layout_data())
+        self.refresh_profiles(profile.id)
+        self.show_status(f"'{profile.name}' 작업공간을 현재 상태로 업데이트했습니다.")
+
+    def rename_selected_workspace(self, _checked: bool = False) -> None:
+        profile = self.current_profile()
+        if profile is None or profile.id is None:
+            QMessageBox.information(self, "작업공간 이름 변경", "이름을 바꿀 작업공간을 선택하세요.")
+            return
+        name, accepted = QInputDialog.getText(
+            self,
+            "작업공간 이름 변경",
+            "새 이름",
+            QLineEdit.EchoMode.Normal,
+            profile.name,
+        )
+        if not accepted:
+            return
+        name = name.strip()
+        if not name:
+            QMessageBox.information(self, "작업공간 이름 변경", "작업공간 이름을 입력하세요.")
+            return
+        existing = self.repository.get_layout_profile(name)
+        if existing is not None and existing.id != profile.id:
+            QMessageBox.information(self, "작업공간 이름 변경", "같은 이름의 작업공간이 이미 있습니다.")
+            return
+        self._rename_profile(profile.id, name)
+        self.refresh_profiles(profile.id)
+        self.show_status(f"작업공간 이름을 '{name}'(으)로 변경했습니다.")
+
+    def delete_selected_workspace(self, _checked: bool = False, confirm: bool = True) -> None:
+        profile = self.current_profile()
+        if profile is None or profile.id is None:
+            QMessageBox.information(self, "작업공간 삭제", "삭제할 작업공간을 선택하세요.")
+            return
+        if confirm:
+            answer = QMessageBox.question(
+                self,
+                "작업공간 삭제",
+                f"'{profile.name}' 작업공간을 삭제할까요?",
+            )
+            if answer != QMessageBox.StandardButton.Yes:
+                return
+        active_id = self.repository.get_preferences().active_workspace_id
+        self.repository.delete_layout_profile(profile.id)
+        if active_id == profile.id:
+            self.repository.clear_active_workspace()
+            parent = self.parent()
+            if hasattr(parent, "preferences"):
+                parent.preferences = self.repository.get_preferences()
+        self.refresh_profiles()
+        self.show_status(f"'{profile.name}' 작업공간을 삭제했습니다.")
+
+    def switch_selected_workspace(self) -> None:
+        profile = self.current_profile()
+        parent = self.parent()
+        if profile is None or profile.id is None or not hasattr(parent, "switch_workspace"):
+            return
+        parent.switch_workspace(profile.id)
+        self.accept()
+
+    def _update_profile_data(self, profile_id: int, data: str) -> None:
+        self.repository.update_layout_profile_data(profile_id, data)
+
+    def _rename_profile(self, profile_id: int, name: str) -> None:
+        self.repository.rename_layout_profile(profile_id, name)
+
+    def show_status(self, message: str) -> None:
+        parent = self.parent()
+        if hasattr(parent, "statusBar"):
+            parent.statusBar().showMessage(message, 2500)
+
+
 class ImageViewAdjustDialog(QDialog):
     def __init__(
         self,
@@ -17906,9 +18429,13 @@ class SettingsDialog(QDialog):
         reset_layout_button = QPushButton("기본 배치")
         _stabilize_control(reset_layout_button, 88)
         reset_layout_button.clicked.connect(lambda: self.run_parent_layout_action("reset_main_layout"))
+        workspace_manager_button = QPushButton("워크스페이스 관리")
+        _stabilize_control(workspace_manager_button, 128)
+        workspace_manager_button.clicked.connect(lambda: self.run_parent_layout_action("show_workspace_manager"))
         layout_tools_row.addWidget(save_layout_button)
         layout_tools_row.addWidget(load_layout_button)
         layout_tools_row.addWidget(reset_layout_button)
+        layout_tools_row.addWidget(workspace_manager_button)
         layout_tools_row.addStretch(1)
         data_form.addRow("화면 배치", layout_tools_panel)
         data_form.addRow("정보 저장 위치", storage_row)
