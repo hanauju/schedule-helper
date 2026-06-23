@@ -9,7 +9,8 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, QTimer
-from PySide6.QtGui import QColor, QIcon, QImage, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtGui import QColor, QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
     QBoxLayout,
@@ -35,6 +36,7 @@ from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorit
 from app.services.app_usage import ActiveWindowSnapshot
 from app.storage.database import ScheduleRepository
 from app.ui import main_window as main_window_module
+from app.ui.quick_switch_config import QuickSwitchConfigDialog
 from app.ui.main_window import (
     COMMISSION_SUMMARY_KEY,
     DASHBOARD_GRID_GAP,
@@ -789,15 +791,70 @@ def test_app_bar_shows_workspace_selector_before_settings(tmp_path) -> None:
     top_buttons = window.findChildren(QPushButton, "topBarButton")
     button_texts = [button.text() for button in top_buttons]
 
-    assert "작업공간" in button_texts
-    assert button_texts.index("작업공간") < button_texts.index("설정")
-    workspace_button = next(button for button in top_buttons if button.text() == "작업공간")
+    assert "기본 ▾" in button_texts
+    assert button_texts.index("기본 ▾") < button_texts.index("설정")
+    workspace_button = next(button for button in top_buttons if button.text() == "기본 ▾")
     assert workspace_button.objectName() == "topBarButton"
 
     menu = window._build_workspace_menu()
     action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
     assert action_texts[-1] == "워크스페이스 관리..."
     assert "업무" in action_texts
+    window.close()
+
+
+def test_workspace_button_shows_active_name(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profile = repository.save_layout_profile(LayoutProfile(name="업무", data='{"layout":{}}'))
+    assert profile.id is not None
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    window.switch_workspace(int(profile.id))
+    app.processEvents()
+
+    assert window.workspace_button.text().startswith("업무")
+    assert window.workspace_button.toolTip() == "업무"
+    window.close()
+
+
+def test_workspace_button_shows_default_when_none(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    assert window.preferences.active_workspace_id is None
+    assert window.workspace_button.text() == "기본 ▾"
+    assert window.workspace_button.toolTip() == ""
+    window.close()
+
+
+def test_long_workspace_name_ellipsized(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    long_name = "아주긴작업공간이름입니다이것은버튼에다안들어가야합니다" * 3
+    profile = repository.save_layout_profile(LayoutProfile(name=long_name, data='{"layout":{}}'))
+    assert profile.id is not None
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    window.switch_workspace(int(profile.id))
+    app.processEvents()
+
+    text = window.workspace_button.text()
+    assert text.endswith("…") or text.endswith("… ▾") or "…" in text
+    assert window.workspace_button.toolTip() == long_name
     window.close()
 
 
@@ -1370,6 +1427,49 @@ def test_settings_dialog_launches_workspace_manager(tmp_path) -> None:
     window.close()
 
 
+def test_settings_dialog_non_modal_allows_main_scroll(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.show_settings_window()
+    app.processEvents()
+
+    dialog = window._settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+    # Non-modal: show() was used, not exec(), so the dialog is not modal and
+    # the main window remains the active window the user can scroll.
+    assert not dialog.isModal()
+    assert dialog.isVisible()
+    assert window.isVisible()
+
+    dialog.reject()
+    app.processEvents()
+    assert window._settings_dialog is None
+    window.close()
+
+
+def test_legacy_layout_buttons_removed(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    dialog = SettingsDialog(repository.get_preferences(), window)
+    dialog.show()
+    app.processEvents()
+
+    button_texts = [button.text() for button in dialog.findChildren(QPushButton)]
+    assert "화면 저장" not in button_texts
+    assert "화면 불러오기" not in button_texts
+    # Reset and workspace manager buttons remain.
+    assert "기본 배치" in button_texts
+    assert "워크스페이스 관리" in button_texts
+
+    dialog.close()
+    window.close()
+
+
 def test_settings_color_picker_uses_eyedropper_cursor(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -1787,22 +1887,28 @@ def test_main_window_opens_with_datetime_panel_border_enabled(tmp_path) -> None:
     window.close()
 
 
-def test_settings_cancel_restores_live_preview_changes(tmp_path, monkeypatch) -> None:
+def test_settings_cancel_restores_live_preview_changes(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
     window.show()
     app.processEvents()
 
-    def reject_after_preview(dialog: SettingsDialog) -> QDialog.DialogCode:
-        dialog.content_font_size_spin.setValue(20)
-        dialog.show_quick_memo_panel_check.setChecked(False)
-        dialog.set_setting_color("accent", "#aa3366")
-        app.processEvents()
-        return QDialog.DialogCode.Rejected
-
-    monkeypatch.setattr(SettingsDialog, "exec", reject_after_preview)
     window.show_settings_window()
+    app.processEvents()
+    dialog = window._settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+
+    dialog.content_font_size_spin.setValue(20)
+    dialog.show_quick_memo_panel_check.setChecked(False)
+    dialog.set_setting_color("accent", "#aa3366")
+    app.processEvents()
+
+    # Live preview applied the edits to the running window without saving.
+    assert window.preferences.content_font_size == 20
+    assert window.preferences.accent_color == "#aa3366"
+
+    dialog.reject()
     app.processEvents()
 
     assert window.preferences.content_font_size == 13
@@ -4668,6 +4774,106 @@ def test_workspace_switch_refreshes_existing_feature_widget_windows_safely(tmp_p
     window.close()
 
 
+def test_switch_skips_refresh_when_unchanged(tmp_path, monkeypatch) -> None:
+    # Given: a window whose current layout state is saved verbatim as a profile,
+    # so switching to it carries identical filters/visibility/layout slices.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    state = window.current_layout_state()
+    state["filters"] = _workspace_filters()
+    profile = repository.save_layout_profile(LayoutProfile(name="동일", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    refresh_notes_calls = 0
+    refresh_checklist_calls = 0
+    refresh_widget_calls = 0
+
+    def spy_refresh_notes() -> None:
+        nonlocal refresh_notes_calls
+        refresh_notes_calls += 1
+
+    def spy_refresh_today_checklist() -> None:
+        nonlocal refresh_checklist_calls
+        refresh_checklist_calls += 1
+
+    def spy_refresh_feature_widget(_key: str | None = None) -> None:
+        nonlocal refresh_widget_calls
+        refresh_widget_calls += 1
+
+    monkeypatch.setattr(window, "refresh_notes", spy_refresh_notes)
+    monkeypatch.setattr(window, "refresh_today_checklist", spy_refresh_today_checklist)
+    monkeypatch.setattr(window, "refresh_feature_widget", spy_refresh_feature_widget)
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    # refresh_notes has no indirect call path from apply_layout_state, so the
+    # diff-based skip must keep it at 0 when filters are unchanged.
+    assert refresh_notes_calls == 0
+    # refresh_today_checklist / refresh_feature_widget are triggered indirectly
+    # by apply_layout_state (via today_checklist_widget.refresh_checklist ->
+    # refresh_today callback chain). The diff-based skip must not add a DIRECT
+    # call on top, so the count stays at the indirect-only baseline of 1.
+    assert refresh_checklist_calls == 1
+    assert refresh_widget_calls == 1
+    assert window.preferences.active_workspace_id == profile.id
+    window.close()
+
+
+def test_switch_refreshes_when_filters_change(tmp_path, monkeypatch) -> None:
+    # Given: a window and a workspace profile whose checklist filter differs
+    # from the current state. Switching must trigger the content refreshes.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    state = window.current_layout_state()
+    state["filters"] = {
+        **_workspace_filters(),
+        "checklist.show_completed": False,
+    }
+    profile = repository.save_layout_profile(LayoutProfile(name="필터 변경", data=json.dumps(state, ensure_ascii=False)))
+    assert profile.id is not None
+
+    refresh_notes_calls = 0
+    refresh_checklist_calls = 0
+    refresh_widget_calls = 0
+
+    def spy_refresh_notes() -> None:
+        nonlocal refresh_notes_calls
+        refresh_notes_calls += 1
+
+    def spy_refresh_today_checklist() -> None:
+        nonlocal refresh_checklist_calls
+        refresh_checklist_calls += 1
+
+    def spy_refresh_feature_widget(_key: str | None = None) -> None:
+        nonlocal refresh_widget_calls
+        refresh_widget_calls += 1
+
+    monkeypatch.setattr(window, "refresh_notes", spy_refresh_notes)
+    monkeypatch.setattr(window, "refresh_today_checklist", spy_refresh_today_checklist)
+    monkeypatch.setattr(window, "refresh_feature_widget", spy_refresh_feature_widget)
+
+    window.switch_workspace(profile.id)
+    app.processEvents()
+
+    # refresh_notes: one direct call from the diff-based refresh (no indirect path).
+    assert refresh_notes_calls == 1
+    # refresh_today_checklist / refresh_feature_widget: one indirect call from
+    # apply_layout_state plus one direct call from the diff-based refresh.
+    assert refresh_checklist_calls == 2
+    assert refresh_widget_calls == 2
+    assert window._active_workspace_filters["checklist.show_completed"] is False
+    window.close()
+
+
 def test_workspace_switch_preserves_current_window_geometry(tmp_path) -> None:
     # Given: a shown window sized/positioned by the user, and a workspace profile
     # whose saved window geometry deliberately differs from the current window.
@@ -4830,7 +5036,12 @@ def test_workspace_manager_create_update_rename_and_delete(tmp_path, monkeypatch
 
     repository.set_active_workspace(renamed.id)
     window.preferences.active_workspace_id = renamed.id
-    dialog.update_current_workspace()
+    window.apply_layout_state(_workspace_state(window, show_focus=True, show_quick_memo=False, show_completed=True))
+    # Applying a state does NOT autosave (that would drift the layout on every
+    # switch). A genuine layout edit (move/resize -> save_last_layout_state) is
+    # what persists the active workspace's current arrangement.
+    window.save_last_layout_state()
+    window._flush_workspace_autosave()
     updated = repository.get_layout_profile("이름 바꿈")
     assert updated is not None
     assert updated.id == created.id
@@ -4842,6 +5053,321 @@ def test_workspace_manager_create_update_rename_and_delete(tmp_path, monkeypatch
     assert repository.get_layout_profile("이름 바꿈") is None
     assert repository.get_preferences().active_workspace_id is None
     dialog.close()
+    window.close()
+
+
+def test_switching_back_and_forth_does_not_drift_stored_layout(tmp_path) -> None:
+    # Regression: switching between workspaces applies each profile's layout,
+    # which rearranges the live dashboard. The pending autosave timer must NOT
+    # persist that applied arrangement back onto the profile, or repeated
+    # switching would slowly mutate ("drift") the saved layouts.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    state_a = _workspace_state(window, show_focus=True, show_quick_memo=True)
+    state_b = _workspace_state(window, show_focus=False, show_quick_memo=False)
+    profile_a = repository.save_layout_profile(
+        LayoutProfile(name="A", data=json.dumps(state_a, ensure_ascii=False))
+    )
+    profile_b = repository.save_layout_profile(
+        LayoutProfile(name="B", data=json.dumps(state_b, ensure_ascii=False))
+    )
+    assert profile_a.id is not None
+    assert profile_b.id is not None
+    saved_a = _profile_data(repository, "A")
+    saved_b = _profile_data(repository, "B")
+
+    # Simulate real usage: flip back and forth, letting the autosave timer fire
+    # after each switch (which is what previously corrupted the profiles).
+    for index in range(6):
+        window.switch_workspace(int(profile_a.id if index % 2 == 0 else profile_b.id))
+        app.processEvents()
+        window._flush_workspace_autosave()
+        app.processEvents()
+
+    assert _profile_data(repository, "A") == saved_a
+    assert _profile_data(repository, "B") == saved_b
+    window.close()
+
+
+def _asymmetric_workspaces(window: MainWindow) -> tuple[dict[str, object], dict[str, object]]:
+    """Two workspaces whose VISIBLE panel sets differ, with explicit positions.
+
+    The hidden panels of one are the visible panels of the other, so switching
+    between them exercises the newly-visible-panel placement path.
+    """
+    base = window.current_layout_state()
+
+    def make(visible_keys: set[str], positions: dict[str, tuple[int, int]]) -> dict[str, object]:
+        state = json.loads(json.dumps(base))
+        for key in list(state["visible"].keys()):
+            state["visible"][key] = key in visible_keys
+        for item in state["layout"]["dashboard"]:
+            if item["key"] in positions:
+                item["x"], item["y"] = positions[item["key"]]
+        return state
+
+    work = make(
+        {"focus", "today_timeline", "today_checklist", "header_banner"},
+        {"focus": (0, 3), "today_timeline": (9, 3), "today_checklist": (6, 3)},
+    )
+    memo = make(
+        {"quick_memo", "link_favorites", "media_panel", "header_banner"},
+        {"quick_memo": (0, 3), "link_favorites": (4, 3), "media_panel": (8, 3)},
+    )
+    return work, memo
+
+
+def test_switching_between_differently_visible_workspaces_keeps_dashboard_stable(tmp_path) -> None:
+    # Regression: when two workspaces expose different visible panels, the panels
+    # that become visible on a switch must keep the incoming profile's stored x/y
+    # instead of being re-flowed as if the user had just manually re-added them.
+    # Otherwise the rendered dashboard drifts (panels creep left) on every switch.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    work, memo = _asymmetric_workspaces(window)
+    id_work = int(repository.save_layout_profile(LayoutProfile(name="Work", data=json.dumps(work, ensure_ascii=False))).id)
+    id_memo = int(repository.save_layout_profile(LayoutProfile(name="Memo", data=json.dumps(memo, ensure_ascii=False))).id)
+
+    def dashboard() -> dict[str, tuple[int, int, int, int]]:
+        return {
+            str(item["key"]): (item["x"], item["y"], item["w"], item["h"])
+            for item in window.current_layout_state()["layout"]["dashboard"]
+        }
+
+    window.switch_workspace(id_work)
+    app.processEvents()
+    first = dashboard()
+    for _ in range(4):
+        window.switch_workspace(id_memo)
+        app.processEvents()
+        window.switch_workspace(id_work)
+        app.processEvents()
+    second = dashboard()
+
+    for key in ("focus", "today_timeline", "today_checklist"):
+        assert first[key] == second[key], f"{key} drifted {first[key]} -> {second[key]}"
+    window.close()
+
+
+def test_applying_workspace_layout_round_trips_losslessly(tmp_path) -> None:
+    # Regression: apply(state) then current_layout_state() must reproduce the
+    # applied splitters/dashboard. If reading back differs, the first edit after a
+    # switch persists the re-read approximation and the saved workspace drifts.
+    # (Detached dashboard-mode splitters previously failed this round-trip.)
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    state = _workspace_state(window, show_focus=True, show_quick_memo=True)
+    window.apply_layout_state(json.loads(json.dumps(state)), include_window=False)
+    app.processEvents()
+
+    read_back = window.current_layout_state()
+    read_back.pop("window", None)
+    expected = json.loads(json.dumps(state))
+    expected.pop("window", None)
+    assert read_back["splitters"] == expected["splitters"]
+    assert read_back["layout"]["dashboard"] == expected["layout"]["dashboard"]
+    window.close()
+
+
+def test_workspace_order_persists_and_reflects_in_menu(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    first = repository.save_layout_profile(LayoutProfile(name="첫째", data=json.dumps(window.current_layout_state(), ensure_ascii=False)))
+    second = repository.save_layout_profile(LayoutProfile(name="둘째", data=json.dumps(window.current_layout_state(), ensure_ascii=False)))
+    assert first.id is not None
+    assert second.id is not None
+
+    dialog = WorkspaceManagerDialog(repository, window)
+    dialog.show()
+    app.processEvents()
+
+    # Given: the dialog lists profiles in repository display_order (first then second).
+    assert [dialog.profile_list.item(row).text() for row in range(dialog.profile_list.count())] == ["첫째", "둘째"]
+
+    # When: the user moves the selected "첫째" workspace down.
+    dialog.profile_list.setCurrentRow(0)
+    dialog.move_selected_workspace_down()
+    app.processEvents()
+
+    # Then: repository order persisted as [second, first]...
+    assert [profile.name for profile in repository.list_user_workspace_profiles()] == ["둘째", "첫째"]
+    # ...and the dialog list reflects the new order with the moved row still selected.
+    assert [dialog.profile_list.item(row).text() for row in range(dialog.profile_list.count())] == ["둘째", "첫째"]
+    assert dialog.profile_list.currentRow() == 1
+
+    # And: _build_workspace_menu lists workspace actions (excluding separator/manage/quick-config) in the same order.
+    menu = window._build_workspace_menu()
+    workspace_action_texts = [
+        action.text()
+        for action in menu.actions()
+        if not action.isSeparator() and action.text() != "워크스페이스 관리..." and action.text() != "빠른 전환 버튼 설정..."
+    ]
+    assert workspace_action_texts == ["둘째", "첫째"]
+
+    dialog.close()
+    window.close()
+
+
+def test_workspace_panel_changes_autosave(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="자동저장", data=json.dumps(window.current_layout_state(), ensure_ascii=False))
+    )
+    assert profile.id is not None
+    window.switch_workspace(profile.id)
+    assert window.preferences.active_workspace_id == profile.id
+
+    original_data = repository.get_layout_profile("자동저장").data
+    window.preferences.show_focus_panel = not window.preferences.show_focus_panel
+    window.apply_preferences()
+    window.save_last_layout_state()
+
+    app.processEvents()
+    QTest.qWait(500)
+    app.processEvents()
+
+    autosaved = repository.get_layout_profile("자동저장")
+    assert autosaved is not None
+    assert autosaved.data != original_data
+    assert json.loads(autosaved.data)["visible"]["focus"] is window.preferences.show_focus_panel
+    window.close()
+
+
+def test_datetime_panel_visibility_persists_across_workspace_switch(tmp_path) -> None:
+    # Regression for BUG 3: toggling the datetime panel via the settings dialog
+    # while in a workspace must persist to that workspace, so switching away and
+    # back restores the datetime panel visibility.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # Start with datetime panel hidden.
+    assert not window.preferences.show_datetime_panel
+
+    # Create a workspace from the current state (datetime off).
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="날짜꺼짐", data=json.dumps(window.current_layout_state(), ensure_ascii=False))
+    )
+    assert profile.id is not None
+    window.switch_workspace(int(profile.id))
+    app.processEvents()
+    assert window.preferences.active_workspace_id == int(profile.id)
+    assert not window.preferences.show_datetime_panel
+
+    # Toggle datetime panel ON via the settings dialog and accept.
+    window.show_settings_window()
+    app.processEvents()
+    dialog = window._settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+    dialog.show_datetime_panel_check.setChecked(True)
+    dialog.accept()
+    app.processEvents()
+
+    assert window.preferences.show_datetime_panel
+    # The workspace profile must now reflect datetime=True.
+    saved = repository.get_layout_profile("날짜꺼짐")
+    assert saved is not None
+    assert json.loads(saved.data)["visible"]["datetime"] is True
+
+    # Switch to a second workspace (datetime off by default), then back.
+    other_profile = repository.save_layout_profile(
+        LayoutProfile(name="다른화면", data=json.dumps(window.default_layout_state(), ensure_ascii=False))
+    )
+    assert other_profile.id is not None
+    window.switch_workspace(int(other_profile.id))
+    app.processEvents()
+    assert not window.preferences.show_datetime_panel
+
+    window.switch_workspace(int(profile.id))
+    app.processEvents()
+    # The datetime panel must be visible again after switching back.
+    assert window.preferences.show_datetime_panel
+    window.close()
+
+
+def test_no_active_workspace_falls_back_to_last_layout_state(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    assert window.preferences.active_workspace_id is None
+    original_last_state = window.preferences.last_layout_state
+
+    window.preferences.show_focus_panel = not window.preferences.show_focus_panel
+    window.apply_preferences()
+    window.save_last_layout_state()
+    app.processEvents()
+
+    assert window.preferences.active_workspace_id is None
+    assert window.preferences.last_layout_state != original_last_state
+    window.close()
+
+
+def test_autosave_debounces_rapid_changes(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    profile = repository.save_layout_profile(
+        LayoutProfile(name="디바운스", data=json.dumps(window.current_layout_state(), ensure_ascii=False))
+    )
+    assert profile.id is not None
+    window.switch_workspace(profile.id)
+
+    write_count = 0
+    original_update = repository.update_layout_profile_data
+
+    def counting_update(profile_id: int, data: str) -> LayoutProfile | None:
+        nonlocal write_count
+        write_count += 1
+        return original_update(profile_id, data)
+
+    monkeypatch.setattr(repository, "update_layout_profile_data", counting_update)
+
+    for _ in range(5):
+        window.preferences.show_focus_panel = not window.preferences.show_focus_panel
+        window.apply_preferences()
+        window.save_last_layout_state()
+        app.processEvents()
+
+    QTest.qWait(500)
+    app.processEvents()
+
+    assert write_count <= 1
     window.close()
 
 
@@ -4874,18 +5400,68 @@ def test_legacy_layout_profiles_are_visible_as_workspaces_with_default_filters(t
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     legacy_profile = repository.save_layout_profile(LayoutProfile(name="예전 화면", data='{"layout":{}}'))
     assert legacy_profile.id is not None
+    # Legacy profiles predate the is_workspace flag; mark this one as a non-workspace
+    # profile so it should be excluded from the workspace menu while remaining
+    # switchable directly.
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET is_workspace = 0 WHERE id = ?",
+            (legacy_profile.id,),
+        )
     window = MainWindow(repository)
-    dialog = WorkspaceManagerDialog(repository, window)
-    dialog.show()
-    app.processEvents()
 
-    assert [dialog.profile_list.item(row).text() for row in range(dialog.profile_list.count())] == ["예전 화면"]
+    # The workspace menu lists only user-created workspaces (is_workspace = 1).
+    menu = window._build_workspace_menu()
+    menu_action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
+    assert "예전 화면" not in menu_action_texts
+    assert menu_action_texts[-1] == "워크스페이스 관리..."
 
     window.switch_workspace(legacy_profile.id)
     app.processEvents()
 
     assert window._active_workspace_filters == _workspace_filters()
-    dialog.close()
+    window.close()
+
+
+def test_workspace_menu_lists_only_user_created_workspaces(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    user1 = repository.save_layout_profile(
+        LayoutProfile(
+            name="업무",
+            data=json.dumps(_workspace_state(window, show_focus=True, show_quick_memo=True), ensure_ascii=False),
+        )
+    )
+    user2 = repository.save_layout_profile(
+        LayoutProfile(
+            name="리뷰",
+            data=json.dumps(_workspace_state(window, show_focus=False, show_quick_memo=True), ensure_ascii=False),
+        )
+    )
+    assert user1.id is not None
+    assert user2.id is not None
+    legacy = repository.save_layout_profile(LayoutProfile(name="예전 화면", data='{"layout":{}}'))
+    assert legacy.id is not None
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET is_workspace = 0 WHERE id = ?",
+            (legacy.id,),
+        )
+
+    menu = window._build_workspace_menu()
+    actions = menu.actions()
+    action_texts = [action.text() for action in actions if not action.isSeparator()]
+    separators = [action for action in actions if action.isSeparator()]
+    assert action_texts == ["업무", "리뷰", "빠른 전환 버튼 설정...", "워크스페이스 관리..."]
+    assert "예전 화면" not in action_texts
+    assert len(separators) == 1
+    assert separators[0] is actions[-3]
+    assert actions[-1].text() == "워크스페이스 관리..."
     window.close()
 
 
@@ -6487,4 +7063,572 @@ def test_main_window_resize_hides_stale_dashboard_guides(tmp_path) -> None:
     assert overlay.preview_rect.isNull()
     assert overlay.impact_rects == []
 
+    window.close()
+
+
+def test_readd_panel_restores_original_slot(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = True
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = True
+    window.preferences.show_today_checklist_inline = True
+    window.preferences.show_link_favorites_panel = True
+
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 3, "h": 7},
+        {"key": "quick_memo", "x": 3, "y": 0, "w": 3, "h": 5},
+        {"key": "today_checklist", "x": 6, "y": 0, "w": 3, "h": 6},
+        {"key": "pomodoro", "x": 9, "y": 0, "w": 3, "h": 4},
+        {"key": "link_favorites", "x": 0, "y": 7, "w": 3, "h": 4},
+        {"key": "today_timeline", "x": 3, "y": 7, "w": 3, "h": 8},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    # Record the saved slot, then hide the panel.
+    saved_slot = next(
+        dict(item) for item in window._current_feature_dashboard_layout() if item["key"] == "quick_memo"
+    )
+    window.hide_feature_from_main("quick_memo")
+    app.processEvents()
+    assert not window.preferences.show_quick_memo_panel
+    assert "quick_memo" in window.hidden_panel_positions
+    assert window.hidden_panel_positions["quick_memo"]["x"] == saved_slot["x"]
+    assert window.hidden_panel_positions["quick_memo"]["y"] == saved_slot["y"]
+
+    # Re-show the panel; the saved slot is empty so it should restore.
+    window.preferences.show_quick_memo_panel = True
+    window.apply_preferences()
+    app.processEvents()
+
+    restored = next(
+        item for item in window._current_feature_dashboard_layout() if item["key"] == "quick_memo"
+    )
+    assert restored["x"] == saved_slot["x"]
+    assert restored["y"] == saved_slot["y"]
+    assert "quick_memo" not in window.hidden_panel_positions
+    window.close()
+
+
+def test_readd_panel_fills_bottom_left_when_no_slot(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1600, 900)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = True
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = False
+    window.preferences.show_today_timeline_inline = False
+    window.preferences.show_today_checklist_inline = False
+    window.preferences.show_link_favorites_panel = False
+
+    # Two panels share a row; quick_memo is at (6,0). After hiding it, we move
+    # focus into quick_memo's saved slot so restore cannot land there.
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 6, "h": 7},
+        {"key": "quick_memo", "x": 6, "y": 0, "w": 6, "h": 5},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    saved_slot = next(
+        dict(item) for item in window._current_feature_dashboard_layout() if item["key"] == "quick_memo"
+    )
+    window.hide_feature_from_main("quick_memo")
+    app.processEvents()
+
+    # Move focus into the saved slot so it is occupied, and make it fill the row.
+    window.feature_dashboard_items = [
+        {"key": "focus", "x": 0, "y": 0, "w": 12, "h": 7},
+    ]
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    # The saved slot is now occupied; re-showing must not restore it.
+    window.preferences.show_quick_memo_panel = True
+    window.apply_preferences()
+    app.processEvents()
+
+    restored = next(
+        item for item in window._current_feature_dashboard_layout() if item["key"] == "quick_memo"
+    )
+    assert restored["x"] == 0
+    # The panel lands on a new row below the existing one, not at the saved y.
+    assert restored["y"] > saved_slot["y"]
+    visible_rows = [
+        int(item.get("y", 0))
+        for item in window._current_feature_dashboard_layout()
+        if window._feature_should_be_visible(str(item.get("key", "")))
+    ]
+    assert restored["y"] == max(visible_rows)
+    window.close()
+
+
+def test_readd_panel_auto_scrolls_to_panel(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = True
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = True
+    window.preferences.show_today_checklist_inline = True
+    window.preferences.show_link_favorites_panel = True
+
+    # Stack many tall panels so the dashboard scrolls well past the viewport.
+    items: list[dict[str, object]] = [
+        {"key": "focus", "x": 0, "y": 0, "w": 6, "h": 8},
+        {"key": "today_timeline", "x": 6, "y": 0, "w": 6, "h": 8},
+        {"key": "quick_memo", "x": 0, "y": 8, "w": 6, "h": 8},
+        {"key": "today_checklist", "x": 6, "y": 8, "w": 6, "h": 8},
+        {"key": "pomodoro", "x": 0, "y": 16, "w": 6, "h": 8},
+        {"key": "link_favorites", "x": 6, "y": 16, "w": 6, "h": 8},
+    ]
+    window.feature_dashboard_items = items
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    window.hide_feature_from_main("link_favorites")
+    app.processEvents()
+
+    # Scroll to the top so the re-added panel is well outside the viewport.
+    scroll = window.full_scroll_area
+    scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().minimum())
+    app.processEvents()
+
+    window.preferences.show_link_favorites_panel = True
+    window.apply_preferences()
+    app.processEvents()
+
+    cell = window.feature_cells.get("link_favorites")
+    assert cell is not None
+    content = scroll.widget()
+    cell_top = cell.mapTo(content, QPoint(0, 0)).y()
+    viewport_top = scroll.verticalScrollBar().value()
+    viewport_bottom = viewport_top + scroll.viewport().height()
+    assert viewport_top <= cell_top <= viewport_bottom
+    window.close()
+
+
+def test_readd_panel_auto_scrolls_to_bottom_row_panel(tmp_path) -> None:
+    # Regression for BUG 4: a panel re-added on a NEW bottom row (dashboard full)
+    # must scroll so the panel's bottom edge is visible, not just its top.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(800, 600)
+    window.show()
+    app.processEvents()
+
+    window.preferences.show_datetime_panel = False
+    window.preferences.show_focus_panel = True
+    window.preferences.show_header_banner = False
+    window.preferences.show_quick_memo_panel = True
+    window.preferences.show_media_panel = False
+    window.preferences.show_media_panel_2 = False
+    window.preferences.show_media_panel_3 = False
+    window.preferences.show_media_panel_4 = False
+    window.preferences.show_pomodoro_controls = True
+    window.preferences.show_today_timeline_inline = True
+    window.preferences.show_today_checklist_inline = True
+    window.preferences.show_link_favorites_panel = True
+
+    # Fill the dashboard so the re-added panel lands on a new bottom row.
+    items: list[dict[str, object]] = [
+        {"key": "focus", "x": 0, "y": 0, "w": 6, "h": 8},
+        {"key": "today_timeline", "x": 6, "y": 0, "w": 6, "h": 8},
+        {"key": "quick_memo", "x": 0, "y": 8, "w": 6, "h": 8},
+        {"key": "today_checklist", "x": 6, "y": 8, "w": 6, "h": 8},
+        {"key": "pomodoro", "x": 0, "y": 16, "w": 6, "h": 8},
+        {"key": "link_favorites", "x": 6, "y": 16, "w": 6, "h": 8},
+    ]
+    window.feature_dashboard_items = items
+    window._render_feature_dashboard()
+    app.processEvents()
+
+    window.hide_feature_from_main("link_favorites")
+    app.processEvents()
+
+    # Scroll to the top so the re-added bottom-row panel is far outside the viewport.
+    scroll = window.full_scroll_area
+    scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().minimum())
+    app.processEvents()
+
+    window.preferences.show_link_favorites_panel = True
+    window.apply_preferences()
+    app.processEvents()
+
+    cell = window.feature_cells.get("link_favorites")
+    assert cell is not None
+    content = scroll.widget()
+    cell_bottom = cell.mapTo(content, QPoint(0, cell.height())).y()
+    viewport_top = scroll.verticalScrollBar().value()
+    viewport_bottom = viewport_top + scroll.viewport().height()
+    # The entire cell (including its bottom edge) must be within the viewport.
+    assert cell_bottom <= viewport_bottom
+    window.close()
+
+
+def _press_key(window, key) -> None:
+    event = QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
+    window.keyPressEvent(event)
+
+
+def test_f11_toggles_fullscreen_hides_title_bar(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    chrome_bar = window.app_chrome_bar
+    assert chrome_bar.isVisible()
+
+    _press_key(window, Qt.Key.Key_F11)
+    app.processEvents()
+    assert window.isFullScreen()
+    assert not chrome_bar.isVisible()
+
+    _press_key(window, Qt.Key.Key_F11)
+    app.processEvents()
+    assert not window.isFullScreen()
+    assert chrome_bar.isVisible()
+
+    window.close()
+
+
+def test_f11_or_esc_restores_pre_fullscreen_size(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.resize(1100, 700)
+    app.processEvents()
+
+    # F11 -> F11 restores the pre-fullscreen size.
+    _press_key(window, Qt.Key.Key_F11)
+    app.processEvents()
+    assert window.isFullScreen()
+    _press_key(window, Qt.Key.Key_F11)
+    app.processEvents()
+    assert not window.isFullScreen()
+    assert (window.width(), window.height()) == (1100, 700)
+
+    # F11 -> Esc restores the pre-fullscreen size.
+    _press_key(window, Qt.Key.Key_F11)
+    app.processEvents()
+    assert window.isFullScreen()
+    _press_key(window, Qt.Key.Key_Escape)
+    app.processEvents()
+    assert not window.isFullScreen()
+    assert (window.width(), window.height()) == (1100, 700)
+
+    window.close()
+
+
+def test_esc_does_not_close_app_when_not_fullscreen(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    assert window.isVisible()
+    _press_key(window, Qt.Key.Key_Escape)
+    app.processEvents()
+    # Esc must not close the app when not fullscreen.
+    assert window.isVisible()
+    assert not window.closing
+
+    window.close()
+
+
+def _seed_quick_switch_profiles(repository: ScheduleRepository) -> list[LayoutProfile]:
+    profiles = [
+        repository.save_layout_profile(LayoutProfile(name=f"작업공간 {i}", data='{"layout":{}}'))
+        for i in range(1, 7)
+    ]
+    for profile in profiles:
+        assert profile.id is not None
+    return profiles
+
+
+def _set_quick_config(repository: ScheduleRepository, entries: list[dict[str, object]]) -> None:
+    repository.set_quick_button_config(entries)
+
+
+def test_quick_switch_buttons_switch_workspace(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#68a8f5", "visible": True},
+        {"workspace_id": int(profiles[1].id), "shape": "heart", "color": "#ef8f8f", "visible": True},
+        {"workspace_id": int(profiles[2].id), "shape": "star", "color": "#f5c869", "visible": True},
+    ])
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    buttons = window._quick_switch_buttons
+    assert len(buttons) == 3
+    # Click the 2nd button -> active workspace switches to profiles[1].
+    buttons[1]._on_click(buttons[1].workspace_id)
+    app.processEvents()
+    assert window.preferences.active_workspace_id == int(profiles[1].id)
+    window.close()
+
+
+def test_quick_switch_button_real_click_switches_workspace(tmp_path) -> None:
+    # Given quick-switch buttons rendered as real push buttons.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#68a8f5", "visible": True},
+        {"workspace_id": int(profiles[1].id), "shape": "heart", "color": "#ef8f8f", "visible": True},
+        {"workspace_id": int(profiles[2].id), "shape": "star", "color": "#f5c869", "visible": True},
+    ])
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    buttons = window._quick_switch_buttons
+    assert len(buttons) == 3
+    assert isinstance(buttons[2], QPushButton)
+    # When the 3rd button is clicked via the real QPushButton click signal.
+    buttons[2].click()
+    app.processEvents()
+    # Then the active workspace switches to that button's workspace.
+    assert window.preferences.active_workspace_id == int(profiles[2].id)
+    window.close()
+
+
+def test_quick_switch_button_single_mouse_release_switches(tmp_path) -> None:
+    # A real press+release on the chip (no drag) must switch in ONE click, not
+    # be swallowed as a no-op reorder.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#68a8f5", "visible": True},
+        {"workspace_id": int(profiles[1].id), "shape": "star", "color": "#ef8f8f", "visible": True},
+        {"workspace_id": int(profiles[2].id), "shape": "moon", "color": "#7a5af5", "visible": True},
+    ])
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+    window.switch_workspace(int(profiles[0].id))
+    app.processEvents()
+
+    buttons = window._quick_switch_buttons
+    assert len(buttons) == 3
+    # When a single real mouse press+release lands on the 2nd chip center.
+    target = buttons[1]
+    QTest.mouseClick(target, Qt.MouseButton.LeftButton, Qt.KeyboardModifier.NoModifier, target.rect().center())
+    app.processEvents()
+    # Then it switches on that one click.
+    assert window.preferences.active_workspace_id == int(profiles[1].id)
+    window.close()
+
+
+def test_quick_switch_buttons_max_five(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    # Configure 6 entries; the 6th must be rejected by normalize_quick_config.
+    config: list[dict[str, object]] = []
+    for index, profile in enumerate(profiles[:6]):
+        config.append({
+            "workspace_id": int(profile.id),
+            "shape": "dot",
+            "color": "#68a8f5",
+            "visible": True,
+        })
+    _set_quick_config(repository, config)
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    buttons = window._quick_switch_buttons
+    assert len(buttons) == 5
+    # The 6th workspace must not appear in the row.
+    sixth_id = int(profiles[5].id)
+    assert all(button.workspace_id != sixth_id for button in buttons)
+    window.close()
+
+
+def test_quick_switch_active_button_highlighted(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#68a8f5", "visible": True},
+        {"workspace_id": int(profiles[1].id), "shape": "heart", "color": "#ef8f8f", "visible": True},
+        {"workspace_id": int(profiles[2].id), "shape": "star", "color": "#f5c869", "visible": True},
+    ])
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # Switch to the 2nd workspace.
+    window.switch_workspace(int(profiles[1].id))
+    app.processEvents()
+
+    buttons = window._quick_switch_buttons
+    assert len(buttons) == 3
+    # The 2nd button (index 1) should be active, others not.
+    assert buttons[1]._active is True
+    assert buttons[0]._active is False
+    assert buttons[2]._active is False
+    window.close()
+
+
+def test_quick_switch_drag_reorder(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#68a8f5", "visible": True},
+        {"workspace_id": int(profiles[1].id), "shape": "heart", "color": "#ef8f8f", "visible": True},
+        {"workspace_id": int(profiles[2].id), "shape": "star", "color": "#f5c869", "visible": True},
+    ])
+
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # Programmatically reorder slot 0 -> slot 2.
+    window._reorder_quick_switch(0, 2)
+    app.processEvents()
+
+    reloaded = repository.get_quick_button_config()
+    assert [entry["workspace_id"] for entry in reloaded] == [
+        int(profiles[1].id),
+        int(profiles[2].id),
+        int(profiles[0].id),
+    ]
+
+    buttons = window._quick_switch_buttons
+    assert [button.workspace_id for button in buttons] == [
+        int(profiles[1].id),
+        int(profiles[2].id),
+        int(profiles[0].id),
+    ]
+    window.close()
+
+
+def test_quick_switch_config_dialog_preserves_saved_color(tmp_path) -> None:
+    # Given a saved quick-switch config with a real hex color per slot.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    saved_color = "#ef8f8f"
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "heart", "color": saved_color, "visible": True},
+    ])
+
+    # When the config dialog is opened and accepted without re-picking the color,
+    # the color must round-trip as the saved hex, not the button label "색".
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    dialog = QuickSwitchConfigDialog(repository, repository.get_quick_button_config(), window)
+    app.processEvents()
+    accepted_config = dialog.config()
+
+    assert len(accepted_config) == 1
+    assert accepted_config[0]["color"] == saved_color
+    assert accepted_config[0]["color"] != "색"
+    dialog.close()
+    window.close()
+
+
+def test_quick_switch_config_dialog_default_color_when_slot_empty(tmp_path) -> None:
+    # A slot with no saved color falls back to the default hex, never the label text.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    dialog = QuickSwitchConfigDialog(repository, [], window)
+    app.processEvents()
+    # Pick a workspace in slot 0 but never touch the color button.
+    dialog._rows[0].workspace_combo.setCurrentIndex(1)
+    accepted_config = dialog.config()
+
+    assert len(accepted_config) == 1
+    assert accepted_config[0]["color"] != "색"
+    dialog.close()
+    window.close()
+
+
+def test_quick_switch_config_dialog_applies_picked_color(tmp_path) -> None:
+    # Given a config dialog with a workspace chosen in slot 0 and a saved color.
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    profiles = _seed_quick_switch_profiles(repository)
+    _set_quick_config(repository, [
+        {"workspace_id": int(profiles[0].id), "shape": "dot", "color": "#ef8f8f", "visible": True},
+    ])
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    dialog = QuickSwitchConfigDialog(repository, repository.get_quick_button_config(), window)
+    app.processEvents()
+
+    # When a new color is applied to slot 0 (as the palette popover's set_color does).
+    dialog._rows[0].color = "#00ff00"
+    picked_config = dialog.config()
+
+    # Then config() reflects the live row color, not the previously saved snapshot.
+    assert len(picked_config) == 1
+    assert picked_config[0]["color"] == "#00ff00"
+    dialog.close()
     window.close()

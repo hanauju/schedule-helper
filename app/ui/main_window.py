@@ -8,7 +8,7 @@ import shutil
 import sys
 import webbrowser
 from ctypes import wintypes
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from html.parser import HTMLParser
 from collections.abc import Callable
 from datetime import date, datetime, time, timedelta
@@ -27,12 +27,14 @@ from PySide6.QtGui import (
     QFontDatabase,
     QGuiApplication,
     QIcon,
+    QKeyEvent,
     QKeySequence,
     QMovie,
     QPainter,
     QPainterPath,
     QPalette,
     QPen,
+    QFontMetrics,
     QPixmap,
     QShortcut,
     QTextCursor,
@@ -92,12 +94,23 @@ from app.services.app_usage import WindowsActiveWindowProvider
 from app.services.focus_timer import FocusTimerService, decode_focus_targets
 from app.ui.metadata_widgets import PinBadge, SortDirectionButton, TagAssignmentDialog, TagBadge
 from app.ui.orot_brand import OROT_RING_COLOR, build_orot_brand
+from app.ui.quick_switch import MAX_QUICK_BUTTONS, QuickShape, QuickSwitchButton, _normalize_shape, normalize_quick_config
+from app.ui.quick_switch_config import QuickSwitchConfigDialog
 from app.storage.database import (
     ScheduleRepository,
     WorkspaceFilters,
     default_database_path,
     set_configured_database_path,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkspaceStateSignature:
+    """Diff-relevant slices of a workspace layout state for refresh skipping."""
+
+    filters: WorkspaceFilters
+    visible: dict[str, object]
+    layout_fingerprint: str
 
 
 FEATURE_MIME_TYPE = "application/x-schedule-helper-feature"
@@ -109,6 +122,7 @@ DASHBOARD_LEGACY_GAP = 16
 DASHBOARD_GRID_COLUMNS = 12
 DASHBOARD_GRID_ROW_HEIGHT = 42
 PANEL_CONTROL_HEIGHT = 40
+TOP_BAR_CONTROL_HEIGHT = 32
 PANEL_MOVE_BAR_HEIGHT = 10
 PANEL_HANDLE_CONTENT_GAP = 1
 PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
@@ -120,6 +134,7 @@ WRITING_LIBRARY_KEY: Final = "writing_library"  # reserved for deferred writing/
 COMMISSION_SUMMARY_KEY: Final = "commission_summary"  # reserved for deferred writing/commission/weekly-plan features
 WEEKLY_PLAN_KEY: Final = "weekly_plan"  # reserved for deferred writing/commission/weekly-plan features
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
+WORKSPACE_BUTTON_MAX_WIDTH = 180  # px; longer workspace names elide with "…" and show full name as tooltip
 KOREAN_FONT_FILES = (
     "malgun.ttf",
     "malgunbd.ttf",
@@ -2924,6 +2939,8 @@ class MainWindow(QMainWindow):
         self.closing = False
         self._normal_window_size: QSize | None = None
         self._suppress_normal_size_tracking = False
+        self._fullscreen_pre_size: QSize | None = None
+        self._fullscreen_hint_shown = False
         self.break_until: datetime | None = None
         self.preferences = self.repository.get_preferences()
         self._active_workspace_filters = self._normalize_workspace_filters({})
@@ -2938,6 +2955,16 @@ class MainWindow(QMainWindow):
         self.pomodoro_tick_timer = QTimer(self)
         self.pomodoro_tick_timer.setInterval(1000)
         self.pomodoro_tick_timer.timeout.connect(self.on_pomodoro_tick)
+        self._workspace_autosave_timer = QTimer(self)
+        self._workspace_autosave_timer.setSingleShot(True)
+        self._workspace_autosave_timer.setInterval(400)
+        self._workspace_autosave_timer.timeout.connect(self._save_current_workspace_state)
+        # Guards autosave while we are APPLYING a saved layout (switch/restore/
+        # load/reset). Without it, applying a workspace re-packs the dashboard and
+        # the autosave writes that re-packed layout back to the profile, so simply
+        # switching back and forth drifts the saved layout. Genuine user edits
+        # (move/resize panels) happen outside apply_layout_state and still autosave.
+        self._suppress_workspace_autosave = False
         self.pomodoro_mode = "focus"
         self.pomodoro_remaining_seconds = 0
         self.pomodoro_total_seconds = 0
@@ -3008,6 +3035,14 @@ class MainWindow(QMainWindow):
         self.feature_layout_rows: list[dict[str, object]] = []
         self.feature_dashboard_items: list[dict[str, object]] = []
         self.feature_row_splitters: list[QSplitter] = []
+        self.hidden_panel_positions: dict[str, dict[str, int]] = {}
+        self._last_dashboard_visible_keys: set[str] | None = None
+        self._pending_readd_keys: set[str] = set()
+        # True only while a stored workspace/layout is being applied. In that
+        # window every panel already carries authoritative x,y from the saved
+        # profile, so panels that become visible must NOT be treated as manual
+        # re-adds (which would discard their stored position and re-flow them).
+        self._applying_layout_state: bool = False
         self.feature_cells: dict[str, FeatureCell] = {}
         self.feature_floating_cells: dict[str, FeatureCell] = {}
         self.media_preview_labels: dict[str, MediaPreviewLabel] = {}
@@ -3134,6 +3169,19 @@ class MainWindow(QMainWindow):
             self.preferences.app_title or "오롯"
         )
         layout.addWidget(brand)
+
+        # Quick-switch buttons sit immediately to the right of the brand title,
+        # before the focus card / stretch / action buttons, so they read as part
+        # of the brand lockup rather than trailing action controls.
+        self.quick_switch_row = QWidget()
+        self.quick_switch_row.setObjectName("quickSwitchRow")
+        quick_switch_layout = QHBoxLayout(self.quick_switch_row)
+        quick_switch_layout.setContentsMargins(0, 0, 0, 0)
+        quick_switch_layout.setSpacing(5)
+        layout.addWidget(self.quick_switch_row)
+        self._quick_switch_buttons: list[QuickSwitchButton] = []
+        self._refresh_quick_switch_buttons()
+
         self.header_focus_card = self._build_header_focus_card()
         layout.addWidget(self.header_focus_card)
         self.header_focus_card.hide()
@@ -3147,25 +3195,26 @@ class MainWindow(QMainWindow):
 
         date_review_button = QPushButton("날짜별 보기")
         date_review_button.setObjectName("topBarButton")
-        _stabilize_control(date_review_button, 106)
+        _stabilize_top_bar_button(date_review_button, 106)
         date_review_button.clicked.connect(self.show_date_review_window)
         actions_layout.addWidget(date_review_button)
 
         task_folder_button = QPushButton("할 일 폴더")
         task_folder_button.setObjectName("topBarButton")
-        _stabilize_control(task_folder_button, 104)
+        _stabilize_top_bar_button(task_folder_button, 104)
         task_folder_button.clicked.connect(self.show_task_folder_settings)
         actions_layout.addWidget(task_folder_button)
 
-        self.workspace_button = QPushButton("작업공간")
+        self.workspace_button = QPushButton("기본")
         self.workspace_button.setObjectName("topBarButton")
-        _stabilize_control(self.workspace_button, 92)
+        _stabilize_top_bar_button(self.workspace_button, 92)
+        self.workspace_button.setMaximumWidth(WORKSPACE_BUTTON_MAX_WIDTH + 24)  # leave room for the " ▾" marker
         self.workspace_button.clicked.connect(self.show_workspace_menu)
         actions_layout.addWidget(self.workspace_button)
 
         settings_button = QPushButton("설정")
         settings_button.setObjectName("topBarButton")
-        _stabilize_control(settings_button, 78)
+        _stabilize_top_bar_button(settings_button, 78)
         settings_button.clicked.connect(self.show_settings_window)
         actions_layout.addWidget(settings_button)
 
@@ -3177,7 +3226,7 @@ class MainWindow(QMainWindow):
 
         self.compact_button = QPushButton("통합 위젯")
         self.compact_button.setObjectName("topBarButton")
-        _stabilize_control(self.compact_button, 94)
+        _stabilize_top_bar_button(self.compact_button, 94)
         self.compact_button.clicked.connect(self.open_compact_widget)
         actions_layout.addWidget(self.compact_button)
 
@@ -4947,6 +4996,9 @@ class MainWindow(QMainWindow):
                 border-top-left-radius: 8px;
                 border-top-right-radius: 8px;
             }
+            QWidget#quickSwitchRow {
+                background: transparent;
+            }
             QWidget#featureGrid {
                 background: transparent;
             }
@@ -6586,6 +6638,9 @@ class MainWindow(QMainWindow):
         self.apply_layout_state(state, include_visibility=False)
 
     def save_last_layout_state(self) -> None:
+        if self.preferences.active_workspace_id is not None:
+            self._schedule_workspace_autosave()
+            return
         state = self.current_layout_state()
         state.pop("window", None)
         data = json.dumps(state, ensure_ascii=False)
@@ -6593,6 +6648,25 @@ class MainWindow(QMainWindow):
             return
         self.preferences.last_layout_state = data
         self.preferences = self.repository.save_preferences(self.preferences)
+
+    def _schedule_workspace_autosave(self) -> None:
+        if self._suppress_workspace_autosave:
+            return
+        self._workspace_autosave_timer.start()
+
+    def _flush_workspace_autosave(self) -> None:
+        if self._workspace_autosave_timer.isActive():
+            self._workspace_autosave_timer.stop()
+            self._save_current_workspace_state()
+
+    def _save_current_workspace_state(self) -> None:
+        active_workspace_id = self.preferences.active_workspace_id
+        if active_workspace_id is None:
+            return
+        state = self.current_layout_state()
+        state.pop("window", None)
+        data = json.dumps(state, ensure_ascii=False)
+        self.repository.update_layout_profile_data(active_workspace_id, data)
 
     def _workspace_profile_by_id(self, profile_id: int) -> LayoutProfile | None:
         return next(
@@ -6614,6 +6688,7 @@ class MainWindow(QMainWindow):
     def _restore_active_workspace(self) -> None:
         active_workspace_id = self.preferences.active_workspace_id
         if active_workspace_id is None:
+            self._refresh_workspace_button_text()
             return
         profile = self._workspace_profile_by_id(active_workspace_id)
         if profile is None:
@@ -6621,17 +6696,118 @@ class MainWindow(QMainWindow):
             self.preferences.active_workspace_id = None
             self.preferences = self.repository.save_preferences(self.preferences)
             self.statusBar().showMessage("활성 작업공간을 찾을 수 없어 기본 배치를 유지합니다.", 3500)
+            self._refresh_workspace_button_text()
             return
         state = self._workspace_state_from_profile(profile)
         if state is None:
+            self._refresh_workspace_button_text()
             return
         self.apply_layout_state(state, include_window=False)
         self.statusBar().showMessage(f"'{profile.name}' 작업공간을 복원했습니다.", 2500)
+        self._refresh_workspace_button_text()
+
+    def _refresh_workspace_button_text(self) -> None:
+        """Show the active workspace name on the workspace button, eliding long names."""
+        if not hasattr(self, "workspace_button"):
+            return
+        active_workspace_id = self.preferences.active_workspace_id
+        if active_workspace_id is None:
+            self.workspace_button.setText("기본 ▾")
+            self.workspace_button.setToolTip("")
+            return
+        profile = self._workspace_profile_by_id(active_workspace_id)
+        if profile is None:
+            self.workspace_button.setText("기본 ▾")
+            self.workspace_button.setToolTip("")
+            return
+        full_name = profile.name
+        marker = " ▾"
+        max_text_width = WORKSPACE_BUTTON_MAX_WIDTH
+        metrics = QFontMetrics(self.workspace_button.font())
+        marker_width = metrics.horizontalAdvance(marker)
+        available = max_text_width - marker_width
+        if metrics.horizontalAdvance(full_name) <= available:
+            display = full_name
+        else:
+            display = metrics.elidedText(full_name, Qt.TextElideMode.ElideRight, available)
+        self.workspace_button.setText(display + marker)
+        self.workspace_button.setToolTip(full_name)
+
+    def _refresh_quick_switch_buttons(self) -> None:
+        """Rebuild the quick-switch button row from stored config (front-filled, max 5)."""
+        if not hasattr(self, "quick_switch_row"):
+            return
+        layout = self.quick_switch_row.layout()
+        if layout is None:
+            return
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._quick_switch_buttons = []
+        raw_config = self.repository.get_quick_button_config()
+        config = normalize_quick_config(raw_config)
+        profiles = self.repository.list_user_workspace_profiles()
+        profile_names = {int(p.id): p.name for p in profiles if p.id is not None}
+        active_workspace_id = self.preferences.active_workspace_id
+        for index, entry in enumerate(config):
+            if not entry.get("visible", True):
+                continue
+            workspace_id = entry.get("workspace_id")
+            if not isinstance(workspace_id, int):
+                continue
+            shape_value: QuickShape = _normalize_shape(entry.get("shape"))
+            color = entry.get("color")
+            color_value = color if isinstance(color, str) and color else "#68a8f5"
+            button = QuickSwitchButton(
+                workspace_id=workspace_id,
+                shape=shape_value,
+                color=color_value,
+                index=index,
+                on_click=self.switch_workspace,
+                on_reorder=self._reorder_quick_switch,
+                parent=self.quick_switch_row,
+            )
+            name = profile_names.get(workspace_id)
+            if name is not None:
+                button.set_tooltip(name)
+            button.set_active(workspace_id == active_workspace_id)
+            layout.addWidget(button)
+            self._quick_switch_buttons.append(button)
+        # Hide the empty pill track when there are no buttons to show.
+        self.quick_switch_row.setVisible(bool(self._quick_switch_buttons))
+
+    def _reorder_quick_switch(self, from_index: int, to_index: int) -> None:
+        """Reorder the quick-switch config and persist it.
+
+        Exposed for offscreen testability so tests can call it directly without
+        synthesizing drag events.
+        """
+        if from_index == to_index:
+            return
+        raw_config = self.repository.get_quick_button_config()
+        config = normalize_quick_config(raw_config)
+        if from_index < 0 or from_index >= len(config):
+            return
+        clamped_to = max(0, min(to_index, len(config) - 1))
+        if clamped_to == from_index:
+            return
+        entry = config.pop(from_index)
+        config.insert(clamped_to, entry)
+        self.repository.set_quick_button_config(config)
+        self._refresh_quick_switch_buttons()
+
+    def show_quick_switch_config(self) -> None:
+        dialog = QuickSwitchConfigDialog(self.repository, self.repository.get_quick_button_config(), self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.repository.set_quick_button_config(dialog.config())
+            self._refresh_quick_switch_buttons()
 
     def _build_workspace_menu(self) -> QMenu:
         menu = _style_popup_menu(QMenu(self), self)
         active_workspace_id = self.preferences.active_workspace_id
-        profiles = self.repository.list_workspace_profiles()
+        profiles = self.repository.list_user_workspace_profiles()
         if not profiles:
             empty_action = menu.addAction("저장된 작업공간 없음")
             empty_action.setEnabled(False)
@@ -6647,6 +6823,8 @@ class MainWindow(QMainWindow):
                 lambda _checked=False, selected_profile_id=profile_id: self.switch_workspace(selected_profile_id)
             )
         menu.addSeparator()
+        quick_config_action = menu.addAction("빠른 전환 버튼 설정...")
+        quick_config_action.triggered.connect(self.show_quick_switch_config)
         manage_action = menu.addAction("워크스페이스 관리...")
         manage_action.triggered.connect(self.show_workspace_manager)
         return menu
@@ -6662,6 +6840,30 @@ class MainWindow(QMainWindow):
         dialog = WorkspaceManagerDialog(self.repository, self)
         dialog.exec()
 
+    def _workspace_state_signature(self, state: dict[str, object]) -> _WorkspaceStateSignature:
+        """Extract diff-relevant slices (filters, visible, layout) from a layout state.
+
+        Used by switch_workspace to skip refresh_* calls when the incoming
+        workspace state matches the current one.
+        """
+        filters_state = state.get("filters")
+        filters = self._normalize_workspace_filters(
+            filters_state if isinstance(filters_state, dict) else {}
+        )
+        visible_state = state.get("visible")
+        visible = visible_state if isinstance(visible_state, dict) else {}
+        layout_state = state.get("layout")
+        layout_fingerprint = (
+            json.dumps(layout_state, sort_keys=True, ensure_ascii=False)
+            if isinstance(layout_state, dict)
+            else ""
+        )
+        return _WorkspaceStateSignature(
+            filters=filters,
+            visible=visible,
+            layout_fingerprint=layout_fingerprint,
+        )
+
     def switch_workspace(self, profile_id: int) -> None:
         profile = self._workspace_profile_by_id(profile_id)
         if profile is None:
@@ -6670,14 +6872,26 @@ class MainWindow(QMainWindow):
         state = self._workspace_state_from_profile(profile)
         if state is None:
             return
-        self.apply_layout_state(state, include_window=False)
-        self.refresh_notes()
-        self.refresh_today_checklist()
-        self.refresh_feature_widget()
+        # Capture current signature BEFORE apply_layout_state mutates state.
+        current_signature = self._workspace_state_signature(self.current_layout_state())
+        incoming_signature = self._workspace_state_signature(state)
+        # The unconditional checklist refresh inside apply_layout_state would
+        # defeat the diff below (it would rebuild the list on every switch, even a
+        # no-op one), so skip it here and let the diff drive the refresh.
+        self.apply_layout_state(state, include_window=False, refresh_checklist=False)
+        filters_changed = current_signature.filters != incoming_signature.filters
+        visibility_changed = current_signature.visible != incoming_signature.visible
+        if filters_changed:
+            self.refresh_notes()
+        if filters_changed or visibility_changed:
+            self.refresh_today_checklist()
+            self.refresh_feature_widget()
         self.repository.set_active_workspace(profile_id)
         self.preferences.active_workspace_id = profile_id
         self.preferences = self.repository.save_preferences(self.preferences)
         self.statusBar().showMessage(f"'{profile.name}' 작업공간으로 전환했습니다.", 2500)
+        self._refresh_workspace_button_text()
+        self._refresh_quick_switch_buttons()
 
     def update_current_datetime_display(self) -> None:
         if not hasattr(self, "current_date_label"):
@@ -7943,24 +8157,56 @@ class MainWindow(QMainWindow):
         self.refresh_inline_timeline()
 
     def show_settings_window(self) -> None:
+        # Non-modal: the main window stays scrollable and interactive while
+        # settings is open. Accept/reject are handled via signals so the
+        # save/restore flow that previously ran after exec() still runs.
+        existing = getattr(self, "_settings_dialog", None)
+        if existing is not None:
+            existing.raise_()
+            existing.activateWindow()
+            return
         original_preferences = replace(self.preferences)
         previous_banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
         dialog = SettingsDialog(self.preferences, self)
-        if dialog.exec() != QDialog.DialogCode.Accepted:
+        self._settings_dialog = dialog
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, False)
+
+        def _on_accepted() -> None:
+            requested_database_path = Path(dialog.database_path()).expanduser()
+            self.preferences = self.repository.save_preferences(
+                self._preferences_with_stored_media_assets(dialog.preferences())
+            )
+            self.apply_preferences()
+            banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
+            if previous_banner_position != banner_position:
+                self.move_header_banner_to_preferred_column()
+            self.update_database_location(requested_database_path)
+            # Persist visibility/layout changes (e.g. datetime panel toggle) to
+            # the active workspace or last_layout_state so they survive switches.
+            # Flush immediately so the profile is updated before any switch.
+            self.save_last_layout_state()
+            self._flush_workspace_autosave()
+            self.statusBar().showMessage("설정을 저장했습니다.", 2500)
+            self._close_settings_dialog(dialog)
+
+        def _on_rejected() -> None:
             preview_banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
             self.preferences = original_preferences
             self.apply_preferences()
             if preview_banner_position != _normalize_header_banner_position(self.preferences.header_banner_position):
                 self.move_header_banner_to_preferred_column()
-            return
-        requested_database_path = Path(dialog.database_path()).expanduser()
-        self.preferences = self.repository.save_preferences(self._preferences_with_stored_media_assets(dialog.preferences()))
-        self.apply_preferences()
-        banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
-        if previous_banner_position != banner_position:
-            self.move_header_banner_to_preferred_column()
-        self.update_database_location(requested_database_path)
-        self.statusBar().showMessage("설정을 저장했습니다.", 2500)
+            self._close_settings_dialog(dialog)
+
+        dialog.accepted.connect(_on_accepted)
+        dialog.rejected.connect(_on_rejected)
+        dialog.show()
+
+    def _close_settings_dialog(self, dialog: SettingsDialog) -> None:
+        dialog.accepted.disconnect()
+        dialog.rejected.disconnect()
+        dialog.close()
+        if getattr(self, "_settings_dialog", None) is dialog:
+            self._settings_dialog = None
 
     def preview_settings_preferences(self, preferences: Preference) -> None:
         previous_banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
@@ -8032,8 +8278,14 @@ class MainWindow(QMainWindow):
     def show_item_type_settings(self) -> None:
         self.show_task_folder_settings()
 
-    def apply_preferences(self, refresh_content: bool = True) -> None:
-        self._apply_style()
+    def apply_preferences(
+        self,
+        refresh_content: bool = True,
+        reapply_style: bool = True,
+        sync_dashboard: bool = True,
+    ) -> None:
+        if reapply_style:
+            self._apply_style()
         if self.stack.currentWidget() == self.full_page:
             self.setWindowTitle(self.preferences.app_title)
         if hasattr(self, "chrome_title_label"):
@@ -8107,10 +8359,11 @@ class MainWindow(QMainWindow):
             self.reset_pomodoro()
         else:
             self.update_pomodoro_display()
-        if hasattr(self, "feature_dashboard_layout"):
-            self._sync_feature_dashboard_visibility()
-        elif hasattr(self, "feature_rows_layout"):
-            self._sync_feature_row_visibility()
+        if sync_dashboard:
+            if hasattr(self, "feature_dashboard_layout"):
+                self._sync_feature_dashboard_visibility()
+            elif hasattr(self, "feature_rows_layout"):
+                self._sync_feature_row_visibility()
 
     def apply_header_banner_preferences(self) -> None:
         if not hasattr(self, "header_banner_widget"):
@@ -8289,6 +8542,54 @@ class MainWindow(QMainWindow):
         if event.type() == QEvent.Type.WindowStateChange:
             self._sync_max_restore_button()
 
+    def keyPressEvent(self, event: QKeyEvent) -> None:
+        key = event.key()
+        if key == Qt.Key.Key_F11:
+            self._toggle_fullscreen()
+            event.accept()
+            return
+        if key == Qt.Key.Key_Escape and self.isFullScreen():
+            self._exit_fullscreen()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _toggle_fullscreen(self) -> None:
+        if self.isFullScreen():
+            self._exit_fullscreen()
+            return
+        self._enter_fullscreen()
+
+    def _enter_fullscreen(self) -> None:
+        # Capture the normal (non-maximized) size before entering fullscreen.
+        # When maximized, the on-screen geometry is the maximized rect, so use
+        # the tracked _normal_window_size instead.
+        if self._is_effectively_maximized() and self._normal_window_size is not None:
+            self._fullscreen_pre_size = QSize(
+                self._normal_window_size.width(), self._normal_window_size.height()
+            )
+        else:
+            current = self.size()
+            self._fullscreen_pre_size = QSize(current.width(), current.height())
+        self.showFullScreen()
+        self._set_title_bar_visible(False)
+        if not self._fullscreen_hint_shown:
+            self._fullscreen_hint_shown = True
+            self.statusBar().showMessage("F11 또는 Esc로 돌아가세요", 3500)
+
+    def _exit_fullscreen(self) -> None:
+        self.showNormal()
+        target = self._fullscreen_pre_size
+        if target is not None:
+            self.resize(target.width(), target.height())
+        self._fullscreen_pre_size = None
+        self._set_title_bar_visible(True)
+
+    def _set_title_bar_visible(self, visible: bool) -> None:
+        chrome_bar = getattr(self, "app_chrome_bar", None)
+        if isinstance(chrome_bar, QWidget):
+            chrome_bar.setVisible(visible)
+
     def showEvent(self, event) -> None:
         super().showEvent(event)
         # The platform HWND exists by now (and is rebuilt whenever a window flag
@@ -8425,10 +8726,31 @@ class MainWindow(QMainWindow):
             return
         if not getattr(self.preferences, attribute):
             return
+        self._record_hidden_panel_position(feature_key)
         setattr(self.preferences, attribute, False)
         self.preferences = self.repository.save_preferences(self.preferences)
         self.apply_preferences()
         self.statusBar().showMessage(f"{self._feature_display_name(feature_key)}을 메인창에서 숨겼습니다.", 2200)
+
+    def _record_hidden_panel_position(self, feature_key: str) -> None:
+        if feature_key in FLOATING_OVERLAY_FEATURE_KEYS:
+            return
+        item = next(
+            (
+                dict(item)
+                for item in self._current_feature_dashboard_layout()
+                if str(item.get("key", "")) == feature_key
+            ),
+            None,
+        )
+        if item is None:
+            return
+        self.hidden_panel_positions[feature_key] = {
+            "x": int(item.get("x", 0)),
+            "y": int(item.get("y", 0)),
+            "w": int(item.get("w", self._default_feature_dashboard_width(feature_key))),
+            "h": int(item.get("h", self._default_feature_dashboard_height(feature_key))),
+        }
 
     def _feature_visibility_attribute(self, feature_key: str) -> str | None:
         return {
@@ -8657,6 +8979,7 @@ class MainWindow(QMainWindow):
         state: dict[str, object],
         include_visibility: bool = True,
         include_window: bool = True,
+        refresh_checklist: bool = True,
     ) -> None:
         if self.stack.currentWidget() == self.compact_page:
             self.set_compact_mode(False)
@@ -8674,10 +8997,18 @@ class MainWindow(QMainWindow):
                 self.resize(max(720, width), max(520, height))
 
         if include_visibility:
-            self._apply_layout_visibility(state.get("visible"))
+            # Applying a saved state must not schedule an autosave: that would
+            # write the freshly re-packed layout back to the profile and drift it
+            # on every switch. User edits run outside apply_layout_state.
+            previous_suppress = self._suppress_workspace_autosave
+            self._suppress_workspace_autosave = True
+            try:
+                self._apply_layout_visibility(state.get("visible"))
+            finally:
+                self._suppress_workspace_autosave = previous_suppress
 
         self._apply_feature_layout(state.get("layout"))
-        if hasattr(self, "today_checklist_widget"):
+        if refresh_checklist and hasattr(self, "today_checklist_widget"):
             self.today_checklist_widget.refresh_checklist()
 
         splitters = state.get("splitters")
@@ -8727,7 +9058,13 @@ class MainWindow(QMainWindow):
 
         if changed:
             self.preferences = self.repository.save_preferences(self.preferences)
-            self.apply_preferences()
+            # A layout/workspace apply only toggles panel visibility + filters: the
+            # global stylesheet is unchanged (skip the costly setStyleSheet), the
+            # caller re-renders the dashboard right after via _apply_feature_layout
+            # (skip the duplicate sync render here), and content reloads are handled
+            # by apply_layout_state/switch_workspace/startup (skip redundant refresh).
+            self.apply_preferences(refresh_content=False, reapply_style=False, sync_dashboard=False)
+            self._schedule_workspace_autosave()
 
     def default_feature_layout(self) -> dict[str, list[str]]:
         layout = {
@@ -8812,7 +9149,16 @@ class MainWindow(QMainWindow):
 
     def _apply_feature_dashboard_layout(self, layout_state: object) -> None:
         self.feature_dashboard_items = self._normalized_feature_dashboard_layout(layout_state)
-        self._render_feature_dashboard()
+        # Render under the apply guard so newly-visible panels keep their stored
+        # positions instead of being re-flowed as manual re-adds (the cause of
+        # layout drift when switching between workspaces with different visible
+        # panel sets).
+        previous_applying = self._applying_layout_state
+        self._applying_layout_state = True
+        try:
+            self._render_feature_dashboard()
+        finally:
+            self._applying_layout_state = previous_applying
 
     def _dashboard_layout_scale_factors(
         self,
@@ -9954,6 +10300,131 @@ class MainWindow(QMainWindow):
         top = min(max(0.0, top), max_top)
         return QRectF(left, top, preview_width, preview_height)
 
+    def _dashboard_occupied_cells(
+        self, items: list[dict[str, object]]
+    ) -> set[tuple[int, int]]:
+        occupied: set[tuple[int, int]] = set()
+        for item in items:
+            key = str(item.get("key", ""))
+            if key in FLOATING_OVERLAY_FEATURE_KEYS:
+                continue
+            column = int(item.get("x", 0))
+            row = int(item.get("y", 0))
+            width = int(item.get("w", 1))
+            height = int(item.get("h", 1))
+            occupied.update(self._dashboard_cells(column, row, width, height))
+        return occupied
+
+    def _compute_readd_panel_placement(
+        self,
+        feature_key: str,
+        visible_items: list[dict[str, object]],
+    ) -> tuple[int, int] | None:
+        """Place a newly-shown panel: saved slot if empty, else beside bottom row, else new row."""
+        saved = self.hidden_panel_positions.get(feature_key)
+        width = self._normalized_feature_dashboard_width(
+            feature_key,
+            saved.get("w") if saved else self._default_feature_dashboard_width(feature_key),
+        )
+        height = self._normalized_feature_dashboard_height(
+            feature_key,
+            saved.get("h") if saved else self._default_feature_dashboard_height(feature_key),
+        )
+        occupied = self._dashboard_occupied_cells(visible_items)
+        if saved is not None:
+            saved_x = self._normalized_dashboard_x(saved.get("x"), width)
+            saved_y = self._normalized_dashboard_y(saved.get("y"))
+            if self._dashboard_slot_is_free(saved_x, saved_y, width, height, occupied):
+                return saved_x, saved_y
+        max_row = max((int(item.get("y", 0)) for item in visible_items), default=0)
+        bottom_row_items = [
+            item for item in visible_items if int(item.get("y", 0)) == max_row
+        ]
+        if bottom_row_items:
+            right_edge = max(
+                int(item.get("x", 0)) + int(item.get("w", 1)) for item in bottom_row_items
+            )
+            if right_edge + width <= DASHBOARD_GRID_COLUMNS:
+                candidate_x = self._normalized_dashboard_x(right_edge, width)
+                if self._dashboard_slot_is_free(candidate_x, max_row, width, height, occupied):
+                    return candidate_x, max_row
+        max_bottom = max(
+            (int(item.get("y", 0)) + int(item.get("h", 1)) for item in visible_items),
+            default=0,
+        )
+        return 0, max_bottom
+
+    def _apply_readd_panel_placements(
+        self,
+        visible_items: list[dict[str, object]],
+        readd_keys: set[str],
+    ) -> list[dict[str, object]]:
+        placed: list[dict[str, object]] = []
+        for item in visible_items:
+            key = str(item.get("key", ""))
+            if key not in readd_keys:
+                placed.append(item)
+                continue
+            placement = self._compute_readd_panel_placement(key, placed)
+            if placement is None:
+                placed.append(item)
+                continue
+            column, row = placement
+            saved = self.hidden_panel_positions.get(key)
+            next_item = dict(item)
+            next_item["x"] = column
+            next_item["y"] = row
+            if saved is not None:
+                next_item["w"] = self._normalized_feature_dashboard_width(key, saved.get("w"))
+                next_item["h"] = self._normalized_feature_dashboard_height(key, saved.get("h"))
+            placed.append(next_item)
+        return placed
+
+    def _sync_readd_placements_into_items(
+        self,
+        visible_items: list[dict[str, object]],
+        readd_keys: set[str],
+    ) -> None:
+        visible_by_key = {
+            str(item.get("key", "")): item for item in visible_items
+        }
+        prioritized: list[dict[str, object]] = []
+        deferred: list[dict[str, object]] = []
+        for item in self.feature_dashboard_items:
+            key = str(item.get("key", ""))
+            if key in readd_keys and key in visible_by_key:
+                placed = visible_by_key[key]
+                prioritized.append({
+                    "key": key,
+                    "x": int(placed.get("x", 0)),
+                    "y": int(placed.get("y", 0)),
+                    "w": int(placed.get("w", item.get("w", 1))),
+                    "h": int(placed.get("h", item.get("h", 1))),
+                    "pinned": bool(item.get("pinned", False)),
+                })
+            else:
+                deferred.append(item)
+        self.feature_dashboard_items = prioritized + deferred
+
+    def _scroll_to_feature_panel(self, feature_key: str) -> None:
+        scroll = getattr(self, "full_scroll_area", None)
+        if not isinstance(scroll, QScrollArea):
+            return
+        cell = self.feature_cells.get(feature_key)
+        if not isinstance(cell, QWidget):
+            return
+        content = scroll.widget()
+        if not isinstance(content, QWidget):
+            return
+        # Force the grid to lay out the newly-added cell so its geometry is
+        # current before we ask the scroll area to reveal it. Without this the
+        # cell may still have a stale position when the deferred scroll fires.
+        content.adjustSize()
+        # ensureWidgetVisible scrolls the least amount needed to make the entire
+        # cell rect visible (not just its top-left point), which matters for
+        # panels added on a new bottom row that extends below the viewport.
+        scroll.ensureWidgetVisible(cell, 40, 40)
+
     def _render_feature_dashboard(self) -> None:
         layout = getattr(self, "feature_dashboard_layout", None)
         if not isinstance(layout, QGridLayout):
@@ -10015,7 +10486,30 @@ class MainWindow(QMainWindow):
         # from the grid: a grid item overlapping other rows makes Qt redistribute row
         # heights, which nudges unrelated panels. They render as direct children placed
         # by geometry instead, so moving/resizing one never repacks its neighbors.
+        current_visible_keys = {
+            str(item.get("key", ""))
+            for item in visible_source_items
+            if str(item.get("key", "")) not in FLOATING_OVERLAY_FEATURE_KEYS
+        }
+        last_visible = self._last_dashboard_visible_keys
+        newly_shown = (
+            current_visible_keys - last_visible
+            if last_visible is not None and not self._applying_layout_state
+            else set()
+        )
+        readd_keys = set(newly_shown)
+        if readd_keys:
+            for item in visible_source_items:
+                key = str(item.get("key", ""))
+                if key in readd_keys:
+                    item.pop("x", None)
+                    item.pop("y", None)
         visible_items = self._pack_feature_dashboard_items(visible_source_items)
+        if readd_keys:
+            visible_items = self._apply_readd_panel_placements(
+                visible_items, readd_keys
+            )
+            self._sync_readd_placements_into_items(visible_items, readd_keys)
 
         previous_rows = int(getattr(self, "feature_dashboard_row_count", 0) or 0)
         max_row = max((int(item.get("y", 0)) + int(item.get("h", 1)) for item in visible_items), default=1)
@@ -10075,6 +10569,14 @@ class MainWindow(QMainWindow):
         if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.setGeometry(self.feature_grid_container.rect())
             overlay.raise_()
+
+        self._last_dashboard_visible_keys = current_visible_keys
+        if readd_keys:
+            readd_key = next(iter(readd_keys))
+            QTimer.singleShot(0, lambda key=readd_key: self._scroll_to_feature_panel(key))
+            self._show_dashboard_resize_guides(readd_key)
+            for key in readd_keys:
+                self.hidden_panel_positions.pop(key, None)
 
     def _reposition_dashboard_floating_overlays(self) -> None:
         container = getattr(self, "feature_grid_container", None)
@@ -11176,6 +11678,15 @@ class MainWindow(QMainWindow):
         splitter = getattr(self, splitter_name, None)
         if splitter is None or not isinstance(sizes, list):
             return
+        # In dashboard mode the body/left/center/right/lower splitters are
+        # detached from the window (their panels live in the grid). Calling
+        # setSizes on a detached splitter makes Qt rescale to its phantom height,
+        # so sizes() reads back distorted values that then get persisted on the
+        # next save -> the saved workspace silently drifts. Only apply sizes to
+        # splitters that are actually anchored in the live window (e.g. memo, or
+        # every splitter in the legacy non-dashboard layout).
+        if not self.isAncestorOf(splitter):
+            return
         parsed_sizes = [max(0, int(size)) for size in sizes if isinstance(size, (int, float))]
         if len(parsed_sizes) != splitter.count() or not any(parsed_sizes):
             return
@@ -11995,6 +12506,7 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.save_last_window_size()
+        self._flush_workspace_autosave()
         self.save_last_layout_state()
         self.closing = True
         self.current_datetime_timer.stop()
@@ -17823,7 +18335,7 @@ class WorkspaceManagerDialog(QDialog):
         self.profile_list.itemDoubleClicked.connect(lambda _item=None: self.switch_selected_workspace())
         layout.addWidget(self.profile_list, 1)
 
-        hint = QLabel("더블클릭하면 작업공간을 즉시 전환합니다. 현재 배치 저장은 '현재 상태로 업데이트'에서만 수행됩니다.")
+        hint = QLabel("더블클릭하면 작업공간을 즉시 전환합니다. 패널 배치는 변경 시 자동으로 저장됩니다.")
         hint.setObjectName("mutedLabel")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -17832,19 +18344,23 @@ class WorkspaceManagerDialog(QDialog):
         create_button = QPushButton("새 워크스페이스")
         _stabilize_control(create_button, 120)
         create_button.clicked.connect(self.create_workspace)
-        update_button = QPushButton("현재 상태로 업데이트")
-        _stabilize_control(update_button, 150)
-        update_button.clicked.connect(self.update_current_workspace)
         rename_button = QPushButton("이름 변경")
         _stabilize_control(rename_button, 92)
         rename_button.clicked.connect(self.rename_selected_workspace)
         delete_button = QPushButton("삭제")
         _stabilize_control(delete_button, 76)
         delete_button.clicked.connect(self.delete_selected_workspace)
+        move_up_button = QPushButton("↑")
+        _stabilize_control(move_up_button, 40)
+        move_up_button.clicked.connect(self.move_selected_workspace_up)
+        move_down_button = QPushButton("↓")
+        _stabilize_control(move_down_button, 40)
+        move_down_button.clicked.connect(self.move_selected_workspace_down)
         button_row.addWidget(create_button)
-        button_row.addWidget(update_button)
         button_row.addWidget(rename_button)
         button_row.addWidget(delete_button)
+        button_row.addWidget(move_up_button)
+        button_row.addWidget(move_down_button)
         button_row.addStretch(1)
         close_button = QPushButton("닫기")
         _stabilize_control(close_button, 84)
@@ -17856,7 +18372,7 @@ class WorkspaceManagerDialog(QDialog):
 
     def refresh_profiles(self, selected_profile_id: int | None = None) -> None:
         current_id = selected_profile_id if selected_profile_id is not None else self.current_profile_id()
-        self.profiles = self.repository.list_workspace_profiles()
+        self.profiles = self.repository.list_user_workspace_profiles()
         self.profile_list.clear()
         active_id = self.repository.get_preferences().active_workspace_id
         for profile in self.profiles:
@@ -17916,15 +18432,6 @@ class WorkspaceManagerDialog(QDialog):
         self.refresh_profiles(profile.id)
         self.show_status(f"'{profile.name}' 작업공간을 만들었습니다.")
 
-    def update_current_workspace(self, _checked: bool = False) -> None:
-        profile = self.current_profile()
-        if profile is None or profile.id is None:
-            QMessageBox.information(self, "작업공간 업데이트", "업데이트할 작업공간을 선택하세요.")
-            return
-        self._update_profile_data(profile.id, self.current_layout_data())
-        self.refresh_profiles(profile.id)
-        self.show_status(f"'{profile.name}' 작업공간을 현재 상태로 업데이트했습니다.")
-
     def rename_selected_workspace(self, _checked: bool = False) -> None:
         profile = self.current_profile()
         if profile is None or profile.id is None:
@@ -17974,6 +18481,27 @@ class WorkspaceManagerDialog(QDialog):
         self.refresh_profiles()
         self.show_status(f"'{profile.name}' 작업공간을 삭제했습니다.")
 
+    def move_selected_workspace_up(self, _checked: bool = False) -> None:
+        self._move_selected_workspace(delta=-1)
+
+    def move_selected_workspace_down(self, _checked: bool = False) -> None:
+        self._move_selected_workspace(delta=1)
+
+    def _move_selected_workspace(self, delta: int) -> None:
+        profile_id = self.current_profile_id()
+        if profile_id is None:
+            return
+        ordered_ids = [int(profile.id) for profile in self.profiles if profile.id is not None]
+        if profile_id not in ordered_ids:
+            return
+        index = ordered_ids.index(profile_id)
+        target_index = index + delta
+        if target_index < 0 or target_index >= len(ordered_ids):
+            return
+        ordered_ids[index], ordered_ids[target_index] = ordered_ids[target_index], ordered_ids[index]
+        self.repository.set_workspace_order(ordered_ids)
+        self.refresh_profiles(profile_id)
+
     def switch_selected_workspace(self) -> None:
         profile = self.current_profile()
         parent = self.parent()
@@ -17981,9 +18509,6 @@ class WorkspaceManagerDialog(QDialog):
             return
         parent.switch_workspace(profile.id)
         self.accept()
-
-    def _update_profile_data(self, profile_id: int, data: str) -> None:
-        self.repository.update_layout_profile_data(profile_id, data)
 
     def _rename_profile(self, profile_id: int, name: str) -> None:
         self.repository.rename_layout_profile(profile_id, name)
@@ -18420,20 +18945,12 @@ class SettingsDialog(QDialog):
         layout_tools_row = QHBoxLayout(layout_tools_panel)
         layout_tools_row.setContentsMargins(0, 0, 0, 0)
         layout_tools_row.setSpacing(8)
-        save_layout_button = QPushButton("화면 저장")
-        _stabilize_control(save_layout_button, 88)
-        save_layout_button.clicked.connect(lambda: self.run_parent_layout_action("save_layout_profile"))
-        load_layout_button = QPushButton("화면 불러오기")
-        _stabilize_control(load_layout_button, 104)
-        load_layout_button.clicked.connect(lambda: self.run_parent_layout_action("load_layout_profile"))
         reset_layout_button = QPushButton("기본 배치")
         _stabilize_control(reset_layout_button, 88)
         reset_layout_button.clicked.connect(lambda: self.run_parent_layout_action("reset_main_layout"))
         workspace_manager_button = QPushButton("워크스페이스 관리")
         _stabilize_control(workspace_manager_button, 128)
         workspace_manager_button.clicked.connect(lambda: self.run_parent_layout_action("show_workspace_manager"))
-        layout_tools_row.addWidget(save_layout_button)
-        layout_tools_row.addWidget(load_layout_button)
         layout_tools_row.addWidget(reset_layout_button)
         layout_tools_row.addWidget(workspace_manager_button)
         layout_tools_row.addStretch(1)
@@ -18906,6 +19423,7 @@ class SettingsDialog(QDialog):
             last_window_width=self._source.last_window_width,
             last_window_height=self._source.last_window_height,
             last_layout_state=self._source.last_layout_state,
+            active_workspace_id=self._source.active_workspace_id,
             id=self._source.id,
         )
 
@@ -20284,6 +20802,20 @@ def _stabilize_control(control: QWidget, minimum_width: int | None = None) -> No
     if isinstance(control, QAbstractSpinBox):
         control.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.UpDownArrows)
         control.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+
+def _stabilize_top_bar_button(control: QWidget, minimum_width: int | None = None) -> None:
+    """Size a title-bar button to the compact top-bar height.
+
+    Title-bar controls are shorter than panel controls so they sit in a tighter
+    vertical rhythm with the OROT logo/title; PANEL_CONTROL_HEIGHT stays reserved
+    for in-panel controls.
+    """
+    control.setMinimumHeight(TOP_BAR_CONTROL_HEIGHT)
+    control.setMaximumHeight(TOP_BAR_CONTROL_HEIGHT)
+    if minimum_width is not None:
+        control.setMinimumWidth(minimum_width)
+    control.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
 
 
 def _stabilize_panel_caption(label: QLabel, height: int = PANEL_CONTROL_HEIGHT) -> None:
