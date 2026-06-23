@@ -455,7 +455,8 @@ class ScheduleRepository:
                     last_layout_state TEXT NOT NULL DEFAULT '',
                     quick_note_sort_direction TEXT NOT NULL DEFAULT 'desc',
                     checklist_sort_direction TEXT NOT NULL DEFAULT 'desc',
-                    active_workspace_id INTEGER
+                    active_workspace_id INTEGER,
+                    quick_button_config TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS layout_profiles (
@@ -463,7 +464,10 @@ class ScheduleRepository:
                     name TEXT NOT NULL UNIQUE,
                     data TEXT NOT NULL,
                     created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    is_workspace INTEGER NOT NULL DEFAULT 1,
+                    display_order INTEGER,
+                    quick_buttons TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS tags (
@@ -814,6 +818,8 @@ class ScheduleRepository:
                 )
             if "active_workspace_id" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN active_workspace_id INTEGER")
+            if "quick_button_config" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN quick_button_config TEXT")
 
             favorite_columns = {row["name"] for row in connection.execute("PRAGMA table_info(link_favorites)")}
             if "icon_text" not in favorite_columns:
@@ -823,6 +829,24 @@ class ScheduleRepository:
             if "sort_order" not in favorite_columns:
                 connection.execute("ALTER TABLE link_favorites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
                 connection.execute("UPDATE link_favorites SET sort_order = id WHERE sort_order = 0")
+
+            layout_profile_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(layout_profiles)")
+            }
+            if "is_workspace" not in layout_profile_columns:
+                connection.execute(
+                    "ALTER TABLE layout_profiles ADD COLUMN is_workspace INTEGER NOT NULL DEFAULT 1"
+                )
+            if "display_order" not in layout_profile_columns:
+                connection.execute("ALTER TABLE layout_profiles ADD COLUMN display_order INTEGER")
+            if "quick_buttons" not in layout_profile_columns:
+                connection.execute("ALTER TABLE layout_profiles ADD COLUMN quick_buttons TEXT")
+            connection.execute(
+                "UPDATE layout_profiles SET is_workspace = 1 WHERE is_workspace IS NULL"
+            )
+            connection.execute(
+                "UPDATE layout_profiles SET display_order = rowid WHERE display_order IS NULL"
+            )
 
             quick_note_columns = {row["name"] for row in connection.execute("PRAGMA table_info(quick_notes)")}
             if "content_html" not in quick_note_columns:
@@ -1705,10 +1729,21 @@ class ScheduleRepository:
                 connection.execute(
                     """
                     UPDATE layout_profiles
-                    SET data = ?, updated_at = ?
+                    SET data = ?,
+                        updated_at = ?,
+                        is_workspace = ?,
+                        display_order = ?,
+                        quick_buttons = ?
                     WHERE id = ?
                     """,
-                    (profile.data, _dt_exact(profile.updated_at), profile.id),
+                    (
+                        profile.data,
+                        _dt_exact(profile.updated_at),
+                        int(profile.is_workspace),
+                        profile.display_order,
+                        profile.quick_buttons,
+                        profile.id,
+                    ),
                 )
             else:
                 profile.name = name
@@ -1716,17 +1751,27 @@ class ScheduleRepository:
                 profile.updated_at = now
                 cursor = connection.execute(
                     """
-                    INSERT INTO layout_profiles (name, data, created_at, updated_at)
-                    VALUES (?, ?, ?, ?)
+                    INSERT INTO layout_profiles
+                      (name, data, created_at, updated_at, is_workspace, display_order, quick_buttons)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         profile.name,
                         profile.data,
                         _dt_exact(profile.created_at),
                         _dt_exact(profile.updated_at),
+                        int(profile.is_workspace),
+                        profile.display_order,
+                        profile.quick_buttons,
                     ),
                 )
                 profile.id = int(cursor.lastrowid)
+                if profile.display_order is None:
+                    profile.display_order = profile.id
+                    connection.execute(
+                        "UPDATE layout_profiles SET display_order = ? WHERE id = ?",
+                        (profile.display_order, profile.id),
+                    )
         return profile
 
     def list_layout_profiles(self) -> list[LayoutProfile]:
@@ -1741,6 +1786,65 @@ class ScheduleRepository:
 
     def list_workspace_profiles(self) -> list[LayoutProfile]:
         return self.list_layout_profiles()
+
+    def list_user_workspace_profiles(self) -> list[LayoutProfile]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM layout_profiles
+                WHERE is_workspace = 1
+                ORDER BY display_order ASC, id ASC
+                """
+            ).fetchall()
+        return [self._layout_profile_from_row(row) for row in rows]
+
+    def set_workspace_order(self, ordered_ids: list[int]) -> None:
+        normalized_ids = [int(profile_id) for profile_id in ordered_ids]
+        if not normalized_ids:
+            return
+        with self.connect() as connection:
+            existing_rows = connection.execute(
+                "SELECT id FROM layout_profiles WHERE is_workspace = 1"
+            ).fetchall()
+            existing_ids = [int(row["id"]) for row in existing_rows]
+            ordered_existing_ids = [
+                profile_id for profile_id in normalized_ids if profile_id in existing_ids
+            ]
+            ordered_existing_ids.extend(
+                profile_id for profile_id in existing_ids if profile_id not in ordered_existing_ids
+            )
+            for display_order, profile_id in enumerate(ordered_existing_ids, start=1):
+                connection.execute(
+                    "UPDATE layout_profiles SET display_order = ? WHERE id = ?",
+                    (display_order, profile_id),
+                )
+
+    def get_quick_button_config(self) -> list[dict[str, object]]:
+        with self.connect() as connection:
+            row = connection.execute(
+                "SELECT quick_button_config FROM preferences WHERE id = 1"
+            ).fetchone()
+        if row is None:
+            return []
+        raw = row["quick_button_config"]
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+        if not isinstance(data, list):
+            return []
+        return [item for item in data if isinstance(item, dict)]
+
+    def set_quick_button_config(self, config: list[dict[str, object]]) -> None:
+        normalized = [item for item in config if isinstance(item, dict)]
+        payload = json.dumps(normalized, ensure_ascii=False)
+        with self.connect() as connection:
+            connection.execute(
+                "UPDATE preferences SET quick_button_config = ? WHERE id = 1",
+                (payload,),
+            )
 
     def get_layout_profile(self, name: str) -> LayoutProfile | None:
         with self.connect() as connection:
@@ -3034,12 +3138,21 @@ class ScheduleRepository:
     def _layout_profile_from_row(row: sqlite3.Row) -> LayoutProfile:
         created_at = _parse_dt(row["created_at"]) or datetime.now()
         updated_at = _parse_dt(row["updated_at"]) or created_at
+        columns = row.keys()
+        is_workspace = bool(row["is_workspace"]) if "is_workspace" in columns else True
+        raw_order = row["display_order"] if "display_order" in columns else None
+        display_order = int(raw_order) if raw_order is not None else None
+        quick_buttons = row["quick_buttons"] if "quick_buttons" in columns else None
+        quick_buttons = str(quick_buttons) if quick_buttons is not None else None
         return LayoutProfile(
             id=int(row["id"]),
             name=str(row["name"]),
             data=str(row["data"]),
             created_at=created_at,
             updated_at=updated_at,
+            is_workspace=is_workspace,
+            display_order=display_order,
+            quick_buttons=quick_buttons,
         )
 
     @staticmethod

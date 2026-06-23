@@ -1443,3 +1443,106 @@ def test_repository_manages_link_favorites(tmp_path) -> None:
     repository.delete_link_favorite(third.id)
 
     assert repository.list_link_favorites() == []
+
+
+def test_list_user_workspace_profiles_filters_and_orders(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    first = repository.save_layout_profile(LayoutProfile(name="First", data='{"layout":"first"}'))
+    second = repository.save_layout_profile(LayoutProfile(name="Second", data='{"layout":"second"}'))
+    third = repository.save_layout_profile(LayoutProfile(name="Third", data='{"layout":"third"}'))
+
+    with repository.connect() as connection:
+        connection.execute(
+            "UPDATE layout_profiles SET is_workspace = 0 WHERE id = ?",
+            (second.id,),
+        )
+
+    listed = repository.list_user_workspace_profiles()
+    assert [profile.id for profile in listed] == [first.id, third.id]
+    assert all(profile.is_workspace for profile in listed)
+    assert [profile.display_order for profile in listed] == [1, 3]
+
+    repository.set_workspace_order([third.id, first.id])
+    reordered = repository.list_user_workspace_profiles()
+    assert [profile.id for profile in reordered] == [third.id, first.id]
+    assert [profile.display_order for profile in reordered] == [1, 2]
+
+
+def test_set_workspace_order_persists_and_reorders(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    alpha = repository.save_layout_profile(LayoutProfile(name="Alpha", data='{"layout":"alpha"}'))
+    beta = repository.save_layout_profile(LayoutProfile(name="Beta", data='{"layout":"beta"}'))
+    gamma = repository.save_layout_profile(LayoutProfile(name="Gamma", data='{"layout":"gamma"}'))
+
+    repository.set_workspace_order([gamma.id, alpha.id, beta.id])
+
+    reloaded = ScheduleRepository(db_path).list_user_workspace_profiles()
+    assert [profile.id for profile in reloaded] == [gamma.id, alpha.id, beta.id]
+    assert [profile.display_order for profile in reloaded] == [1, 2, 3]
+
+    repository.set_workspace_order([beta.id, gamma.id])
+    reloaded_after = ScheduleRepository(db_path).list_user_workspace_profiles()
+    assert [profile.id for profile in reloaded_after] == [beta.id, gamma.id, alpha.id]
+
+
+def test_quick_button_config_round_trips(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    repository = ScheduleRepository(db_path)
+    assert repository.get_quick_button_config() == []
+
+    config = [
+        {"workspace_id": 1, "shape": "circle", "color": "#68a8f5", "visible": True},
+        {"workspace_id": 2, "shape": "heart", "color": "#ef8f8f", "visible": False},
+    ]
+    repository.set_quick_button_config(config)
+
+    reloaded = ScheduleRepository(db_path).get_quick_button_config()
+    assert reloaded == config
+
+    repository.set_quick_button_config([])
+    assert ScheduleRepository(db_path).get_quick_button_config() == []
+
+
+def test_legacy_layout_profile_db_upgrades_without_data_loss(tmp_path) -> None:
+    db_path = tmp_path / "schedule.sqlite3"
+    connection = sqlite3.connect(db_path)
+    connection.executescript(
+        """
+        CREATE TABLE preferences (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            day_max_minutes INTEGER NOT NULL,
+            break_minutes INTEGER NOT NULL,
+            strategy TEXT NOT NULL
+        );
+        INSERT INTO preferences (id, day_max_minutes, break_minutes, strategy)
+        VALUES (1, 480, 10, 'deadline_priority');
+
+        CREATE TABLE layout_profiles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            data TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        INSERT INTO layout_profiles (name, data, created_at, updated_at)
+        VALUES
+            ('Legacy A', '{"body":[700,300]}', '2026-06-01T09:00:00', '2026-06-01T09:00:00'),
+            ('Legacy B', '{"body":[300,700]}', '2026-06-02T10:00:00', '2026-06-02T10:00:00');
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    repository = ScheduleRepository(db_path)
+
+    profiles = repository.list_layout_profiles()
+    assert {profile.name for profile in profiles} == {"Legacy A", "Legacy B"}
+    assert all(profile.is_workspace for profile in profiles)
+    assert all(profile.data for profile in profiles)
+    assert all(profile.quick_buttons is None for profile in profiles)
+
+    user_profiles = repository.list_user_workspace_profiles()
+    assert [profile.name for profile in user_profiles] == ["Legacy A", "Legacy B"]
+    assert [profile.display_order for profile in user_profiles] == [1, 2]
+    assert repository.get_quick_button_config() == []

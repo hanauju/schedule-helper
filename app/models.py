@@ -132,6 +132,9 @@ class LayoutProfile:
     created_at: datetime = field(default_factory=datetime.now)
     updated_at: datetime = field(default_factory=datetime.now)
     id: int | None = None
+    is_workspace: bool = True
+    display_order: int | None = None
+    quick_buttons: str | None = None
 
 
 @dataclass(slots=True)
