@@ -123,7 +123,7 @@ DASHBOARD_GRID_COLUMNS = 12
 DASHBOARD_GRID_ROW_HEIGHT = 42
 PANEL_CONTROL_HEIGHT = 40
 TOP_BAR_CONTROL_HEIGHT = 32
-PANEL_MOVE_BAR_HEIGHT = 10
+PANEL_MOVE_BAR_HEIGHT = 8
 PANEL_HANDLE_CONTENT_GAP = 1
 PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
 PANEL_CORNER_RADIUS = 16  # keep in sync with normal card "border-radius: 16px" in the stylesheet
@@ -1467,14 +1467,40 @@ class FeatureGridContainer(QWidget):
     floating overlay cells (the datetime clock) are direct children placed by
     geometry, so they need an explicit nudge to keep tracking their grid slot
     when the container is resized.
+
+    The floating datetime overlay is NOT a layout item, so the QGridLayout's
+    sizeHint does not account for it. To let the overlay (and a drag preview)
+    grow the scrollable content height without colliding with grid items or
+    thrashing column widths, the container exposes a single
+    ``set_required_dashboard_height`` knob fed into ``minimumSizeHint``.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._resize_callback: Callable[[], None] | None = None
+        self._required_height = 0
 
     def set_resize_callback(self, callback: Callable[[], None]) -> None:
         self._resize_callback = callback
+
+    def set_required_dashboard_height(self, height: int) -> None:
+        normalized = max(0, int(height))
+        if normalized == self._required_height:
+            return
+        self._required_height = normalized
+        self.updateGeometry()
+
+    def minimumSizeHint(self) -> QSize:
+        hint = super().minimumSizeHint()
+        if self._required_height > self.layout().minimumSize().height():
+            return QSize(hint.width(), self._required_height)
+        return hint
+
+    def sizeHint(self) -> QSize:
+        hint = super().sizeHint()
+        if self._required_height > hint.height():
+            return QSize(hint.width(), self._required_height)
+        return hint
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -3025,7 +3051,7 @@ class MainWindow(QMainWindow):
         workspace = QWidget()
         workspace.setObjectName("workspace")
         workspace_layout = QVBoxLayout(workspace)
-        workspace_layout.setContentsMargins(30, 26, 30, 30)
+        workspace_layout.setContentsMargins(30, 12, 30, 30)
         workspace_layout.setSpacing(16)
         self.workspace_layout = workspace_layout
 
@@ -3136,7 +3162,14 @@ class MainWindow(QMainWindow):
         self.feature_dashboard_layout = QGridLayout(self.feature_grid_container)
         self.feature_dashboard_layout.setContentsMargins(0, 0, 0, 0)
         self.feature_dashboard_layout.setHorizontalSpacing(DASHBOARD_GRID_GAP)
-        self.feature_dashboard_layout.setVerticalSpacing(DASHBOARD_GRID_GAP)
+        # Vertical spacing is baked into each row's minimum height (ROW_HEIGHT +
+        # GAP) instead of QGridLayout's inter-row spacing. Qt drops the spacing
+        # for EMPTY rows, so when a panel (e.g. the full-width banner) is dragged
+        # away and leaves empty rows behind, the spacing collapse made panels
+        # below visually rise. A fixed per-row height keeps every grid row exactly
+        # ROW_HEIGHT+GAP tall whether or not it holds a widget, so a panel at grid
+        # row N always renders at the same pixel y = N*(ROW_HEIGHT+GAP).
+        self.feature_dashboard_layout.setVerticalSpacing(0)
         for column in range(DASHBOARD_GRID_COLUMNS):
             self.feature_dashboard_layout.setColumnStretch(column, 1)
             self.feature_dashboard_layout.setColumnMinimumWidth(column, 28)
@@ -9289,7 +9322,10 @@ class MainWindow(QMainWindow):
                     }
                 )
                 seen.add(key)
-        return self._pack_feature_dashboard_items_preserving_floating(items)
+        # Render is position-preserving: keep each panel's explicit x/y and only
+        # resolve genuine overlaps (push down). This avoids the top-left
+        # compaction that previously scattered unrelated panels on every render.
+        return self._resolve_dashboard_collisions(items)
 
     def _dashboard_items_from_legacy_layout(self, layout_state: object) -> list[dict[str, object]]:
         feature_keys = set(self.feature_boxes)
@@ -9376,6 +9412,7 @@ class MainWindow(QMainWindow):
         priority_keys: list[str] | tuple[str, ...] | None = None,
         flow_direction: str | None = None,
         strict_lateral_push: bool = False,
+        prevent_upward: bool = False,
     ) -> list[dict[str, object]]:
         regular_items: list[dict[str, object]] = []
         floating_items: list[dict[str, object]] = []
@@ -9390,6 +9427,7 @@ class MainWindow(QMainWindow):
             priority_keys=priority_keys,
             flow_direction=flow_direction,
             strict_lateral_push=strict_lateral_push,
+            prevent_upward=prevent_upward,
         ) + floating_items
 
     def _pack_feature_dashboard_items(
@@ -9398,6 +9436,8 @@ class MainWindow(QMainWindow):
         priority_keys: list[str] | tuple[str, ...] | None = None,
         flow_direction: str | None = None,
         strict_lateral_push: bool = False,
+        pre_occupied: set[tuple[int, int]] | None = None,
+        prevent_upward: bool = False,
     ) -> list[dict[str, object]]:
         ordered_items = list(raw_items)
         pinned_keys = {str(item.get("key", "")) for item in ordered_items if bool(item.get("pinned", False))}
@@ -9413,7 +9453,7 @@ class MainWindow(QMainWindow):
             ordered_items.sort(key=lambda item: 0 if str(item.get("key", "")) in pinned_keys else 1)
 
         packed: list[dict[str, object]] = []
-        occupied: set[tuple[int, int]] = set()
+        occupied: set[tuple[int, int]] = set(pre_occupied) if pre_occupied else set()
         for raw_item in ordered_items:
             key = str(raw_item.get("key", ""))
             if key not in self.feature_boxes:
@@ -9463,7 +9503,9 @@ class MainWindow(QMainWindow):
                     return []
                 column, row = slot
             else:
-                column, row = self._first_free_dashboard_slot(width, height, occupied, preferred_x, preferred_y, flow_direction)
+                column, row = self._first_free_dashboard_slot(
+                    width, height, occupied, preferred_x, preferred_y, flow_direction, prevent_upward=prevent_upward
+                )
             occupied.update(self._dashboard_cells(column, row, width, height))
             packed.append(
                 {
@@ -9503,6 +9545,141 @@ class MainWindow(QMainWindow):
             return "left" if dx < 0 else "right"
         return "down"
 
+    def _first_free_slot_at_or_below(
+        self,
+        width: int,
+        height: int,
+        occupied: set[tuple[int, int]],
+        start_column: int,
+        start_row: int,
+    ) -> tuple[int, int]:
+        """Find the nearest free slot at or below ``start_row``.
+
+        Never searches above ``start_row`` so a displaced panel only ever moves
+        DOWN into free space, never UP into a gap a moved panel vacated. The
+        column preference stays close to ``start_column`` so the panel keeps its
+        horizontal lane when possible.
+        """
+        max_column = max(0, DASHBOARD_GRID_COLUMNS - width)
+        clamped_column = min(max(0, start_column), max_column)
+        row = max(0, start_row)
+        while True:
+            if self._dashboard_slot_is_free(clamped_column, row, width, height, occupied):
+                return clamped_column, row
+            for offset in range(1, DASHBOARD_GRID_COLUMNS):
+                for column in (clamped_column - offset, clamped_column + offset):
+                    if 0 <= column <= max_column and self._dashboard_slot_is_free(
+                        column, row, width, height, occupied
+                    ):
+                        return column, row
+            row += 1
+
+    def _relocate_displaced_panel(
+        self,
+        width: int,
+        height: int,
+        occupied: set[tuple[int, int]],
+        start_column: int,
+        start_row: int,
+        flow_direction: str | None,
+    ) -> tuple[int, int]:
+        """Find a new slot for a panel whose preferred slot is taken.
+
+        Prefer a free slot in the SAME row (lateral push) following the move's
+        flow direction; only when the row has no room does it drop to the next
+        free slot below. Never searches above ``start_row`` and never blocks.
+        """
+        if flow_direction:
+            slot = self._first_directional_dashboard_slot(
+                width, height, occupied, start_column, start_row, flow_direction
+            )
+            if slot is not None:
+                return slot
+        return self._first_free_slot_at_or_below(width, height, occupied, start_column, start_row)
+
+    def _resolve_dashboard_collisions(
+        self,
+        raw_items: list[dict[str, object]],
+        priority_keys: list[str] | tuple[str, ...] | None = None,
+        flow_direction: str | None = None,
+    ) -> list[dict[str, object]]:
+        """Place panels honoring their explicit positions; resolve overlaps only.
+
+        Unlike top-left compaction packing, this keeps every panel exactly where
+        it was placed unless it overlaps another panel. Overlapping panels are
+        pushed sideways within their row when there is room (following the move's
+        flow direction), otherwise DOWN — never up — so moving one panel never
+        scatters unrelated panels or floats them into vacated gaps. The floating
+        datetime overlay is excluded entirely — it is allowed to overlap.
+        """
+        regular_items: list[dict[str, object]] = []
+        floating_items: list[dict[str, object]] = []
+        for raw_item in raw_items:
+            key = str(raw_item.get("key", ""))
+            if key in FLOATING_OVERLAY_FEATURE_KEYS:
+                floating_items.append(self._normalize_floating_dashboard_item(raw_item))
+            else:
+                regular_items.append(raw_item)
+
+        priority = {str(key): index for index, key in enumerate(priority_keys or [])}
+        pinned_keys = {str(item.get("key", "")) for item in regular_items if bool(item.get("pinned", False))}
+
+        def has_position(item: dict[str, object]) -> bool:
+            return item.get("x") is not None and item.get("y") is not None
+
+        def order_key(indexed: tuple[int, dict[str, object]]) -> tuple[int, int, int]:
+            index, item = indexed
+            key = str(item.get("key", ""))
+            # Stable, deterministic order: pinned first, then the moved/priority
+            # panel, then everything else in its existing list order. We do NOT
+            # sort by (y, x) — that made same-slot ties non-deterministic and let
+            # a later panel steal an earlier panel's position. List order keeps
+            # explicit/saved positions authoritative; only genuinely overlapping
+            # panels relocate (downward).
+            return (
+                0 if key in pinned_keys else 1,
+                priority.get(key, len(priority)),
+                index,
+            )
+
+        ordered = [item for _index, item in sorted(enumerate(regular_items), key=order_key)]
+
+        packed: list[dict[str, object]] = []
+        occupied: set[tuple[int, int]] = set()
+        for raw_item in ordered:
+            key = str(raw_item.get("key", ""))
+            if key not in self.feature_boxes:
+                continue
+            width = self._normalized_feature_dashboard_width(
+                key,
+                raw_item.get("w", self._default_feature_dashboard_width(key)),
+            )
+            height = self._normalized_feature_dashboard_height(
+                key,
+                raw_item.get("h", self._default_feature_dashboard_height(key)),
+            )
+            if has_position(raw_item):
+                column = self._normalized_dashboard_x(raw_item.get("x"), width)
+                row = self._normalized_dashboard_y(raw_item.get("y"))
+                if not self._dashboard_slot_is_free(column, row, width, height, occupied):
+                    column, row = self._relocate_displaced_panel(
+                        width, height, occupied, column, row, flow_direction
+                    )
+            else:
+                column, row = self._first_free_dashboard_slot(width, height, occupied)
+            occupied.update(self._dashboard_cells(column, row, width, height))
+            packed.append(
+                {
+                    "key": key,
+                    "x": column,
+                    "y": row,
+                    "w": width,
+                    "h": height,
+                    "pinned": bool(raw_item.get("pinned", False)),
+                }
+            )
+        return packed + floating_items
+
     def _first_free_dashboard_slot(
         self,
         width: int,
@@ -9511,6 +9688,7 @@ class MainWindow(QMainWindow):
         preferred_x: object = None,
         preferred_y: object = None,
         flow_direction: str | None = None,
+        prevent_upward: bool = False,
     ) -> tuple[int, int]:
         if preferred_x is not None and preferred_y is not None:
             start_column = self._normalized_dashboard_x(preferred_x, width)
@@ -9527,9 +9705,15 @@ class MainWindow(QMainWindow):
                 if directional_slot is not None:
                     return directional_slot
             max_radius = max(24, len(occupied) + height + 4)
+            # When a panel is dragged downward, panels displaced from their
+            # preferred slot should only relocate further down — never fill the
+            # gap left above by the dragged panel. prevent_upward is set whenever
+            # the source panel moved down (new_y > old_y), regardless of
+            # flow_direction (which may report "right" for diagonal moves).
+            min_search_row = start_row if prevent_upward else 0
             for radius in range(max_radius + 1):
                 candidates: list[tuple[int, int]] = []
-                for row in range(max(0, start_row - radius), start_row + radius + 1):
+                for row in range(max(min_search_row, start_row - radius), start_row + radius + 1):
                     for column in range(
                         max(0, start_column - radius),
                         min(DASHBOARD_GRID_COLUMNS - width, start_column + radius) + 1,
@@ -9541,7 +9725,7 @@ class MainWindow(QMainWindow):
                     if self._dashboard_slot_is_free(column, row, width, height, occupied):
                         return column, row
 
-        row = 0
+        row = max(0, start_row) if (prevent_upward and preferred_x is not None and preferred_y is not None) else 0
         while True:
             for column in range(0, DASHBOARD_GRID_COLUMNS - width + 1):
                 if self._dashboard_slot_is_free(column, row, width, height, occupied):
@@ -9712,7 +9896,7 @@ class MainWindow(QMainWindow):
             value = int(height)
         except (TypeError, ValueError):
             value = 3
-        return min(18, max(1, value))
+        return min(40, max(1, value))
 
     def _dashboard_width_from_legacy_span(self, span: object) -> int:
         try:
@@ -9764,6 +9948,15 @@ class MainWindow(QMainWindow):
 
     def _dashboard_item_pixel_height(self, height: int) -> int:
         return int(DASHBOARD_GRID_ROW_HEIGHT * height + DASHBOARD_GRID_GAP * max(0, height - 1))
+
+    def _dashboard_cell_pixel_height(self, height: int) -> int:
+        # The panel box (cell) = the visible card height (_dashboard_item_pixel_height)
+        # PLUS the header band that sits above the card. Sizing the box this way
+        # keeps the card itself at the intended pixel height and lands the next
+        # card exactly DASHBOARD_GRID_GAP away (vertical gap == horizontal gap).
+        # Used for BOTH grid cells and the floating datetime overlay so a floating
+        # panel matches a grid panel of the same grid height.
+        return self._dashboard_item_pixel_height(height) + PANEL_MOVE_BAR_HEIGHT + PANEL_HANDLE_CONTENT_GAP
 
     def _full_scroll_position(self) -> tuple[int, int] | None:
         scroll = getattr(self, "full_scroll_area", None)
@@ -9967,34 +10160,22 @@ class MainWindow(QMainWindow):
         source_width = self._normalized_dashboard_width(source_item.get("w"))
         old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
         old_y = self._normalized_dashboard_y(source_item.get("y"))
-        minimum_width = self._minimum_feature_dashboard_width(source_key)
-        packed_items: list[dict[str, object]] = []
-        for candidate_width in range(source_width, minimum_width - 1, -1):
-            candidate_items = [dict(item) for item in items]
-            candidate_source = next(
-                (item for item in candidate_items if str(item.get("key", "")) == source_key),
-                None,
-            )
-            if candidate_source is None:
-                continue
-            position = (
-                self._normalized_dashboard_x(base_position[0], candidate_width),
-                self._normalized_dashboard_y(base_position[1]),
-            )
-            candidate_source["x"], candidate_source["y"] = position
-            candidate_source["w"] = candidate_width
-            flow_direction = self._dashboard_flow_direction(old_x, old_y, position[0], position[1])
-            strict_lateral_push = flow_direction in {"left", "right"} and position[1] == old_y
-            packed_items = self._pack_feature_dashboard_items(
-                candidate_items,
-                priority_keys=[source_key],
-                flow_direction=flow_direction,
-                strict_lateral_push=strict_lateral_push,
-            )
-            if packed_items:
-                break
+        position = (
+            self._normalized_dashboard_x(base_position[0], source_width),
+            self._normalized_dashboard_y(base_position[1]),
+        )
+        source_item["x"], source_item["y"] = position
+        source_item["w"] = source_width
+        # The dragged panel goes exactly where dropped (priority); any panel it
+        # overlaps is pushed sideways within the row when there is room (in the
+        # move's flow direction), otherwise down. Every non-datetime panel uses
+        # this same rule, so unrelated panels never scatter or float up.
+        flow_direction = self._dashboard_flow_direction(old_x, old_y, position[0], position[1])
+        packed_items = self._resolve_dashboard_collisions(
+            items, priority_keys=[source_key], flow_direction=flow_direction
+        )
         if not packed_items:
-            self.statusBar().showMessage("옆으로 빈 공간이 없어 이동하지 않았습니다.", 1600)
+            self.statusBar().showMessage("패널을 옮길 빈 공간이 없습니다.", 1600)
             return False
         self.feature_dashboard_items = packed_items + hidden_items
         self._render_feature_dashboard()
@@ -10035,7 +10216,11 @@ class MainWindow(QMainWindow):
         if not isinstance(container, QWidget):
             return None
         cursor_position = container.mapFromGlobal(global_position)
-        if not container.rect().contains(cursor_position):
+        # Allow dropping below the current container bottom so a panel dragged
+        # downward can extend the grid (the container grows with the grid). We
+        # only reject drops entirely outside the container horizontally or above
+        # its top edge; x is clamped to the usable column range.
+        if cursor_position.y() < 0:
             return None
         local_position = cursor_position - drag_offset if isinstance(drag_offset, QPoint) else cursor_position
         column_step = self._dashboard_column_width() + DASHBOARD_GRID_GAP
@@ -10055,10 +10240,29 @@ class MainWindow(QMainWindow):
         if not isinstance(overlay, DashboardGridGuideOverlay) or not isinstance(container, QWidget):
             return
         scroll_position = self._full_scroll_position()
-        overlay.setGeometry(container.rect())
+        container_rect = container.rect()
+        drag_rect = self._dashboard_drag_preview_rect(source_key, global_position, drag_offset)
+        # Extend the overlay downward when the drag preview falls below the
+        # container bottom, so the preview rectangle stays visible while dragging
+        # a panel toward a new row at the bottom.
+        if drag_rect.isValid() and drag_rect.bottom() > container_rect.bottom():
+            extended_rect = QRectF(
+                0.0,
+                0.0,
+                float(container_rect.width()),
+                float(drag_rect.bottom() + 1),
+            ).toRect()
+            overlay.setGeometry(extended_rect)
+            # Grow the container through its single required-height knob so the
+            # scroll area reveals the space being created while dragging downward.
+            # Going through set_required_dashboard_height (backed by sizeHint)
+            # avoids the raw setMinimumHeight thrash that distorted sizing.
+            if isinstance(container, FeatureGridContainer):
+                container.set_required_dashboard_height(int(drag_rect.bottom() + 1))
+        else:
+            overlay.setGeometry(container_rect)
         preview_layout = self._dashboard_preview_layout(source_key, global_position, drag_offset)
         impact_rects = self._dashboard_preview_impact_rects(source_key, preview_layout)
-        drag_rect = self._dashboard_drag_preview_rect(source_key, global_position, drag_offset)
         overlay.set_preview_rect(drag_rect, impact_rects)
         overlay.raise_()
         if not overlay.isVisible():
@@ -10070,6 +10274,11 @@ class MainWindow(QMainWindow):
         if isinstance(overlay, DashboardGridGuideOverlay):
             overlay.hide()
             overlay.set_preview_rect(QRectF(), [])
+        # Drop the drag-time required-height expansion; _render_feature_dashboard
+        # recomputes the committed required height (grid + datetime overlay).
+        container = getattr(self, "feature_grid_container", None)
+        if isinstance(container, FeatureGridContainer):
+            container.set_required_dashboard_height(0)
 
     def _show_dashboard_resize_guides(self, feature_key: str) -> None:
         overlay = getattr(self, "dashboard_guide_overlay", None)
@@ -10107,87 +10316,51 @@ class MainWindow(QMainWindow):
     ) -> list[dict[str, object]]:
         if source_key in FLOATING_OVERLAY_FEATURE_KEYS:
             return self._floating_dashboard_preview_layout(source_key, global_position, drag_offset)
-        target = self._feature_drop_target_at(global_position, source_key)
         all_items = [dict(item) for item in self._current_feature_dashboard_layout()]
         items, hidden_items = self._split_dashboard_items_for_visible_edit(all_items, {source_key})
         source_item = next((item for item in items if str(item.get("key", "")) == source_key), None)
         if source_item is None:
             return []
-        position = self._dashboard_grid_position_from_global(
-            global_position,
-            self._normalized_dashboard_width(source_item.get("w")),
-            drag_offset,
-        )
+        source_width = self._normalized_dashboard_width(source_item.get("w"))
+        position = self._dashboard_grid_position_from_global(global_position, source_width, drag_offset)
         if position is not None:
-            source_width = self._normalized_dashboard_width(source_item.get("w"))
+            # Grid-position drop: mirror finish_feature_reposition exactly so the
+            # preview the user sees matches the committed result (same resolver,
+            # same flow direction → sideways-if-space-else-down, never block).
             old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
             old_y = self._normalized_dashboard_y(source_item.get("y"))
             column, row = position
             source_item["x"] = column
             source_item["y"] = row
             flow_direction = self._dashboard_flow_direction(old_x, old_y, column, row)
-            strict_lateral_push = flow_direction in {"left", "right"} and row == old_y
-            preview_items = self._pack_feature_dashboard_items(
-                items,
-                priority_keys=[source_key],
-                flow_direction=flow_direction,
-                strict_lateral_push=strict_lateral_push,
-            )
-            if strict_lateral_push and not preview_items:
-                return [dict(item) for item in self._current_feature_dashboard_layout()]
-            return preview_items + hidden_items
-        if target is not None:
-            target_kind, target_key, _placement = target
-            if target_kind == "feature":
-                target_item = next((item for item in items if str(item.get("key", "")) == target_key), None)
-                if target_item is not None:
-                    source_width = self._normalized_feature_dashboard_width(source_key, source_item.get("w"))
-                    source_height = self._normalized_feature_dashboard_height(source_key, source_item.get("h"))
-                    target_width = self._normalized_feature_dashboard_width(target_key, target_item.get("w"))
-                    target_height = self._normalized_feature_dashboard_height(target_key, target_item.get("h"))
-                    source_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
-                    source_y = self._normalized_dashboard_y(source_item.get("y"))
-                    target_x = self._normalized_dashboard_x(target_item.get("x"), target_width)
-                    target_y = self._normalized_dashboard_y(target_item.get("y"))
-                    source_item.update(
-                        {
-                            "x": self._normalized_dashboard_x(target_x, source_width),
-                            "y": target_y,
-                            "w": source_width,
-                            "h": source_height,
-                        }
-                    )
-                    target_item.update(
-                        {
-                            "x": self._normalized_dashboard_x(source_x, target_width),
-                            "y": source_y,
-                            "w": target_width,
-                            "h": target_height,
-                        }
-                    )
-                    return self._pack_feature_dashboard_items(
-                        items,
-                        priority_keys=[source_key, target_key],
-                    ) + hidden_items
+            return self._resolve_dashboard_collisions(
+                items, priority_keys=[source_key], flow_direction=flow_direction
+            ) + hidden_items
 
-        position = self._dashboard_grid_position_from_global(
-            global_position,
-            self._normalized_dashboard_width(source_item.get("w")),
-            drag_offset,
-        )
-        if position is None:
-            return self._pack_feature_dashboard_items(items) + hidden_items
-        source_width = self._normalized_dashboard_width(source_item.get("w"))
-        old_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
-        old_y = self._normalized_dashboard_y(source_item.get("y"))
-        column, row = position
-        source_item["x"] = column
-        source_item["y"] = row
-        return self._pack_feature_dashboard_items(
-            items,
-            priority_keys=[source_key],
-            flow_direction=self._dashboard_flow_direction(old_x, old_y, column, row),
-        ) + hidden_items
+        # No grid position (cursor above the grid): mirror the drop's swap path —
+        # if hovering another panel, preview a swap; otherwise leave layout as-is.
+        target = self._feature_drop_target_at(global_position, source_key)
+        if target is not None and target[0] == "feature":
+            target_key = target[1]
+            target_item = next((item for item in items if str(item.get("key", "")) == target_key), None)
+            if target_item is not None:
+                source_height = self._normalized_feature_dashboard_height(source_key, source_item.get("h"))
+                target_width = self._normalized_feature_dashboard_width(target_key, target_item.get("w"))
+                target_height = self._normalized_feature_dashboard_height(target_key, target_item.get("h"))
+                source_x = self._normalized_dashboard_x(source_item.get("x"), source_width)
+                source_y = self._normalized_dashboard_y(source_item.get("y"))
+                target_x = self._normalized_dashboard_x(target_item.get("x"), target_width)
+                target_y = self._normalized_dashboard_y(target_item.get("y"))
+                source_item.update(
+                    {"x": self._normalized_dashboard_x(target_x, source_width), "y": target_y, "w": source_width, "h": source_height}
+                )
+                target_item.update(
+                    {"x": self._normalized_dashboard_x(source_x, target_width), "y": source_y, "w": target_width, "h": target_height}
+                )
+                return self._resolve_dashboard_collisions(
+                    items, priority_keys=[source_key, target_key]
+                ) + hidden_items
+        return self._resolve_dashboard_collisions(items) + hidden_items
 
     def _floating_dashboard_preview_layout(
         self,
@@ -10240,11 +10413,14 @@ class MainWindow(QMainWindow):
         height = self._normalized_dashboard_height(item.get("h"))
         column = int(item.get("x", 0))
         row = int(item.get("y", 0))
+        # Use the full box height (card + header) so the floating overlay occupies
+        # the exact same pixel region as a grid panel of the same grid size, and
+        # the container/drag guides outline the real box.
         return QRectF(
             column * (self._dashboard_column_width() + DASHBOARD_GRID_GAP),
             row * (DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP),
             self._dashboard_item_pixel_width(width),
-            self._dashboard_item_pixel_height(height),
+            self._dashboard_cell_pixel_height(height),
         )
 
     def _dashboard_drag_preview_size(self, source_key: str) -> tuple[float, float] | None:
@@ -10295,9 +10471,11 @@ class MainWindow(QMainWindow):
         left = float(cursor_position.x()) - offset_x
         top = float(cursor_position.y()) - offset_y
         max_left = max(0.0, float(container.width()) - preview_width)
-        max_top = max(0.0, float(container.height()) - preview_height)
+        # Allow the preview to follow the cursor below the container bottom so
+        # users see where a downward drop will land; only clamp the left edge and
+        # keep the top non-negative.
         left = min(max(0.0, left), max_left)
-        top = min(max(0.0, top), max_top)
+        top = max(0.0, top)
         return QRectF(left, top, preview_width, preview_height)
 
     def _dashboard_occupied_cells(
@@ -10513,11 +10691,23 @@ class MainWindow(QMainWindow):
 
         previous_rows = int(getattr(self, "feature_dashboard_row_count", 0) or 0)
         max_row = max((int(item.get("y", 0)) + int(item.get("h", 1)) for item in visible_items), default=1)
+        # Floating overlays (datetime) are placed by geometry, not the grid layout,
+        # so they don't contribute to max_row automatically. Include them so the
+        # container grows downward when a floating overlay is dragged below the
+        # current bottom (otherwise the overlay would be clipped/hidden).
+        for floating_item in floating_items:
+            max_row = max(max_row, int(floating_item.get("y", 0)) + int(floating_item.get("h", 1)))
         for row in range(max(previous_rows, max_row + 1) + 1):
             layout.setRowMinimumHeight(row, 0)
             layout.setRowStretch(row, 0)
+        # Each content row reserves ROW_HEIGHT + GAP so empty rows keep their
+        # height (vertical spacing is 0). This guarantees a panel at grid row N
+        # always renders at pixel y = N*(ROW_HEIGHT+GAP) even when rows above it
+        # are emptied by dragging a panel away — fixing the "neighbors creep up"
+        # bug. Cell heights stay ROW_HEIGHT*h + GAP*(h-1); the trailing GAP of the
+        # row span becomes the inter-panel gap under AlignTop.
         for row in range(max_row):
-            layout.setRowMinimumHeight(row, DASHBOARD_GRID_ROW_HEIGHT)
+            layout.setRowMinimumHeight(row, DASHBOARD_GRID_ROW_HEIGHT + DASHBOARD_GRID_GAP)
         layout.setRowStretch(max_row, 1)
         self.feature_dashboard_row_count = max_row + 1
 
@@ -10531,7 +10721,7 @@ class MainWindow(QMainWindow):
             widget.hide()
             cell = FeatureCell(key, widget)
             cell.hide()
-            cell.set_panel_height(self._dashboard_item_pixel_height(height))
+            cell.set_panel_height(self._dashboard_cell_pixel_height(height))
             cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
             self.feature_cells[key] = cell
             layout.addWidget(
@@ -10555,7 +10745,7 @@ class MainWindow(QMainWindow):
             widget.hide()
             cell = FeatureCell(key, widget, self.feature_grid_container)
             cell.hide()
-            cell.set_panel_height(self._dashboard_item_pixel_height(height))
+            cell.set_panel_height(self._dashboard_cell_pixel_height(height))
             cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
             cell.setGeometry(self._dashboard_item_rect(item).toRect())
             self.feature_cells[key] = cell
@@ -10564,6 +10754,20 @@ class MainWindow(QMainWindow):
             widget.show()
             cell.raise_()
             widget.raise_()
+
+        # The floating datetime overlay is placed by geometry, not the grid, so
+        # the QGridLayout sizeHint doesn't account for it. Feed its bottom edge
+        # into the container's single required-height knob (backed by sizeHint),
+        # so the scroll content grows to fit the overlay when it is at the bottom
+        # — without a grid reservation widget (which would shift real panels) or
+        # raw setMinimumHeight calls (which thrashed column widths).
+        floating_bottom = 0
+        for floating_item in floating_items:
+            rect = self._dashboard_item_rect(floating_item)
+            floating_bottom = max(floating_bottom, int(rect.y() + rect.height()))
+        container = getattr(self, "feature_grid_container", None)
+        if isinstance(container, FeatureGridContainer):
+            container.set_required_dashboard_height(floating_bottom)
 
         overlay = getattr(self, "dashboard_guide_overlay", None)
         if isinstance(overlay, DashboardGridGuideOverlay):
@@ -10599,7 +10803,7 @@ class MainWindow(QMainWindow):
                     continue
                 width = self._normalized_dashboard_width(item.get("w"))
                 height = self._normalized_dashboard_height(item.get("h"))
-                cell.set_panel_height(self._dashboard_item_pixel_height(height))
+                cell.set_panel_height(self._dashboard_cell_pixel_height(height))
                 cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
                 cell.setGeometry(self._dashboard_item_rect(item).toRect())
                 cell.raise_()
@@ -11250,7 +11454,7 @@ class MainWindow(QMainWindow):
 
     def _normalized_item_height(self, height: object) -> int:
         try:
-            return min(1400, max(80, int(height)))
+            return min(4000, max(80, int(height)))
         except (TypeError, ValueError):
             return 280
 

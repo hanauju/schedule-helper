@@ -721,11 +721,11 @@ def test_card_panel_borders_fit_dashboard_grid_rhythm(tmp_path) -> None:
         title = widget.findChild(QLabel, "panelTitleLabel")
         assert title is not None
         rect = QRect(widget.mapTo(window, QPoint(0, 0)), widget.size())
-        expected_card_height = (
-            window._dashboard_item_pixel_height(heights[key])
-            - PANEL_HEADER_HEIGHT
-            - PANEL_HANDLE_CONTENT_GAP
-        )
+        # The grid cell (box) is now sized as card + header, so the visible card
+        # itself equals the item pixel height. This keeps the vertical card-to-card
+        # gap equal to the horizontal one (DASHBOARD_GRID_GAP) instead of being
+        # widened by the header band's height.
+        expected_card_height = window._dashboard_item_pixel_height(heights[key])
         assert rect.height() == expected_card_height
         move_bar = window.feature_boxes[key].move_bar
         assert move_bar is not None
@@ -5959,7 +5959,26 @@ def test_dashboard_move_pushes_neighbors_sideways_when_space_remains(tmp_path) -
     window.close()
 
 
-def test_dashboard_move_does_not_wrap_neighbors_when_side_space_is_full(tmp_path) -> None:
+def _dashboard_layout_has_no_overlap(items: list[dict[str, object]]) -> bool:
+    """True when no two non-floating panels share a grid cell."""
+    occupied: set[tuple[int, int]] = set()
+    for item in items:
+        if str(item.get("key", "")) == "datetime":
+            continue
+        x, y = int(item["x"]), int(item["y"])
+        w, h = int(item["w"]), int(item["h"])
+        for cx in range(x, x + w):
+            for cy in range(y, y + h):
+                if (cx, cy) in occupied:
+                    return False
+                occupied.add((cx, cy))
+    return True
+
+
+def test_dashboard_move_pushes_neighbor_sideways_then_down_when_row_is_full(tmp_path) -> None:
+    # When a panel is dropped onto a full row, the move is never blocked: the
+    # dragged panel takes the target slot and displaced neighbors slide sideways
+    # if the row still has room, otherwise drop to the next row. Nothing floats up.
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -5978,22 +5997,25 @@ def test_dashboard_move_does_not_wrap_neighbors_when_side_space_is_full(tmp_path
 
     column_step = window._dashboard_column_width() + DASHBOARD_GRID_GAP
     drop_global = window.feature_grid_container.mapToGlobal(QPoint(int(round(column_step * 4)), 0))
-    before = {
-        str(item["key"]): (int(item["x"]), int(item["y"]))
-        for item in window._current_feature_dashboard_layout()
-    }
-    assert not window._move_feature_to_dashboard_position("focus", drop_global)
+    assert window._move_feature_to_dashboard_position("focus", drop_global)
     app.processEvents()
 
-    after = {
-        str(item["key"]): (int(item["x"]), int(item["y"]))
-        for item in window._current_feature_dashboard_layout()
-    }
-    assert after == before
+    items = [dict(item) for item in window._current_feature_dashboard_layout()]
+    positions = {str(item["key"]): (int(item["x"]), int(item["y"])) for item in items}
+    # Dragged panel lands exactly at the target slot.
+    assert positions["focus"] == (4, 0)
+    # quick_memo had room to its right, so it slides sideways within row 0.
+    assert positions["quick_memo"] == (8, 0)
+    # link_favorites had no lateral room left, so it drops straight down.
+    assert positions["link_favorites"] == (8, 4)
+    # No panel floated above its row and nothing overlaps.
+    assert _dashboard_layout_has_no_overlap(items)
     window.close()
 
 
-def test_dashboard_media_drag_blocks_instead_of_wrapping_full_row(tmp_path) -> None:
+def test_dashboard_media_drag_pushes_neighbors_down_instead_of_blocking(tmp_path) -> None:
+    # Dragging media onto a full row pushes the overlapped neighbors down rather
+    # than blocking, and the drag preview matches the committed drop exactly.
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -6013,23 +6035,22 @@ def test_dashboard_media_drag_blocks_instead_of_wrapping_full_row(tmp_path) -> N
     column_step = window._dashboard_column_width() + DASHBOARD_GRID_GAP
     drag_offset = QPoint(10, 10)
     drop_global = window.feature_grid_container.mapToGlobal(QPoint(int(round(column_step * 2)) + 10, 10))
-    before = {
-        str(item["key"]): (int(item["x"]), int(item["y"]))
-        for item in window._current_feature_dashboard_layout()
-    }
 
     preview = window._dashboard_preview_item("media_panel", drop_global, drag_offset)
     assert preview is not None
-    assert (int(preview["x"]), int(preview["y"])) == before["media_panel"]
+    # Preview shows the dragged panel at the target slot...
+    assert (int(preview["x"]), int(preview["y"])) == (2, 0)
 
     window.finish_feature_reposition("media_panel", drop_global, drag_offset)
     app.processEvents()
 
-    positions = {
-        str(item["key"]): (int(item["x"]), int(item["y"]))
-        for item in window._current_feature_dashboard_layout()
-    }
-    assert positions == before
+    items = [dict(item) for item in window._current_feature_dashboard_layout()]
+    positions = {str(item["key"]): (int(item["x"]), int(item["y"])) for item in items}
+    # ...and the commit matches the preview, with the overlapped panel pushed down.
+    assert positions["media_panel"] == (2, 0)
+    assert positions["focus"] == (0, 4)
+    assert positions["quick_memo"] == (5, 0)
+    assert _dashboard_layout_has_no_overlap(items)
     window.close()
 
 
