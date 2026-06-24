@@ -135,6 +135,58 @@ def test_default_preferences_show_captured_dashboard_panels(tmp_path) -> None:
     assert not seeded.show_datetime_panel
 
 
+def test_auto_collapse_focus_form_preference_round_trips(tmp_path) -> None:
+    assert Preference().auto_collapse_focus_form is False
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    assert seeded.auto_collapse_focus_form is False
+
+    seeded.auto_collapse_focus_form = True
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.auto_collapse_focus_form is True
+
+
+def test_focus_status_grid_and_color_preferences_round_trip(tmp_path) -> None:
+    defaults = Preference()
+    assert defaults.show_focus_status_grid is True
+    assert defaults.focus_display_color == "#b9a7e8"
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    assert seeded.show_focus_status_grid is True
+    assert seeded.focus_display_color == "#b9a7e8"
+
+    seeded.show_focus_status_grid = False
+    seeded.focus_display_color = "#ff8800"
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.show_focus_status_grid is False
+    assert reloaded.focus_display_color == "#ff8800"
+
+
+def test_focus_fade_threshold_preferences_round_trip(tmp_path) -> None:
+    defaults = Preference()
+    assert defaults.focus_fade_half_minutes == 3
+    assert defaults.focus_fade_white_minutes == 6
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    assert seeded.focus_fade_half_minutes == 3
+    assert seeded.focus_fade_white_minutes == 6
+
+    seeded.focus_fade_half_minutes = 2
+    seeded.focus_fade_white_minutes = 8
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.focus_fade_half_minutes == 2
+    assert reloaded.focus_fade_white_minutes == 8
+
+
 def test_repository_persists_tasks_and_events(tmp_path) -> None:
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     custom_task_type = repository.save_item_type(ItemType("업무", "task"))

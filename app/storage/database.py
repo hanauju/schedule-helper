@@ -389,6 +389,8 @@ class ScheduleRepository:
                     app_title TEXT NOT NULL DEFAULT '오롯',
                     main_always_on_top INTEGER NOT NULL DEFAULT 0,
                     show_focus_panel INTEGER NOT NULL DEFAULT 1,
+                    auto_collapse_focus_form INTEGER NOT NULL DEFAULT 0,
+                    show_focus_status_grid INTEGER NOT NULL DEFAULT 1,
                     show_datetime_panel INTEGER NOT NULL DEFAULT 0,
                     show_current_date INTEGER NOT NULL DEFAULT 1,
                     show_current_time INTEGER NOT NULL DEFAULT 1,
@@ -438,6 +440,9 @@ class ScheduleRepository:
                     panel_color TEXT NOT NULL DEFAULT '#fafafa',
                     table_color TEXT NOT NULL DEFAULT '#fafafa',
                     text_color TEXT NOT NULL DEFAULT '#111315',
+                    focus_display_color TEXT NOT NULL DEFAULT '#b9a7e8',
+                    focus_fade_half_minutes INTEGER NOT NULL DEFAULT 3,
+                    focus_fade_white_minutes INTEGER NOT NULL DEFAULT 6,
                     main_font_family TEXT NOT NULL DEFAULT '',
                     main_font_size INTEGER NOT NULL DEFAULT 13,
                     label_font_size INTEGER NOT NULL DEFAULT 13,
@@ -637,6 +642,10 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_always_on_top INTEGER NOT NULL DEFAULT 0")
             if "show_focus_panel" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_panel INTEGER NOT NULL DEFAULT 1")
+            if "auto_collapse_focus_form" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN auto_collapse_focus_form INTEGER NOT NULL DEFAULT 0")
+            if "show_focus_status_grid" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_status_grid INTEGER NOT NULL DEFAULT 1")
             if "show_datetime_panel" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_datetime_panel INTEGER NOT NULL DEFAULT 0")
             if "show_current_date" not in preference_columns:
@@ -774,6 +783,12 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN table_color TEXT NOT NULL DEFAULT '#fafafa'")
             if "text_color" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN text_color TEXT NOT NULL DEFAULT '#111315'")
+            if "focus_display_color" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN focus_display_color TEXT NOT NULL DEFAULT '#b9a7e8'")
+            if "focus_fade_half_minutes" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN focus_fade_half_minutes INTEGER NOT NULL DEFAULT 3")
+            if "focus_fade_white_minutes" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN focus_fade_white_minutes INTEGER NOT NULL DEFAULT 6")
             if "main_font_family" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_font_family TEXT NOT NULL DEFAULT ''")
             if "main_font_size" not in preference_columns:
@@ -1409,6 +1424,8 @@ class ScheduleRepository:
             app_title=_app_title(row["app_title"]),
             main_always_on_top=bool(row["main_always_on_top"]),
             show_focus_panel=bool(row["show_focus_panel"]),
+            auto_collapse_focus_form=bool(row["auto_collapse_focus_form"]),
+            show_focus_status_grid=bool(row["show_focus_status_grid"]),
             show_datetime_panel=bool(row["show_datetime_panel"]),
             show_current_date=bool(row["show_current_date"]),
             show_current_time=bool(row["show_current_time"]),
@@ -1460,6 +1477,9 @@ class ScheduleRepository:
             panel_color=_optional_color(row["panel_color"]),
             table_color=_optional_color(row["table_color"]),
             text_color=_optional_color(row["text_color"]),
+            focus_display_color=str(row["focus_display_color"] or "#b9a7e8"),
+            focus_fade_half_minutes=int(row["focus_fade_half_minutes"]),
+            focus_fade_white_minutes=int(row["focus_fade_white_minutes"]),
             main_font_family=str(row["main_font_family"] or "").strip(),
             main_font_size=_main_font_size(row["main_font_size"]),
             label_font_size=_label_font_size(row["label_font_size"]),
@@ -1536,18 +1556,19 @@ class ScheduleRepository:
                 INSERT INTO preferences
                   (id, day_max_minutes, break_minutes, strategy, week_start_day,
                    app_title, main_always_on_top,
-                   show_focus_panel, show_datetime_panel, show_current_date, show_current_time, show_current_seconds,
+                   show_focus_panel, auto_collapse_focus_form, show_focus_status_grid, show_datetime_panel, show_current_date, show_current_time, show_current_seconds,
                    show_pomodoro_controls, show_today_timeline_inline, show_today_timeline_waiting_panel,
                    show_today_timeline_waiting_pinned, show_today_checklist_inline,
                    show_today_flow_panel, show_quick_memo_panel, show_link_favorites_panel,
                    show_media_panel, media_panel_file_path,
                    show_compact_favorites_panel, favorite_display_mode, time_format, appearance_theme, accent_color,
-                   button_color, background_color, inner_background_color, panel_color, table_color, text_color,
-                   main_font_family, main_font_size, label_font_size, content_font_size,
+                    button_color, background_color, inner_background_color, panel_color, table_color, text_color,
+                    focus_display_color, focus_fade_half_minutes, focus_fade_white_minutes,
+                    main_font_family, main_font_size, label_font_size, content_font_size,
                    show_header_banner, header_banner_image_path, header_banner_height, header_banner_position, header_banner_span,
                    focus_rate_display,
                    last_window_width, last_window_height, last_layout_state)
-                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                     day_max_minutes = excluded.day_max_minutes,
                     break_minutes = excluded.break_minutes,
@@ -1556,6 +1577,8 @@ class ScheduleRepository:
                     app_title = excluded.app_title,
                     main_always_on_top = excluded.main_always_on_top,
                     show_focus_panel = excluded.show_focus_panel,
+                    auto_collapse_focus_form = excluded.auto_collapse_focus_form,
+                    show_focus_status_grid = excluded.show_focus_status_grid,
                     show_datetime_panel = excluded.show_datetime_panel,
                     show_current_date = excluded.show_current_date,
                     show_current_time = excluded.show_current_time,
@@ -1581,6 +1604,9 @@ class ScheduleRepository:
                     panel_color = excluded.panel_color,
                     table_color = excluded.table_color,
                     text_color = excluded.text_color,
+                    focus_display_color = excluded.focus_display_color,
+                    focus_fade_half_minutes = excluded.focus_fade_half_minutes,
+                    focus_fade_white_minutes = excluded.focus_fade_white_minutes,
                     main_font_family = excluded.main_font_family,
                     main_font_size = excluded.main_font_size,
                     label_font_size = excluded.label_font_size,
@@ -1603,6 +1629,8 @@ class ScheduleRepository:
                     preferences.app_title,
                     int(preferences.main_always_on_top),
                     int(preferences.show_focus_panel),
+                    int(preferences.auto_collapse_focus_form),
+                    int(preferences.show_focus_status_grid),
                     int(preferences.show_datetime_panel),
                     int(preferences.show_current_date),
                     int(preferences.show_current_time),
@@ -1628,6 +1656,9 @@ class ScheduleRepository:
                     preferences.panel_color,
                     preferences.table_color,
                     preferences.text_color,
+                    preferences.focus_display_color,
+                    int(preferences.focus_fade_half_minutes),
+                    int(preferences.focus_fade_white_minutes),
                     preferences.main_font_family,
                     preferences.main_font_size,
                     preferences.label_font_size,
