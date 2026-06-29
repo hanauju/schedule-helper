@@ -149,6 +149,20 @@ def test_auto_collapse_focus_form_preference_round_trips(tmp_path) -> None:
     assert reloaded.auto_collapse_focus_form is True
 
 
+def test_keep_focus_form_expanded_preference_round_trips(tmp_path) -> None:
+    assert Preference().keep_focus_form_expanded is False
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    assert seeded.keep_focus_form_expanded is False
+
+    seeded.keep_focus_form_expanded = True
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.keep_focus_form_expanded is True
+
+
 def test_focus_status_grid_and_color_preferences_round_trip(tmp_path) -> None:
     defaults = Preference()
     assert defaults.show_focus_status_grid is True
@@ -185,6 +199,41 @@ def test_focus_fade_threshold_preferences_round_trip(tmp_path) -> None:
     reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
     assert reloaded.focus_fade_half_minutes == 2
     assert reloaded.focus_fade_white_minutes == 8
+
+
+def test_focus_status_cell_shape_preference_round_trip(tmp_path) -> None:
+    defaults = Preference()
+    assert defaults.focus_status_cell_shape == "dot"
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    assert seeded.focus_status_cell_shape == "dot"
+
+    seeded.focus_status_cell_shape = "heart"
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.focus_status_cell_shape == "heart"
+
+
+def test_focus_status_cell_shape_preference_supports_all_shapes(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    for shape in ("dot", "heart", "wave", "line"):
+        seeded = repository.get_preferences()
+        seeded.focus_status_cell_shape = shape
+        repository.save_preferences(seeded)
+        reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+        assert reloaded.focus_status_cell_shape == shape
+
+
+def test_focus_status_cell_shape_preference_normalizes_unknown(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    seeded = repository.get_preferences()
+    seeded.focus_status_cell_shape = "triangle"
+    repository.save_preferences(seeded)
+
+    reloaded = ScheduleRepository(tmp_path / "schedule.sqlite3").get_preferences()
+    assert reloaded.focus_status_cell_shape == "dot"
 
 
 def test_repository_persists_tasks_and_events(tmp_path) -> None:

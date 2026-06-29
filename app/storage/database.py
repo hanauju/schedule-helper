@@ -200,6 +200,11 @@ def _focus_rate_display(value: str) -> str:
     return value if value in {"ring", "bar"} else "ring"
 
 
+def _focus_status_cell_shape(value: object) -> str:
+    shape = str(value or "").strip().lower()
+    return shape if shape in {"dot", "heart", "wave", "line"} else "dot"
+
+
 def _header_banner_position(value: str) -> str:
     normalized = str(value or "").strip().lower()
     if normalized in {"left", "center", "right"}:
@@ -390,6 +395,7 @@ class ScheduleRepository:
                     main_always_on_top INTEGER NOT NULL DEFAULT 0,
                     show_focus_panel INTEGER NOT NULL DEFAULT 1,
                     auto_collapse_focus_form INTEGER NOT NULL DEFAULT 0,
+                    keep_focus_form_expanded INTEGER NOT NULL DEFAULT 0,
                     show_focus_status_grid INTEGER NOT NULL DEFAULT 1,
                     show_datetime_panel INTEGER NOT NULL DEFAULT 0,
                     show_current_date INTEGER NOT NULL DEFAULT 1,
@@ -443,6 +449,7 @@ class ScheduleRepository:
                     focus_display_color TEXT NOT NULL DEFAULT '#b9a7e8',
                     focus_fade_half_minutes INTEGER NOT NULL DEFAULT 3,
                     focus_fade_white_minutes INTEGER NOT NULL DEFAULT 6,
+                    focus_status_cell_shape TEXT NOT NULL DEFAULT 'dot',
                     main_font_family TEXT NOT NULL DEFAULT '',
                     main_font_size INTEGER NOT NULL DEFAULT 13,
                     label_font_size INTEGER NOT NULL DEFAULT 13,
@@ -644,6 +651,8 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_panel INTEGER NOT NULL DEFAULT 1")
             if "auto_collapse_focus_form" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN auto_collapse_focus_form INTEGER NOT NULL DEFAULT 0")
+            if "keep_focus_form_expanded" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN keep_focus_form_expanded INTEGER NOT NULL DEFAULT 0")
             if "show_focus_status_grid" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN show_focus_status_grid INTEGER NOT NULL DEFAULT 1")
             if "show_datetime_panel" not in preference_columns:
@@ -789,6 +798,8 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE preferences ADD COLUMN focus_fade_half_minutes INTEGER NOT NULL DEFAULT 3")
             if "focus_fade_white_minutes" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN focus_fade_white_minutes INTEGER NOT NULL DEFAULT 6")
+            if "focus_status_cell_shape" not in preference_columns:
+                connection.execute("ALTER TABLE preferences ADD COLUMN focus_status_cell_shape TEXT NOT NULL DEFAULT 'dot'")
             if "main_font_family" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN main_font_family TEXT NOT NULL DEFAULT ''")
             if "main_font_size" not in preference_columns:
@@ -1425,6 +1436,7 @@ class ScheduleRepository:
             main_always_on_top=bool(row["main_always_on_top"]),
             show_focus_panel=bool(row["show_focus_panel"]),
             auto_collapse_focus_form=bool(row["auto_collapse_focus_form"]),
+            keep_focus_form_expanded=bool(row["keep_focus_form_expanded"]),
             show_focus_status_grid=bool(row["show_focus_status_grid"]),
             show_datetime_panel=bool(row["show_datetime_panel"]),
             show_current_date=bool(row["show_current_date"]),
@@ -1480,6 +1492,7 @@ class ScheduleRepository:
             focus_display_color=str(row["focus_display_color"] or "#b9a7e8"),
             focus_fade_half_minutes=int(row["focus_fade_half_minutes"]),
             focus_fade_white_minutes=int(row["focus_fade_white_minutes"]),
+            focus_status_cell_shape=_focus_status_cell_shape(row["focus_status_cell_shape"]),
             main_font_family=str(row["main_font_family"] or "").strip(),
             main_font_size=_main_font_size(row["main_font_size"]),
             label_font_size=_label_font_size(row["label_font_size"]),
@@ -1547,6 +1560,7 @@ class ScheduleRepository:
         preferences.header_banner_position = _header_banner_position(preferences.header_banner_position)
         preferences.header_banner_span = _header_banner_span(preferences.header_banner_span)
         preferences.focus_rate_display = _focus_rate_display(preferences.focus_rate_display)
+        preferences.focus_status_cell_shape = _focus_status_cell_shape(preferences.focus_status_cell_shape)
         preferences.app_title = _app_title(preferences.app_title)
         preferences.last_window_width = _window_dimension(preferences.last_window_width, 1280, 430, 4000)
         preferences.last_window_height = _window_dimension(preferences.last_window_height, 820, 320, 3000)
@@ -1705,7 +1719,9 @@ class ScheduleRepository:
                     header_banner_image_view = ?,
                     quick_note_sort_direction = ?,
                     checklist_sort_direction = ?,
-                    active_workspace_id = ?
+                    active_workspace_id = ?,
+                    focus_status_cell_shape = ?,
+                    keep_focus_form_expanded = ?
                 WHERE id = 1
                 """,
                 (
@@ -1738,6 +1754,8 @@ class ScheduleRepository:
                     preferences.quick_note_sort_direction,
                     preferences.checklist_sort_direction,
                     preferences.active_workspace_id,
+                    preferences.focus_status_cell_shape,
+                    int(preferences.keep_focus_form_expanded),
                 ),
             )
         return preferences

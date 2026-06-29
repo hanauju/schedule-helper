@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 
 from PySide6.QtCore import QDate, QEvent, QMimeData, QPoint, QPointF, QRectF, QSize, Qt, QTime, QTimer, QUrl
 from PySide6.QtGui import (
+    QBrush,
     QColor,
     QCursor,
     QDrag,
@@ -79,6 +80,8 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStackedWidget,
     QStatusBar,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTabWidget,
     QTableWidget,
     QTableWidgetItem,
@@ -938,8 +941,17 @@ class FocusRateRing(QWidget):
 FOCUS_STATUS_COLUMNS = 6
 FOCUS_STATUS_BUCKET_SECONDS = 600  # one cell == 10 minutes of elapsed focus time
 FOCUS_STATUS_MIN_ROWS = 3  # 3 rows x 6 cols x 10min == 3 hours visible before scrolling
-FOCUS_STATUS_ROW_HEIGHT = 8
+FOCUS_STATUS_ROW_HEIGHT = 28  # taller cells; dot radius and chrome height scale from this
 FOCUS_STATUS_EMPTY_COLOR = "#eef0f4"
+FOCUS_STATUS_DOT_MARGIN = 3  # gap around each dot
+FOCUS_STATUS_DOT_RADIUS_RATIO = 0.42  # dot radius relative to cell short side
+FOCUS_STATUS_CELL_SHAPES = ("dot", "heart", "wave", "line")
+FOCUS_STATUS_DEFAULT_SHAPE = "dot"
+
+
+def _normalize_focus_cell_shape(value: str) -> str:
+    shape = str(value or "").strip().lower()
+    return shape if shape in FOCUS_STATUS_CELL_SHAPES else FOCUS_STATUS_DEFAULT_SHAPE
 
 
 def _focus_activity_cell_color(
@@ -969,15 +981,109 @@ def _focus_activity_cell_color(
     return base
 
 
+class FocusStatusCellDelegate(QStyledItemDelegate):
+    """Paints each focus-status cell as a cute compact vector shape.
+
+    The shape (dot, heart, wave, or short line) is chosen in the focus activity
+    settings. The cell color comes from the item's background brush: reached cells
+    carry the focus color and unreached cells the neutral empty color.
+    """
+
+    def __init__(self, parent: QWidget | None = None, shape: str = FOCUS_STATUS_DEFAULT_SHAPE) -> None:
+        super().__init__(parent)
+        self.shape = _normalize_focus_cell_shape(shape)
+
+    @staticmethod
+    def _fill_color_from_data(value: object) -> QColor:
+        # QTableWidgetItem.setBackground stores a QBrush, so the real color lives on
+        # the brush; accept a bare QColor too and fall back when absent or invalid.
+        if isinstance(value, QBrush):
+            color = value.color()
+        elif isinstance(value, QColor):
+            color = value
+        else:
+            color = QColor()
+        if not color.isValid():
+            return QColor(FOCUS_STATUS_EMPTY_COLOR)
+        return color
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        painter.save()
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        rect = option.rect
+        margin = FOCUS_STATUS_DOT_MARGIN
+        cell_rect = rect.adjusted(margin, margin, -margin, -margin)
+        radius = max(2.0, min(cell_rect.width(), cell_rect.height()) * FOCUS_STATUS_DOT_RADIUS_RATIO)
+        fill = self._fill_color_from_data(index.data(Qt.ItemDataRole.BackgroundRole))
+        center = QPointF(rect.center().x(), rect.center().y())
+
+        if self.shape == "heart":
+            self._paint_heart(painter, center, radius, fill)
+        elif self.shape == "wave":
+            self._paint_wave(painter, center, radius, fill)
+        elif self.shape == "line":
+            self._paint_line(painter, center, radius, fill)
+        else:
+            self._paint_dot(painter, center, radius, fill)
+        painter.restore()
+
+    @staticmethod
+    def _paint_dot(painter: QPainter, center: QPointF, radius: float, fill: QColor) -> None:
+        painter.setBrush(fill)
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 0))
+        painter.drawEllipse(center, radius, radius)
+
+    @staticmethod
+    def _paint_heart(painter: QPainter, center: QPointF, radius: float, fill: QColor) -> None:
+        cx, cy = center.x(), center.y()
+        size = radius * 1.05
+        top = cy - size * 0.55
+        bottom = cy + size * 0.92
+        path = QPainterPath()
+        path.moveTo(cx, bottom)
+        path.cubicTo(cx - size * 1.28, cy - size * 0.18, cx - size * 0.52, top, cx, cy - size * 0.22)
+        path.cubicTo(cx + size * 0.52, top, cx + size * 1.28, cy - size * 0.18, cx, bottom)
+        path.closeSubpath()
+        painter.setBrush(fill)
+        painter.setPen(QPen(QColor(255, 255, 255, 120), 0))
+        painter.drawPath(path)
+
+    @staticmethod
+    def _paint_wave(painter: QPainter, center: QPointF, radius: float, fill: QColor) -> None:
+        cx, cy = center.x(), center.y()
+        half = radius * 1.15
+        amp = radius * 0.7
+        path = QPainterPath()
+        path.moveTo(cx - half, cy)
+        path.cubicTo(cx - half * 0.45, cy - amp * 1.7, cx - half * 0.1, cy - amp, cx, cy)
+        path.cubicTo(cx + half * 0.1, cy + amp, cx + half * 0.45, cy + amp * 1.7, cx + half, cy)
+        pen = QPen(fill, max(1.6, radius * 0.55))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setBrush(Qt.BrushStyle.NoBrush)
+        painter.setPen(pen)
+        painter.drawPath(path)
+
+    @staticmethod
+    def _paint_line(painter: QPainter, center: QPointF, radius: float, fill: QColor) -> None:
+        cx, cy = center.x(), center.y()
+        half = radius * 1.15
+        pen = QPen(fill, max(2.0, radius * 0.7))
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        painter.setPen(pen)
+        painter.drawLine(QPointF(cx - half, cy), QPointF(cx + half, cy))
+
+
 class FocusStatusGrid(QTableWidget):
-    """Timeline-style grid of 10-minute focus cells.
+    """Cute dot grid of 10-minute focus cells.
 
     Cells fill left to right, top to bottom; one cell == 10 minutes of elapsed
-    focus time. Each cell starts at the focus color and fades as away time (idle
-    past the cutoff, or off the designated window) accumulates inside that window
-    (full color when present, half-light past the half threshold, white past the
-    white threshold). Three rows (3 hours) stay visible and the grid scrolls once
-    a session runs longer than that.
+    focus time. Each cell is drawn as a small dot that starts at the focus color
+    and fades as away time (idle past the cutoff, or off the designated window)
+    accumulates inside that window (full color when present, half-light past the
+    half threshold, white past the white threshold). Three rows (3 hours) stay
+    visible and the grid scrolls once a session runs longer than that.
     """
 
     def __init__(self, parent: QWidget | None = None) -> None:
@@ -987,22 +1093,42 @@ class FocusStatusGrid(QTableWidget):
         self.verticalHeader().setVisible(False)
         self.verticalHeader().setMinimumSectionSize(1)
         self.verticalHeader().setDefaultSectionSize(FOCUS_STATUS_ROW_HEIGHT)
-        self.setShowGrid(True)
+        self.setShowGrid(False)
         self.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.setFixedHeight(self._chrome_height())
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._visible_rows = FOCUS_STATUS_MIN_ROWS
+        self._status_buckets: list[int] = []
+        self._status_elapsed_seconds = 0
+        self._status_focus_color = "#b9a7e8"
+        self._status_half_minutes = 3
+        self._status_white_minutes = 6
+        self.setMinimumHeight(self._chrome_height(FOCUS_STATUS_MIN_ROWS))
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._cell_delegate = FocusStatusCellDelegate(self, FOCUS_STATUS_DEFAULT_SHAPE)
+        self.setItemDelegate(self._cell_delegate)
         self.update_status([], 0, "#b9a7e8")
 
-    def _chrome_height(self) -> int:
-        return FOCUS_STATUS_ROW_HEIGHT * FOCUS_STATUS_MIN_ROWS + 2 * self.frameWidth() + 1
+    def _chrome_height(self, rows: int | None = None) -> int:
+        visible_rows = max(FOCUS_STATUS_MIN_ROWS, rows or FOCUS_STATUS_MIN_ROWS)
+        return FOCUS_STATUS_ROW_HEIGHT * visible_rows + 2 * self.frameWidth() + 1
+
+    def shape(self) -> str:
+        return self._cell_delegate.shape
+
+    def set_shape(self, shape: str) -> None:
+        normalized = _normalize_focus_cell_shape(shape)
+        if normalized == self._cell_delegate.shape:
+            return
+        self._cell_delegate.shape = normalized
+        self.viewport().update()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._resize_columns()
+        self._sync_visible_rows_to_height()
 
     def _resize_columns(self) -> None:
         width = self.viewport().width()
@@ -1012,6 +1138,16 @@ class FocusStatusGrid(QTableWidget):
         for column in range(FOCUS_STATUS_COLUMNS):
             self.setColumnWidth(column, column_width)
 
+    def _sync_visible_rows_to_height(self) -> None:
+        height = self.viewport().height()
+        if height <= 0:
+            return
+        visible_rows = max(FOCUS_STATUS_MIN_ROWS, height // FOCUS_STATUS_ROW_HEIGHT)
+        if visible_rows == self._visible_rows:
+            return
+        self._visible_rows = visible_rows
+        self._render_status()
+
     def update_status(
         self,
         buckets: list[int],
@@ -1020,11 +1156,21 @@ class FocusStatusGrid(QTableWidget):
         half_minutes: int = 3,
         white_minutes: int = 6,
     ) -> None:
+        self._status_buckets = list(buckets)
+        self._status_elapsed_seconds = elapsed_seconds
+        self._status_focus_color = focus_color
+        self._status_half_minutes = half_minutes
+        self._status_white_minutes = white_minutes
+        self._render_status()
+
+    def _render_status(self) -> None:
         reached = 0
-        if elapsed_seconds > 0:
-            reached = (elapsed_seconds + FOCUS_STATUS_BUCKET_SECONDS - 1) // FOCUS_STATUS_BUCKET_SECONDS
+        if self._status_elapsed_seconds > 0:
+            reached = (
+                self._status_elapsed_seconds + FOCUS_STATUS_BUCKET_SECONDS - 1
+            ) // FOCUS_STATUS_BUCKET_SECONDS
         needed_rows = (reached + FOCUS_STATUS_COLUMNS - 1) // FOCUS_STATUS_COLUMNS
-        rows = max(FOCUS_STATUS_MIN_ROWS, needed_rows)
+        rows = max(FOCUS_STATUS_MIN_ROWS, self._visible_rows, needed_rows)
         if self.rowCount() != rows:
             self.setRowCount(rows)
         empty_color = QColor(FOCUS_STATUS_EMPTY_COLOR)
@@ -1039,8 +1185,15 @@ class FocusStatusGrid(QTableWidget):
                 item.setFlags(Qt.ItemFlag.ItemIsEnabled)
                 self.setItem(row, column, item)
             if index < reached:
-                away = buckets[index] if index < len(buckets) else 0
-                item.setBackground(_focus_activity_cell_color(away, focus_color, half_minutes, white_minutes))
+                away = self._status_buckets[index] if index < len(self._status_buckets) else 0
+                item.setBackground(
+                    _focus_activity_cell_color(
+                        away,
+                        self._status_focus_color,
+                        self._status_half_minutes,
+                        self._status_white_minutes,
+                    )
+                )
                 last_filled = item
             else:
                 item.setBackground(empty_color)
@@ -1076,6 +1229,26 @@ class FocusActivitySettingsDialog(QDialog):
         self.auto_collapse_check = QCheckBox("집중 시작 시 편집창 자동 접기")
         self.auto_collapse_check.setChecked(bool(preferences.auto_collapse_focus_form))
         layout.addWidget(self.auto_collapse_check)
+
+        self.keep_expanded_check = QCheckBox("설정 항상 펼쳐두기 (펼치기 버튼 숨김)")
+        self.keep_expanded_check.setChecked(bool(preferences.keep_focus_form_expanded))
+        layout.addWidget(self.keep_expanded_check)
+
+        shape_row = QHBoxLayout()
+        shape_row.setSpacing(8)
+        shape_row.addWidget(QLabel("표시 모양"))
+        shape_row.addStretch(1)
+        self.shape_combo = QComboBox()
+        self.shape_combo.setObjectName("focusShapeCombo")
+        for label, value in (("점", "dot"), ("하트", "heart"), ("물결", "wave"), ("짧은 선", "line")):
+            self.shape_combo.addItem(label, value)
+        current_shape_index = self.shape_combo.findData(
+            _normalize_focus_cell_shape(preferences.focus_status_cell_shape)
+        )
+        if current_shape_index >= 0:
+            self.shape_combo.setCurrentIndex(current_shape_index)
+        shape_row.addWidget(self.shape_combo)
+        layout.addLayout(shape_row)
 
         timing_label = QLabel("이탈 시간에 따른 색 옅어짐 (한 칸 10분 기준)")
         timing_label.setObjectName("formLabel")
@@ -1128,6 +1301,13 @@ class FocusActivitySettingsDialog(QDialog):
 
     def auto_collapse_focus_form(self) -> bool:
         return self.auto_collapse_check.isChecked()
+
+    def keep_focus_form_expanded(self) -> bool:
+        return self.keep_expanded_check.isChecked()
+
+    def focus_cell_shape(self) -> str:
+        data = self.shape_combo.currentData()
+        return _normalize_focus_cell_shape(str(data)) if data is not None else FOCUS_STATUS_DEFAULT_SHAPE
 
     def fade_half_minutes(self) -> int:
         return self.half_minutes_spin.value()
@@ -2218,7 +2398,16 @@ class DraggableFeatureBox(QWidget):
         return 56 if self.feature_key in FLOATING_OVERLAY_FEATURE_KEYS else 120
 
     def _minimum_resize_pixel_height(self) -> int:
-        return 36 if self.feature_key in FLOATING_OVERLAY_FEATURE_KEYS else 80
+        if self.feature_key in FLOATING_OVERLAY_FEATURE_KEYS:
+            return 36
+        # The focus panel carries a tall dashboard plus pinned form states, so a
+        # low drag floor lets rows fold together. Pomodoro has its own compact
+        # timer-only layout, so it can resize more freely.
+        if self.feature_key == "focus":
+            return 200
+        if self.feature_key == "pomodoro":
+            return 160
+        return 80
 
     def _grid_column_width(self) -> float:
         widget = self.parentWidget()
@@ -3338,6 +3527,7 @@ class MainWindow(QMainWindow):
             on_changed=self.refresh_today,
             on_focus_task=self.load_task_by_id,
             on_delete_focus_session=self.delete_focus_session_by_id,
+            on_set_focus_session_color=self.set_focus_session_color_by_id,
             show_waiting_panel=self.preferences.show_today_timeline_waiting_panel,
             waiting_panel_pinned=self.preferences.show_today_timeline_waiting_pinned,
             on_waiting_pinned_changed=self.set_today_timeline_waiting_pinned,
@@ -4031,6 +4221,11 @@ class MainWindow(QMainWindow):
         form = QGridLayout(form_panel)
         self.focus_form = form
         self.focus_form_panel = form_panel
+        # Pinned ("always show settings") mode docks this panel inline below the
+        # timer dashboard. A Minimum vertical policy keeps it at its content
+        # height so the controls and Korean labels are never crushed when the
+        # focus panel is short.
+        form_panel.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Minimum)
         form.setContentsMargins(14, 12, 14, 12)
         form.setHorizontalSpacing(10)
         form.setVerticalSpacing(6)
@@ -4277,15 +4472,17 @@ class MainWindow(QMainWindow):
         button_row.addWidget(self.complete_focus_button)
         focus_dashboard_layout.addLayout(button_row)
         # Timer/countdown dashboard stays the hero. The compact focus-status grid
-        # sits directly under it (above the collapse toggle) and shows only while
-        # the setup form is collapsed. The setup form and its focus-color picker
-        # live below the toggle and show only while expanded.
+        # sits directly under it and follows the status-grid preference.
+        # The setup form + focus-color picker are docked inline lower down: shown
+        # inline when pinned, otherwise hidden until the bottom toggle opens the
+        # floating overlay dropdown.
         layout.addWidget(focus_dashboard)
         self._focus_away_buckets: list[int] = []
         self._focus_elapsed_total = 0
         self.focus_status_grid = FocusStatusGrid()
+        self.focus_status_grid.set_shape(self.preferences.focus_status_cell_shape)
         self.focus_status_grid.setVisible(False)
-        layout.addWidget(self.focus_status_grid)
+        layout.addWidget(self.focus_status_grid, 1)
         layout.addSpacing(6)
         self.focus_form_toggle = QToolButton()
         self.focus_form_toggle.setObjectName("focusFormToggle")
@@ -4302,7 +4499,6 @@ class MainWindow(QMainWindow):
             "QToolButton#focusFormToggle:hover { background: #eef0f7; border-color: #d3d6e0; }"
         )
         self.focus_form_toggle.toggled.connect(self._on_focus_form_toggle)
-        layout.addWidget(self.focus_form_toggle)
 
         self.focus_color_row = QWidget()
         focus_color_layout = QHBoxLayout(self.focus_color_row)
@@ -4310,23 +4506,32 @@ class MainWindow(QMainWindow):
         focus_color_layout.setSpacing(8)
         focus_color_label = QLabel("집중 표시 색")
         focus_color_label.setObjectName("formLabel")
+        focus_color_label.setMinimumHeight(PANEL_CONTROL_HEIGHT)
         self.focus_color_swatch = QLabel()
         self.focus_color_swatch.setObjectName("focusColorSwatch")
-        self.focus_color_swatch.setFixedSize(34, 18)
+        self.focus_color_swatch.setFixedSize(40, 24)
         self.focus_color_button = QPushButton("색 선택")
         self.focus_color_button.setObjectName("softButton")
+        _stabilize_control(self.focus_color_button, 96)
+        self.focus_color_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
         self.focus_color_button.clicked.connect(self._choose_focus_display_color)
         focus_color_layout.addWidget(focus_color_label)
         focus_color_layout.addStretch(1)
         focus_color_layout.addWidget(self.focus_color_swatch)
         focus_color_layout.addWidget(self.focus_color_button)
-        # The form panel and color row live in a floating overlay dropdown (created
-        # lazily on first expand) so they don't crush the timer dashboard above.
         self.focus_form_overlay: QFrame | None = None
-        layout.addStretch(1)
+        # Pinned "always show settings" mode docks the setup form + focus-color row
+        # inline here. In the default (non-pinned) mode the responsive layout keeps
+        # them hidden until the toggle reparents them into a floating overlay
+        # dropdown so they don't crush the timer dashboard above.
+        layout.addWidget(self.focus_form_panel)
+        layout.addWidget(self.focus_color_row)
+        layout.addWidget(self.focus_form_toggle)
         self._update_focus_color_swatch()
 
         self.toggle_focus_target_controls(False)
+        if self.preferences.keep_focus_form_expanded:
+            self._focus_form_expanded = True
         self.update_focus_panel_responsive_layout()
 
         return panel
@@ -4373,6 +4578,7 @@ class MainWindow(QMainWindow):
         dense = width > 0 and width < 420
         tiny = (width > 0 and width < 340) or (height > 0 and height < 300)
         micro = (width > 0 and width < 280) or (height > 0 and height < 260)
+        panel_height_tight = height > 0 and height <= 320
         mode = "micro" if micro else "tiny" if tiny else "compact" if compact else "wide"
 
         form = self.focus_form
@@ -4430,20 +4636,29 @@ class MainWindow(QMainWindow):
                 form.addWidget(self.idle_cutoff_spin, 3, 3)
             self._focus_responsive_mode = mode
 
-        if tiny:
+        if panel_height_tight:
+            form.setContentsMargins(6, 6, 6, 6)
+        elif tiny:
             form.setContentsMargins(8, 8, 8, 8)
         elif compact:
             form.setContentsMargins(10, 10, 10, 10)
         else:
             form.setContentsMargins(14, 12, 14, 12)
-        form.setHorizontalSpacing(6 if tiny else 8 if compact else 10)
-        form.setVerticalSpacing(5 if tiny else 7 if compact else 6)
+        form.setHorizontalSpacing(6 if (tiny or panel_height_tight) else 8 if compact else 10)
+        form.setVerticalSpacing(4 if panel_height_tight else 5 if tiny else 7 if compact else 6)
 
         compact_rhythm = width > 0 and width < 560
         _apply_panel_rhythm(self.focus_panel_layout, "tiny" if tiny else "compact" if compact_rhythm else "normal")
 
         if hasattr(self, "focus_dashboard_layout"):
             _apply_panel_rhythm(self.focus_dashboard_layout, "tiny" if tiny else "compact" if compact_rhythm else "normal")
+
+        if panel_height_tight:
+            self.focus_panel_layout.setContentsMargins(8, 8, 8, 8)
+            self.focus_panel_layout.setSpacing(6)
+            if hasattr(self, "focus_dashboard_layout"):
+                self.focus_dashboard_layout.setContentsMargins(10, 8, 10, 8)
+                self.focus_dashboard_layout.setSpacing(6)
 
         for label in (
             self.focus_task_label,
@@ -4462,10 +4677,30 @@ class MainWindow(QMainWindow):
         self._focus_responsive_tiny = tiny
         self._focus_responsive_dense = dense
         self.focus_header_label.setVisible(False)
-        form_expanded = getattr(self, "_focus_form_expanded", False)
-        # The form panel + color row live in a floating overlay; their inline
-        # visibility is driven by the overlay, not the panel layout.
-        if hasattr(self, "focus_form_overlay") and self.focus_form_overlay is not None:
+        pinned = bool(self.preferences.keep_focus_form_expanded)
+        target_setup_tight = pinned and target_controls_visible and height > 0 and height < 700
+        if target_setup_tight:
+            form.setContentsMargins(6, 6, 6, 6)
+            form.setHorizontalSpacing(6)
+            form.setVerticalSpacing(4)
+            self.focus_panel_layout.setContentsMargins(10, 8, 10, 8)
+            self.focus_panel_layout.setSpacing(6)
+            if hasattr(self, "focus_dashboard_layout"):
+                self.focus_dashboard_layout.setContentsMargins(10, 8, 10, 8)
+                self.focus_dashboard_layout.setSpacing(6)
+        # Pinned mode is always "expanded": the setup form shows inline while
+        # the toggle hides; status-grid visibility follows the preference below.
+        form_expanded = True if pinned else getattr(self, "_focus_form_expanded", False)
+        if pinned:
+            # Inline docked form + color row; no floating overlay in this mode.
+            self.focus_form_panel.setVisible(not micro)
+            if hasattr(self, "focus_color_row"):
+                self.focus_color_row.setVisible(not micro and not target_setup_tight)
+            if getattr(self, "focus_form_overlay", None) is not None:
+                self.focus_form_overlay.setVisible(False)
+        elif getattr(self, "focus_form_overlay", None) is not None:
+            # Non-pinned: the form panel + color row live in a floating overlay;
+            # their inline visibility is driven by the overlay, not the layout.
             self.focus_form_panel.setVisible(True)
             if hasattr(self, "focus_color_row"):
                 self.focus_color_row.setVisible(True)
@@ -4476,11 +4711,28 @@ class MainWindow(QMainWindow):
             self.focus_form_panel.setVisible(False)
             if hasattr(self, "focus_color_row"):
                 self.focus_color_row.setVisible(False)
+        if hasattr(self, "focus_color_swatch") and hasattr(self, "focus_color_button"):
+            # The enclosing FeatureCell relaxes every descendant's minimum width
+            # to 0 so panels can dock narrow, which also wipes the swatch's fixed
+            # width and the color button's stabilized minimum. Beside the color
+            # row's stretch they then collapse to their sizeHints (an 8px swatch
+            # and a 68px button), squeezing the pinned setup at narrow widths.
+            # Re-assert the intended sizing so the focus color row stays usable
+            # whether pinned inline or shown in the floating overlay.
+            self.focus_color_swatch.setFixedSize(40, 24)
+            self.focus_color_button.setMinimumWidth(96)
         if hasattr(self, "focus_form_toggle"):
-            self.focus_form_toggle.setVisible(not micro)
+            self.focus_form_toggle.setVisible(not micro and not pinned and not panel_height_tight)
         if hasattr(self, "focus_status_grid"):
-            # Compact status grid: only while collapsed, enabled, and not micro.
-            show_grid = (not micro) and (not form_expanded) and bool(self.preferences.show_focus_status_grid)
+            # Status grid visibility tracks the preference and non-micro space
+            # only. It stays visible whether the setup form is collapsed,
+            # expanded into the floating overlay, or pinned inline.
+            show_grid = (
+                (not micro)
+                and (not panel_height_tight)
+                and (not target_setup_tight)
+                and bool(self.preferences.show_focus_status_grid)
+            )
             self.focus_status_grid.setVisible(show_grid)
         self.focus_title_label.setVisible(True)
         self.focus_task_label.setVisible(False)
@@ -4496,6 +4748,8 @@ class MainWindow(QMainWindow):
             widget.setVisible(target_controls_visible)
             widget.setEnabled(self.use_focus_target_check.isChecked())
         self.focus_targets_label.setVisible(False)
+        self.focus_targets_list.setMinimumHeight(54 if target_setup_tight else 82)
+        self.focus_targets_list.setMaximumHeight(58 if target_setup_tight else 104)
         self.remove_target_button.hide()
         self.planned_minutes_label.setVisible(not tiny)
         self.planned_minutes_spin.setVisible(not micro)
@@ -4504,23 +4758,32 @@ class MainWindow(QMainWindow):
         self.focus_detail_label.setVisible(False)
         self.focus_ratio_card.setVisible(not dense)
         self._focus_force_rate_bar = compact
-        if compact:
-            if getattr(self, "_focus_form_expanded", True):
+        tight_dashboard = panel_height_tight or target_setup_tight
+        if tight_dashboard:
+            self.focus_ratio_card.setMinimumHeight(76)
+            self.focus_ratio_card.setMaximumHeight(82)
+            self.focus_ratio_stack.setMinimumHeight(46)
+            self.focus_ratio_stack.setMaximumHeight(50)
+            if hasattr(self, "focus_ratio_layout"):
+                self.focus_ratio_layout.setContentsMargins(8, 6, 8, 6)
+                self.focus_ratio_layout.setSpacing(2)
+        elif compact:
+            if form_expanded:
                 # Expanded: keep the ratio compact so the setup form fits without
                 # squeezing the dashboard.
-                self.focus_ratio_card.setMinimumHeight(72)
-                self.focus_ratio_card.setMaximumHeight(86)
-                self.focus_ratio_stack.setMinimumHeight(30)
-                self.focus_ratio_stack.setMaximumHeight(44)
+                self.focus_ratio_card.setMinimumHeight(88)
+                self.focus_ratio_card.setMaximumHeight(92)
+                self.focus_ratio_stack.setMinimumHeight(46)
+                self.focus_ratio_stack.setMaximumHeight(50)
                 if hasattr(self, "focus_ratio_layout"):
                     self.focus_ratio_layout.setContentsMargins(12, 9, 12, 9)
                     self.focus_ratio_layout.setSpacing(5)
             else:
                 # Collapsed widget view: the dashboard is the main content, so give
                 # the focus-rate card more height (less flat).
-                self.focus_ratio_card.setMinimumHeight(88)
+                self.focus_ratio_card.setMinimumHeight(94)
                 self.focus_ratio_card.setMaximumHeight(108)
-                self.focus_ratio_stack.setMinimumHeight(40)
+                self.focus_ratio_stack.setMinimumHeight(46)
                 self.focus_ratio_stack.setMaximumHeight(58)
                 if hasattr(self, "focus_ratio_layout"):
                     self.focus_ratio_layout.setContentsMargins(14, 12, 14, 12)
@@ -4534,7 +4797,7 @@ class MainWindow(QMainWindow):
                 self.focus_ratio_layout.setContentsMargins(16, 14, 16, 14)
                 self.focus_ratio_layout.setSpacing(8)
         self.update_focus_rate_display_mode()
-        metric_cards_visible = not micro
+        metric_cards_visible = not micro and not tight_dashboard
         compact_metrics = compact or tiny or dense
         for card in self.focus_metric_cards:
             card.setVisible(metric_cards_visible)
@@ -4560,12 +4823,17 @@ class MainWindow(QMainWindow):
         self.focus_meter_row.setDirection(meter_direction)
         self.focus_metrics_layout.setDirection(metrics_direction)
         self.focus_button_row.setDirection(button_direction)
+        self.focus_meter_row.setSpacing(8 if tight_dashboard else 16)
+        self.focus_metrics_layout.setSpacing(6 if compact_metrics else 10)
+        self.focus_button_row.setSpacing(6 if tight_dashboard else 10)
         if hasattr(self, "target_action_layout"):
             self.target_action_layout.setDirection(
                 QBoxLayout.Direction.LeftToRight
             )
 
-        if micro:
+        if tight_dashboard:
+            self.remaining_time_label.setStyleSheet("font-size: 22px;")
+        elif micro:
             self.remaining_time_label.setStyleSheet("font-size: 26px;")
         elif tiny:
             self.remaining_time_label.setStyleSheet("font-size: 30px;")
@@ -4576,7 +4844,42 @@ class MainWindow(QMainWindow):
         else:
             self.remaining_time_label.setStyleSheet("")
         if hasattr(self, "focus_ratio_ring"):
-            self.focus_ratio_ring.setMinimumSize(64 if dense else 72, 64 if dense else 72)
+            ring_size = 52 if tight_dashboard else 64 if dense else 72
+            self.focus_ratio_ring.setMinimumSize(ring_size, ring_size)
+        # Keep the inline setup form and the timer dashboard from folding their
+        # rows together when a pinned or compact focus panel is squeezed below its
+        # content height. Without these floors the target action box collapses, the
+        # form grid compresses so the combo/list/duration rows overlap, the timer
+        # label is crushed, and the 집중률 ratio card sits on top of the progress
+        # bar, metric cards, and action buttons stacked below it. Pinning each block
+        # to its current content minimum makes a too-short panel clip at the bottom
+        # instead of overlapping. activate() refreshes the cached minimum after the
+        # grid arrangement and row directions just changed above.
+        self.remaining_time_label.setMinimumHeight(24 if tight_dashboard else 26 if micro else 30 if tiny else 34)
+        status_height = 26 if tight_dashboard else 30
+        status_max = 28 if tight_dashboard else 34
+        self.focus_status_label.setMinimumHeight(status_height)
+        self.focus_status_label.setMaximumHeight(status_max)
+        self.focus_session_title_label.setMinimumHeight(status_height)
+        self.focus_session_title_label.setMaximumHeight(status_max)
+        for button in (self.start_focus_button, self.pause_focus_button, self.complete_focus_button):
+            button.setMinimumHeight(34 if tight_dashboard else 0)
+            button.setMaximumHeight(36 if tight_dashboard else 16777215)
+        if not dense:
+            self.use_focus_target_check.setMinimumHeight(PANEL_CONTROL_HEIGHT)
+        self.target_action_box.setMinimumHeight(PANEL_CONTROL_HEIGHT)
+        if self.focus_form_panel.isVisible():
+            self.focus_form.activate()
+            self.focus_form_panel.setMinimumHeight(self.focus_form_panel.minimumSizeHint().height())
+        else:
+            self.focus_form_panel.setMinimumHeight(0)
+        if hasattr(self, "focus_dashboard_card"):
+            dashboard_layout = self.focus_dashboard_card.layout()
+            if dashboard_layout is not None:
+                dashboard_layout.activate()
+            self.focus_dashboard_card.setMinimumHeight(
+                self.focus_dashboard_card.minimumSizeHint().height()
+            )
 
     def _build_metric_card(self, caption: str, value_label: QLabel) -> QWidget:
         card = QWidget()
@@ -4611,6 +4914,7 @@ class MainWindow(QMainWindow):
 
         timer_card = QWidget()
         timer_card.setObjectName("pomodoroTimerCard")
+        self.pomodoro_timer_card = timer_card
         timer_card_layout = QVBoxLayout(timer_card)
         self.pomodoro_timer_card_layout = timer_card_layout
         timer_card_layout.setContentsMargins(16, 14, 16, 14)
@@ -4621,14 +4925,18 @@ class MainWindow(QMainWindow):
         self.pomodoro_status_dot = QFrame()
         self.pomodoro_status_dot.setObjectName("pomodoroStatusDot")
         self.pomodoro_status_dot.setFixedSize(7, 7)
-        heading_row.addWidget(self.pomodoro_status_dot)
+        heading_row.addWidget(self.pomodoro_status_dot, 0, Qt.AlignmentFlag.AlignVCenter)
         self.pomodoro_status_label = QLabel("대기")
         self.pomodoro_status_label.setObjectName("pomodoroStatus")
         self.pomodoro_status_label.setMinimumWidth(0)
+        self.pomodoro_status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.pomodoro_status_label.setMinimumHeight(30)
+        self.pomodoro_status_label.setMaximumHeight(32)
+        self.pomodoro_status_label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         self.pomodoro_time_label = QLabel("25:00")
         self.pomodoro_time_label.setObjectName("pomodoroTime")
         self.pomodoro_time_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        heading_row.addWidget(self.pomodoro_status_label)
+        heading_row.addWidget(self.pomodoro_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
         heading_row.addStretch(1)
         timer_card_layout.addLayout(heading_row)
         timer_card_layout.addWidget(self.pomodoro_time_label)
@@ -4645,10 +4953,13 @@ class MainWindow(QMainWindow):
         self.pomodoro_detail_label.setWordWrap(True)
         self.pomodoro_detail_label.hide()
         timer_card_layout.addWidget(self.pomodoro_detail_label)
-        layout.addWidget(timer_card)
+        timer_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        layout.addWidget(timer_card, 1)
 
         controls_panel = QWidget()
         controls_panel.setObjectName("pomodoroControlsPanel")
+        self.pomodoro_controls_panel = controls_panel
+        controls_panel.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         controls_layout = QVBoxLayout(controls_panel)
         self.pomodoro_controls_layout = controls_layout
         controls_layout.setContentsMargins(14, 12, 14, 12)
@@ -4713,7 +5024,9 @@ class MainWindow(QMainWindow):
         required = (
             "pomodoro_panel",
             "pomodoro_panel_layout",
+            "pomodoro_timer_card",
             "pomodoro_timer_card_layout",
+            "pomodoro_controls_panel",
             "pomodoro_input_row",
             "pomodoro_button_row",
             "pomodoro_status_label",
@@ -4724,29 +5037,66 @@ class MainWindow(QMainWindow):
             return
         width = self.pomodoro_panel.width()
         height = self.pomodoro_panel.height()
-        compact = (width > 0 and width < 380) or (height > 0 and height < 190)
+        tight_height = height > 0 and height < 300
+        mini_height = height > 0 and height < 190
+        compact = (width > 0 and width < 420) or tight_height
         tiny = width > 0 and width < 260
         _apply_panel_rhythm(self.pomodoro_panel_layout, "tiny" if tiny else "compact" if compact else "normal")
-        timer_horizontal_margin = 12 if tiny else 14 if compact else 16
-        timer_vertical_margin = 12 if compact else 14
+        if tight_height:
+            self.pomodoro_panel_layout.setSpacing(6)
+        timer_horizontal_margin = 8 if mini_height else 12 if tight_height or tiny else 14 if compact else 16
+        timer_vertical_margin = 5 if mini_height else 8 if tight_height else 12 if compact else 14
         self.pomodoro_timer_card_layout.setContentsMargins(
             timer_horizontal_margin,
             timer_vertical_margin,
             timer_horizontal_margin,
             timer_vertical_margin,
         )
-        self.pomodoro_timer_card_layout.setSpacing(7 if tiny else 10)
+        self.pomodoro_timer_card_layout.setSpacing(3 if mini_height else 5 if tight_height else 7 if tiny else 10)
+        controls_margin = 8 if mini_height else 10 if tight_height else 12
+        self.pomodoro_controls_layout.setContentsMargins(
+            controls_margin,
+            7 if mini_height else 8 if tight_height else 12,
+            controls_margin,
+            7 if mini_height else 8 if tight_height else 12,
+        )
+        self.pomodoro_controls_layout.setSpacing(4 if tight_height else 8)
         direction = QBoxLayout.Direction.TopToBottom if tiny else QBoxLayout.Direction.LeftToRight
         self.pomodoro_input_row.setDirection(direction)
         self.pomodoro_button_row.setDirection(direction)
         self.pomodoro_detail_label.setVisible(False)
-        self.pomodoro_status_label.setVisible(not tiny)
-        if tiny:
+        show_inputs = not tight_height and not tiny
+        for control in (self.pomodoro_minutes_spin, self.break_minutes_spin):
+            control.setVisible(show_inputs)
+        self.pomodoro_status_label.setVisible(not tiny and not mini_height)
+        self.pomodoro_status_label.setMinimumHeight(30)
+        self.pomodoro_status_label.setMaximumHeight(32)
+        self.pomodoro_status_dot.setVisible(not mini_height)
+        self.pomodoro_progress.setVisible(not mini_height)
+        self.pomodoro_controls_panel.setVisible(True)
+        if mini_height:
+            self.pomodoro_time_label.setStyleSheet("font-size: 20px;")
+        elif tight_height:
+            self.pomodoro_time_label.setStyleSheet("font-size: 30px;")
+        elif tiny:
             self.pomodoro_time_label.setStyleSheet("font-size: 22px;")
         elif compact:
             self.pomodoro_time_label.setStyleSheet("font-size: 28px;")
         else:
             self.pomodoro_time_label.setStyleSheet("")
+        # Keep the timer label and the two stacked cards from being crushed when a
+        # short pomodoro panel is squeezed below its content height. Without these
+        # floors the time label collapses to 0px and the controls panel folds so
+        # the spin rows overlap the button row. Pinning each card to its current
+        # content minimum makes a too-short panel clip at the bottom instead of
+        # folding its rows together. activate() refreshes the cached minimum after
+        # the row direction just changed above.
+        self.pomodoro_time_label.setMinimumHeight(22 if mini_height or tiny else 30 if tight_height or compact else 34)
+        for card in (self.pomodoro_controls_panel, self.pomodoro_timer_card):
+            card_layout = card.layout()
+            if card_layout is not None:
+                card_layout.activate()
+            card.setMinimumHeight(0 if not card.isVisible() else card.minimumSizeHint().height())
 
     def _build_today_panel(self) -> QWidget:
         panel = QWidget()
@@ -7366,10 +7716,14 @@ class MainWindow(QMainWindow):
             return
         self.preferences.show_focus_status_grid = dialog.show_focus_status_grid()
         self.preferences.auto_collapse_focus_form = dialog.auto_collapse_focus_form()
+        self.preferences.keep_focus_form_expanded = dialog.keep_focus_form_expanded()
+        self.preferences.focus_status_cell_shape = dialog.focus_cell_shape()
         self.preferences.focus_fade_half_minutes = dialog.fade_half_minutes()
         self.preferences.focus_fade_white_minutes = dialog.fade_white_minutes()
         self.preferences = self.repository.save_preferences(self.preferences)
-        self.update_focus_panel_responsive_layout()
+        if hasattr(self, "focus_status_grid"):
+            self.focus_status_grid.set_shape(self.preferences.focus_status_cell_shape)
+        self._apply_focus_form_pin_mode()
         self.update_focus_display()
 
     def _choose_focus_display_color(self) -> None:
@@ -7382,6 +7736,10 @@ class MainWindow(QMainWindow):
         self.preferences.focus_display_color = color.name()
         self.preferences = self.repository.save_preferences(self.preferences)
         self._update_focus_color_swatch()
+        session = self.focus_timer.session if self.focus_timer else None
+        if session is not None and session.id is not None and session.status in {"running", "paused", "break"}:
+            self.repository.set_focus_session_color(session.id, color.name())
+            session.color = color.name()
         self.update_focus_display()
         self.refresh_inline_timeline()
 
@@ -7412,6 +7770,42 @@ class MainWindow(QMainWindow):
             self.focus_form_toggle.blockSignals(False)
             self.focus_form_toggle.setText("설정 접기  ▲" if self._focus_form_expanded else "설정 펼치기  ▼")
         self.update_focus_panel_responsive_layout()
+
+    def _apply_focus_form_pin_mode(self) -> None:
+        """Sync the focus setup form to the keep-expanded preference.
+
+        Pinned: dock the form inline, drop any floating overlay, and stay
+        expanded (toggle hidden). Non-pinned: return to a clean collapsed state
+        so the toggle + overlay dropdown behave exactly as before.
+        """
+        if bool(self.preferences.keep_focus_form_expanded):
+            self._dock_focus_form_inline()
+            self._set_focus_form_expanded(True)
+        else:
+            self._set_focus_form_expanded(False)
+
+    def _dock_focus_form_inline(self) -> None:
+        layout = getattr(self, "focus_panel_layout", None)
+        panel = getattr(self, "focus_content_panel", None)
+        if not isinstance(layout, QVBoxLayout) or not isinstance(panel, QWidget):
+            return
+        already_inline = (
+            self.focus_form_panel.parentWidget() is panel
+            and layout.indexOf(self.focus_form_panel) != -1
+        )
+        if not already_inline:
+            # Reparent the form panel + color row out of the overlay and back
+            # into the panel, just above the growth stretch and bottom toggle.
+            anchor = layout.indexOf(self.focus_status_grid)
+            if anchor == -1:
+                anchor = max(0, layout.indexOf(self.focus_form_toggle) - 2)
+            layout.insertWidget(anchor + 2, self.focus_form_panel)
+            layout.insertWidget(anchor + 3, self.focus_color_row)
+        overlay = getattr(self, "focus_form_overlay", None)
+        if overlay is not None:
+            overlay.hide()
+            overlay.deleteLater()
+            self.focus_form_overlay = None
 
     def _ensure_focus_form_overlay(self) -> QFrame | None:
         container = getattr(self, "feature_grid_container", None)
@@ -12441,6 +12835,15 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("집중 기록을 삭제했습니다.", 2500)
         return True
 
+    def set_focus_session_color_by_id(self, session_id: int, color: str) -> bool:
+        if not self.repository.set_focus_session_color(session_id, color):
+            return False
+        active = self.focus_timer.session if self.focus_timer else None
+        if active is not None and active.id == session_id:
+            active.color = color
+            self.update_focus_display()
+        return True
+
     def start_focus(self) -> None:
         if self.focus_timer is None:
             return
@@ -12462,12 +12865,13 @@ class MainWindow(QMainWindow):
             target_window_title=window_title,
             target_windows=targets,
             task_id=self.selected_task_id,
+            color=self.preferences.focus_display_color,
         )
         self.break_until = None
         self._reset_focus_away()
         self.focus_tick_timer.start()
         self.update_focus_display()
-        if self.preferences.auto_collapse_focus_form:
+        if self.preferences.auto_collapse_focus_form and not self.preferences.keep_focus_form_expanded:
             self._set_focus_form_expanded(False)
 
     def pause_or_resume_focus(self) -> None:
@@ -12575,15 +12979,21 @@ class MainWindow(QMainWindow):
             self.focus_session_title_label.setText(session_title)
             self.focus_session_title_label.setVisible(active and bool(session_title))
         if hasattr(self, "focus_status_grid"):
+            self.focus_status_grid.set_shape(self.preferences.focus_status_cell_shape)
             elapsed_for_grid = (
                 session.focused_seconds + session.away_seconds + session.paused_seconds
                 if session is not None
                 else 0
             )
+            grid_focus_color = (
+                session.color
+                if session is not None and session.color.strip()
+                else self.preferences.focus_display_color
+            )
             self.focus_status_grid.update_status(
                 getattr(self, "_focus_away_buckets", []),
                 elapsed_for_grid,
-                self.preferences.focus_display_color,
+                grid_focus_color,
                 self.preferences.focus_fade_half_minutes,
                 self.preferences.focus_fade_white_minutes,
             )
@@ -16371,6 +16781,7 @@ class TodayTimelineWidget(QWidget):
         on_changed: Callable[[], None] | None = None,
         on_focus_task: Callable[[int], None] | None = None,
         on_delete_focus_session: Callable[[int], bool] | None = None,
+        on_set_focus_session_color: Callable[[int, str], bool] | None = None,
         show_waiting_panel: bool = True,
         waiting_panel_pinned: bool = True,
         on_waiting_pinned_changed: Callable[[bool], None] | None = None,
@@ -16381,6 +16792,7 @@ class TodayTimelineWidget(QWidget):
         self.on_changed = on_changed
         self.on_focus_task = on_focus_task
         self.on_delete_focus_session = on_delete_focus_session
+        self.on_set_focus_session_color = on_set_focus_session_color
         self.show_waiting_panel = show_waiting_panel
         self.waiting_panel_pinned = waiting_panel_pinned
         self.waiting_auto_collapsed = False
@@ -16950,7 +17362,9 @@ class TodayTimelineWidget(QWidget):
             label = _shorten(title or "항목", 28)
             if item_type == "focus_session":
                 color_action = menu.addAction(f"색상 변경 - {label}")
-                color_action.triggered.connect(lambda _checked=False, session_id=item_id: self.change_focus_session_color(session_id))
+                color_action.triggered.connect(
+                    lambda _checked=False, session_id=item_id: self.change_focus_session_color(session_id)
+                )
                 delete_action = menu.addAction(f"집중 기록 삭제 - {label}")
                 delete_action.triggered.connect(lambda _checked=False, session_id=item_id: self.delete_focus_session(session_id))
                 continue
@@ -17228,11 +17642,17 @@ class TodayTimelineWidget(QWidget):
         if session is None:
             self.refresh_after_change()
             return
-        current_color = QColor(session.color or _timeline_block_color("focus"))
-        selected_color = QColorDialog.getColor(current_color, self, "집중 기록 색상")
-        if not selected_color.isValid():
+        current = QColor(session.color) if session.color.strip() else QColor("#b9a7e8")
+        if not current.isValid():
+            current = QColor("#b9a7e8")
+        color = QColorDialog.getColor(current, self, "집중 기록 색")
+        if not color.isValid():
             return
-        if self.repository.set_focus_session_color(session_id, selected_color.name()):
+        if self.on_set_focus_session_color is not None:
+            updated = self.on_set_focus_session_color(session_id, color.name())
+        else:
+            updated = self.repository.set_focus_session_color(session_id, color.name())
+        if updated:
             self.refresh_after_change()
 
     def open_date_picker_from_label(self, event) -> None:
@@ -20278,6 +20698,10 @@ def _today_timeline_items(
 
     for session in repository.list_focus_sessions(start_at, end_at):
         reference_at = session.started_at or session.ended_at
+        focus_payload: dict[str, object] = {"type": "focus_session", "id": session.id, "title": session.title}
+        session_color = session.color.strip()
+        if session_color and QColor(session_color).isValid():
+            focus_payload["color"] = session_color
         items.append(
             (
                 reference_at,
@@ -20285,7 +20709,7 @@ def _today_timeline_items(
                 f"{_focus_session_goal_summary(session)} · 집중 {_format_duration(session.focused_seconds)} · "
                 f"{_status_label(session.status)}",
                 "focus",
-                {"type": "focus_session", "id": session.id, "title": session.title, "color": session.color},
+                focus_payload,
             )
         )
 
@@ -20358,6 +20782,10 @@ def _today_timeline_blocks(
         session_end = session.ended_at or datetime.now()
         if session_start is None:
             continue
+        focus_payload: dict[str, object] = {"type": "focus_session", "id": session.id, "title": session.title}
+        session_color = session.color.strip()
+        if session_color and QColor(session_color).isValid():
+            focus_payload["color"] = session_color
         _append_timeline_block(
             blocks,
             start_at,
@@ -20366,7 +20794,7 @@ def _today_timeline_blocks(
             session_end,
             "focus",
             f"집중 {session.title} · {_focus_session_goal_summary(session)}",
-            {"type": "focus_session", "id": session.id, "title": session.title, "color": session.color},
+            focus_payload,
         )
 
     return blocks
@@ -20445,11 +20873,7 @@ def _fill_time_block_table(
                 if payload_copy not in payloads:
                     payloads.append(payload_copy)
                     item.setData(Qt.ItemDataRole.UserRole, payloads)
-            block_color = str(payload.get("color") or "").strip() if category == "focus" else ""
-            if category == "focus" and not (block_color and QColor(block_color).isValid()):
-                pref_focus_color = (preferences.focus_display_color if preferences is not None else "").strip()
-                if pref_focus_color and QColor(pref_focus_color).isValid():
-                    block_color = pref_focus_color
+            block_color = str(payload.get("color") or "").strip()
             next_color = QColor(block_color if block_color and QColor(block_color).isValid() else _timeline_block_color(category))
             current_color = item.background().color().name().lower()
             item.setBackground(overlap_background if current_color != slot_background.name().lower() else next_color)

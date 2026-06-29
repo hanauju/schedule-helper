@@ -157,3 +157,18 @@ def test_focus_timer_keeps_counting_after_planned_time(tmp_path) -> None:
     assert saved.status == "running"
     assert saved.focused_seconds == 90
     assert saved.remaining_seconds == 0
+
+
+def test_focus_timer_start_stores_provided_color(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    service = FocusTimerService(repository)
+    start = datetime(2026, 6, 8, 13, 0, 0)
+
+    # Given a chosen focus color, When a session starts, Then that color is stored on the session
+    # instead of an auto-assigned-by-title color.
+    session = service.start("Deep work", 25 * 60, color="#abcdef", now=start)
+
+    assert session.color == "#abcdef"
+    saved = repository.get_focus_session(session.id)
+    assert saved is not None
+    assert saved.color == "#abcdef"

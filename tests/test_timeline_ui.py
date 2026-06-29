@@ -9,7 +9,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, QTimer
-from PySide6.QtGui import QColor, QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
+from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
     QApplication,
@@ -69,7 +69,12 @@ from app.ui.main_window import (
     CompletedAtEditDialog,
     DraggableFeatureBox,
     FavoritesSettingsDialog,
+    FOCUS_STATUS_CELL_SHAPES,
+    FOCUS_STATUS_EMPTY_COLOR,
+    FOCUS_STATUS_MIN_ROWS,
+    FOCUS_STATUS_ROW_HEIGHT,
     FocusActivitySettingsDialog,
+    FocusStatusCellDelegate,
     FocusStatusGrid,
     FocusWidgetDialog,
     ItemTypeSettingsDialog,
@@ -130,6 +135,19 @@ def _checklist_section_titles(layout, title_object_name: str) -> list[str]:
         if title is not None:
             titles.append(title.text())
     return titles
+
+
+def _widget_span_in_parent(widget: QWidget, parent: QWidget) -> tuple[int, int]:
+    top = widget.mapTo(parent, QPoint(0, 0)).y()
+    return top, top + widget.height()
+
+
+def _assert_visible_widget_within_parent(widget: QWidget, parent: QWidget) -> None:
+    if not widget.isVisibleTo(parent):
+        return
+    top, bottom = _widget_span_in_parent(widget, parent)
+    assert top >= 0
+    assert bottom <= parent.height(), f"{widget.objectName() or widget.__class__.__name__} extends below parent"
 
 
 def _click_light_popup_button(app: QApplication, text: str) -> None:
@@ -349,7 +367,7 @@ def test_timeline_deduplicates_same_focus_session_per_slot(tmp_path) -> None:
     assert item.background().color().name().lower() == "#b9a7e8"
 
 
-def test_timeline_focus_block_uses_focus_display_color_preference(tmp_path) -> None:
+def test_timeline_focus_block_without_session_color_uses_default_not_preference(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
@@ -365,18 +383,24 @@ def test_timeline_focus_block_uses_focus_display_color_preference(tmp_path) -> N
     _fill_time_block_table(table, selected_date, blocks, preferences)
     app.processEvents()
 
-    # Focus block with no per-session color uses the focus_display_color preference.
-    assert table.item(9, 1).background().color().name().lower() == "#123456"
+    # Given a focus block with no saved per-session color, When the table renders, Then the cell
+    # uses the default focus color, never the global focus_display_color swatch preference.
+    assert table.item(9, 1).background().color().name().lower() == "#b9a7e8"
 
 
-def test_timeline_focus_block_keeps_explicit_session_color_over_preference(tmp_path) -> None:
+def test_timeline_focus_block_uses_session_color_over_display_color_preference(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
     preferences.focus_display_color = "#123456"
     selected_date = datetime(2026, 6, 14).date()
     table = QTableWidget(24, 7)
-    session_payload = {"type": "focus_session", "id": 9, "title": "Explicit", "color": "#abcdef"}
+    session_payload = {
+        "type": "focus_session",
+        "id": 9,
+        "title": "Explicit",
+        "color": "#abcdef",
+    }
     start = datetime(2026, 6, 14, 9, 0)
     blocks = [
         (start, start + timedelta(minutes=10), "focus", "집중 Explicit", session_payload),
@@ -385,8 +409,217 @@ def test_timeline_focus_block_keeps_explicit_session_color_over_preference(tmp_p
     _fill_time_block_table(table, selected_date, blocks, preferences)
     app.processEvents()
 
-    # An explicit per-session color still overrides the preference.
+    # Given a focus payload carrying its own color, When the table renders, Then that color is
+    # used directly and is not overridden by the global focus_display_color preference.
     assert table.item(9, 1).background().color().name().lower() == "#abcdef"
+
+
+def test_timeline_repository_focus_block_uses_session_color_over_display_color_preference(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.focus_display_color = "#123456"
+    selected_date = datetime(2026, 6, 14).date()
+    started = datetime(2026, 6, 14, 9, 0)
+    session = repository.save_focus_session(
+        FocusSession(
+            title="Repo focus",
+            planned_seconds=600,
+            focused_seconds=600,
+            started_at=started,
+            ended_at=started + timedelta(minutes=10),
+            status="completed",
+            color="#abcdef",
+        )
+    )
+
+    # Given a saved session with its own color, When timeline blocks are built, Then each focus
+    # block carries that session color and the table paints it, never focus_display_color.
+    assert session.color == "#abcdef"
+    blocks = _today_timeline_blocks(repository, selected_date)
+    focus_blocks = [block for block in blocks if block[4].get("type") == "focus_session"]
+    assert focus_blocks
+    assert all(block[4].get("color") == "#abcdef" for block in focus_blocks)
+
+    table = QTableWidget(24, 7)
+    _fill_time_block_table(table, selected_date, blocks, preferences)
+    app.processEvents()
+
+    assert table.item(9, 1).background().color().name().lower() == "#abcdef"
+
+
+def test_time_block_focus_session_menu_includes_color_change(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    widget = TodayTimelineWidget(repository)
+    app.processEvents()
+
+    # Per-session colors now drive timetable focus blocks, so the block context menu offers a
+    # per-session "색상 변경" alongside delete; it only recolors that one session.
+    menu = QMenu(widget)
+    payloads = [{"type": "focus_session", "id": 5, "title": "딥 워크"}]
+    widget._add_time_block_item_actions(menu, payloads)
+
+    action_texts = [action.text() for action in menu.actions() if not action.isSeparator()]
+    assert action_texts == ["색상 변경 - 딥 워크", "집중 기록 삭제 - 딥 워크"]
+    widget.close()
+
+
+def test_timeline_list_focus_session_menu_includes_color_change(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    started = datetime(2026, 6, 14, 9, 0)
+    session = repository.save_focus_session(
+        FocusSession(
+            title="타임라인 집중",
+            planned_seconds=600,
+            focused_seconds=600,
+            started_at=started,
+            ended_at=started + timedelta(minutes=10),
+            status="completed",
+        )
+    )
+    assert session.id is not None
+
+    captured_menus: list[QMenu] = []
+
+    def capture_style(menu: QMenu, _parent: QWidget) -> QMenu:
+        captured_menus.append(menu)
+        return menu
+
+    monkeypatch.setattr(main_window_module, "_style_popup_menu", capture_style)
+
+    widget = TodayTimelineWidget(repository)
+    widget.set_date(started.date())
+    app.processEvents()
+
+    focus_item = None
+    for row in range(widget.timeline_list.count()):
+        candidate = widget.timeline_list.item(row)
+        data = candidate.data(Qt.ItemDataRole.UserRole)
+        if isinstance(data, dict) and data.get("type") == "focus_session":
+            focus_item = candidate
+            break
+    assert focus_item is not None
+
+    # itemAt depends on layout/visibility (the list is hidden after refresh), so resolve the
+    # real focus_session item directly while still exercising show_timeline_context_menu's exec path.
+    monkeypatch.setattr(widget.timeline_list, "itemAt", lambda _position: focus_item)
+
+    QTimer.singleShot(0, lambda: captured_menus[-1].close() if captured_menus else None)
+    widget.show_timeline_context_menu(QPoint(0, 0))
+
+    assert captured_menus
+    action_texts = [action.text() for action in captured_menus[-1].actions() if not action.isSeparator()]
+    assert "집중 기록 삭제" in action_texts
+    assert "색상 변경" in action_texts
+    widget.close()
+
+
+def _stub_focus_color_dialog(monkeypatch, hex_value: str) -> None:
+    class _StubColorDialog:
+        @staticmethod
+        def getColor(*args, **kwargs):
+            return QColor(hex_value)
+
+    monkeypatch.setattr(main_window_module, "QColorDialog", _StubColorDialog)
+
+
+def test_time_block_color_change_updates_only_that_session(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    started = datetime(2026, 6, 14, 9, 0)
+    first = repository.save_focus_session(
+        FocusSession(
+            title="첫 집중",
+            planned_seconds=600,
+            started_at=started,
+            ended_at=started + timedelta(minutes=10),
+            status="completed",
+            color="#111111",
+        )
+    )
+    second = repository.save_focus_session(
+        FocusSession(
+            title="둘째 집중",
+            planned_seconds=600,
+            started_at=started + timedelta(minutes=20),
+            ended_at=started + timedelta(minutes=30),
+            status="completed",
+            color="#222222",
+        )
+    )
+    widget = TodayTimelineWidget(repository)
+    app.processEvents()
+
+    _stub_focus_color_dialog(monkeypatch, "#abcdef")
+    widget.change_focus_session_color(first.id)
+    app.processEvents()
+
+    # Given two saved sessions, When one is recolored from the block menu, Then only that session
+    # changes and the other keeps its saved color (no global focus repaint).
+    assert repository.get_focus_session(first.id).color == "#abcdef"
+    assert repository.get_focus_session(second.id).color == "#222222"
+    widget.close()
+
+
+def test_focus_picker_during_active_session_recolors_only_that_session(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    # A prior completed session keeps its own color and must not be repainted by the picker.
+    earlier = repository.save_focus_session(
+        FocusSession(
+            title="이전 집중",
+            planned_seconds=600,
+            started_at=datetime(2026, 6, 14, 8, 0),
+            ended_at=datetime(2026, 6, 14, 8, 10),
+            status="completed",
+            color="#111111",
+        )
+    )
+
+    window.focus_title_edit.setText("리포트 작성")
+    window.start_focus_button.click()
+    app.processEvents()
+    active = window.focus_timer.session
+    assert active is not None and active.status == "running"
+
+    _stub_focus_color_dialog(monkeypatch, "#abcdef")
+    window._choose_focus_display_color()
+    app.processEvents()
+
+    # When the focus picker changes color during an active session, Then the active session and
+    # the swatch/default both take the new color, while unrelated saved sessions stay untouched.
+    assert window.focus_timer.session.color == "#abcdef"
+    assert repository.get_focus_session(active.id).color == "#abcdef"
+    assert window.preferences.focus_display_color == "#abcdef"
+    assert repository.get_focus_session(earlier.id).color == "#111111"
+    window.close()
+
+
+def test_start_focus_captures_selected_focus_color(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    window.preferences.focus_display_color = "#abcdef"
+    window.focus_title_edit.setText("리포트 작성")
+    window.start_focus_button.click()
+    app.processEvents()
+
+    # Given a selected focus swatch color, When a focus session starts, Then the new session
+    # stores that color rather than an auto-assigned-by-title color.
+    session = window.focus_timer.session
+    assert session is not None
+    assert session.color == "#abcdef"
+    assert repository.get_focus_session(session.id).color == "#abcdef"
+    window.close()
 
 
 def test_checklist_edit_dialog_can_select_past_date_time(tmp_path) -> None:
@@ -2085,6 +2318,9 @@ def test_focus_form_can_be_collapsed_and_expanded(tmp_path) -> None:
     # Default: collapsed (form lives in a floating overlay that is hidden).
     assert not window.focus_form_panel.isVisible()
     assert window.focus_form_toggle.text().startswith("설정 펼치기")
+    # With the show-grid preference on (default), the status grid is visible.
+    assert window.preferences.show_focus_status_grid is True
+    assert window.focus_status_grid.isVisible()
 
     # Expanding shows the floating overlay dropdown with the form.
     window.focus_form_toggle.setChecked(True)
@@ -2093,12 +2329,15 @@ def test_focus_form_can_be_collapsed_and_expanded(tmp_path) -> None:
     assert window.focus_form_overlay is not None
     assert window.focus_form_overlay.isVisible()
     assert window.focus_form_toggle.text().startswith("설정 접기")
+    # The grid stays visible behind/above the floating overlay while expanded.
+    assert window.focus_status_grid.isVisible()
 
-    # Collapsing hides the overlay again.
+    # Collapsing hides the overlay again; the grid remains visible.
     window.focus_form_toggle.setChecked(False)
     app.processEvents()
     assert not window.focus_form_overlay.isVisible()
     assert not window.focus_form_panel.isVisible()
+    assert window.focus_status_grid.isVisible()
     window.close()
 
 
@@ -2135,6 +2374,206 @@ def test_auto_collapse_pref_persists_and_collapses_form_on_start(tmp_path) -> No
     window.close()
 
 
+def test_focus_settings_dialog_exposes_keep_expanded_option(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    assert preferences.keep_focus_form_expanded is False
+
+    dialog = FocusActivitySettingsDialog(preferences)
+    app.processEvents()
+    # Reflects the stored preference and reports the live checkbox state.
+    assert dialog.keep_focus_form_expanded() is False
+    dialog.keep_expanded_check.setChecked(True)
+    assert dialog.keep_focus_form_expanded() is True
+    dialog.close()
+
+
+def test_keep_focus_form_expanded_pins_form_inline_and_hides_toggle(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    window.focus_content_panel.setFixedSize(720, max(600, window.focus_content_panel.height()))
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+
+    # Default (non-pinned): the toggle is shown and the form is hidden inline.
+    assert window.focus_form_toggle.isVisible()
+    assert not window.focus_form_panel.isVisible()
+
+    def fake_exec(self) -> int:
+        self.keep_expanded_check.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+
+    # Persisted to memory and SQLite.
+    assert window.preferences.keep_focus_form_expanded is True
+    assert repository.get_preferences().keep_focus_form_expanded is True
+    # Toggle hidden; the setup form + color row are visible inline in the panel
+    # (docked back into the panel, not a floating overlay).
+    assert not window.focus_form_toggle.isVisible()
+    assert window.focus_form_panel.isVisible()
+    assert window.focus_color_row.isVisible()
+    assert window.focus_form_panel.parentWidget() is window.focus_content_panel
+    assert window.focus_color_row.parentWidget() is window.focus_content_panel
+    assert window.focus_form_overlay is None
+    # The status grid stays visible alongside the pinned inline setup form when
+    # the show-grid preference is on (default True).
+    assert window.preferences.show_focus_status_grid is True
+    assert window.focus_status_grid.isVisible()
+    window.close()
+
+
+def test_keep_focus_form_expanded_after_overlay_reparents_back_without_leaks(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    window.focus_content_panel.setFixedSize(720, max(600, window.focus_content_panel.height()))
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+
+    # Open the overlay first (non-pinned), so the form lives in the overlay.
+    window.focus_form_toggle.setChecked(True)
+    app.processEvents()
+    assert window.focus_form_overlay is not None
+    assert window.focus_form_panel.parentWidget() is window.focus_form_overlay
+    layout = window.focus_panel_layout
+
+    def fake_exec(self) -> int:
+        self.keep_expanded_check.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+
+    # Enabling pinned mode reparents the form back inline and drops the overlay,
+    # leaving exactly one copy of the form in the panel layout.
+    assert window.focus_form_overlay is None
+    assert window.focus_form_panel.parentWidget() is window.focus_content_panel
+    assert layout.indexOf(window.focus_form_panel) != -1
+    assert layout.indexOf(window.focus_color_row) != -1
+    assert window.focus_form_panel.isVisible()
+    assert not window.focus_form_toggle.isVisible()
+    window.close()
+
+
+def test_keep_focus_form_expanded_keeps_color_row_usable_when_narrow(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    # Pin the setup form inline through the same dialog path the settings menu uses.
+    def fake_exec(self) -> int:
+        self.keep_expanded_check.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+    assert window.preferences.keep_focus_form_expanded is True
+
+    # Squeeze the pinned panel down to the reported ~620px width and re-lay it out.
+    window.focus_content_panel.setFixedSize(620, max(850, window.focus_content_panel.height()))
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    # The pinned setup form + color row stay docked inline; the toggle stays hidden.
+    assert window.focus_form_panel.isVisible()
+    assert window.focus_color_row.isVisible()
+    assert not window.focus_form_toggle.isVisible()
+
+    # Regression: at this narrow pinned width the enclosing FeatureCell relaxes
+    # every descendant's minimum width to 0, which used to collapse the focus
+    # color swatch to its 8px sizeHint and the "색 선택" button to its 68px
+    # sizeHint beside the row stretch. The swatch must keep a real 40x24 size and
+    # the button its stabilized width/height so the color row stays usable.
+    assert window.focus_color_swatch.width() == 40
+    assert window.focus_color_swatch.height() == 24
+    assert window.focus_color_button.width() >= 96
+    assert window.focus_color_button.height() == PANEL_CONTROL_HEIGHT
+
+    # Showing the status grid stays honored while the form is pinned inline.
+    assert window.preferences.show_focus_status_grid is True
+    assert window.focus_status_grid.isVisible()
+    window.close()
+
+
+def test_keep_focus_form_expanded_keeps_focus_rate_bar_text_readable_when_short(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    def fake_exec(self) -> int:
+        self.keep_expanded_check.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+
+    # Match the compact focus panel size from the screenshot: pinned settings make
+    # the dashboard tight, and compact width forces the focus-rate display to bar mode.
+    window.focus_content_panel.setFixedSize(620, 312)
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    assert window.preferences.keep_focus_form_expanded is True
+    assert window.focus_ratio_stack.currentIndex() == 1
+    assert window.focus_ratio_label.height() >= window.focus_ratio_label.sizeHint().height()
+    assert window.focus_ratio_label.geometry().bottom() < window.focus_ratio_bar.geometry().top()
+    window.close()
+
+
+def test_collapsed_focus_panel_expands_status_grid_instead_of_blank_spacer(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    window.focus_content_panel.setFixedSize(454, 960)
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    layout = window.focus_panel_layout
+    toggle_index = layout.indexOf(window.focus_form_toggle)
+    assert toggle_index != -1
+
+    expanding_spacer_indices = [
+        index
+        for index in range(layout.count())
+        if layout.itemAt(index).spacerItem() is not None
+        and bool(layout.itemAt(index).spacerItem().expandingDirections() & Qt.Orientation.Vertical)
+    ]
+    # Tall collapsed focus panels should give the extra height to the status grid,
+    # not to a meaningless blank stretch above the settings toggle.
+    assert not expanding_spacer_indices
+    assert window.focus_status_grid.rowCount() > FOCUS_STATUS_MIN_ROWS
+
+    panel = window.focus_content_panel
+    grid_bottom = (
+        window.focus_status_grid.mapTo(panel, window.focus_status_grid.rect().topLeft()).y()
+        + window.focus_status_grid.height()
+    )
+    toggle_top = window.focus_form_toggle.mapTo(panel, window.focus_form_toggle.rect().topLeft()).y()
+    assert 0 <= toggle_top - grid_bottom <= 24
+    window.close()
+
+
 def test_focus_fade_cell_color_three_stages() -> None:
     base = QColor("#b9a7e8")
     expected_half = QColor((base.red() + 255) // 2, (base.green() + 255) // 2, (base.blue() + 255) // 2)
@@ -2162,7 +2601,7 @@ def test_focus_status_grid_fades_cells_and_grows_rows() -> None:
     grid.update_status([1 * 60, 4 * 60], 20 * 60, "#b9a7e8")
     app.processEvents()
     assert grid.rowCount() == 3  # 3 hours (3 rows) visible by default
-    assert grid.rowHeight(0) == 8  # compact rows
+    assert grid.rowHeight(0) == FOCUS_STATUS_ROW_HEIGHT  # cells use the configured row height
     base = QColor("#b9a7e8")
     half = QColor((base.red() + 255) // 2, (base.green() + 255) // 2, (base.blue() + 255) // 2)
     assert grid.item(0, 0).background().color().name().lower() == "#b9a7e8"
@@ -2207,7 +2646,7 @@ def test_focus_away_buckets_count_only_away_time(tmp_path) -> None:
     window.close()
 
 
-def test_focus_status_grid_visible_only_when_collapsed_and_enabled(tmp_path) -> None:
+def test_focus_status_grid_visible_when_enabled_regardless_of_form_state(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     window = MainWindow(repository)
@@ -2221,17 +2660,18 @@ def test_focus_status_grid_visible_only_when_collapsed_and_enabled(tmp_path) -> 
     assert window.preferences.show_focus_status_grid is True
     assert window.focus_status_grid.isVisible()
 
-    # Expanding the form hides the grid (overlay dropdown takes the space).
+    # Expanding the form keeps the grid visible (it stays above the overlay).
     window.focus_form_toggle.setChecked(True)
     app.processEvents()
-    assert not window.focus_status_grid.isVisible()
+    assert window.focus_form_overlay is not None and window.focus_form_overlay.isVisible()
+    assert window.focus_status_grid.isVisible()
 
-    # Collapsing again reveals the grid.
+    # Collapsing again keeps the grid visible.
     window.focus_form_toggle.setChecked(False)
     app.processEvents()
     assert window.focus_status_grid.isVisible()
 
-    # Turning the preference off hides it even while collapsed.
+    # Turning the preference off hides it regardless of form state.
     window.preferences.show_focus_status_grid = False
     window.update_focus_panel_responsive_layout()
     app.processEvents()
@@ -2260,6 +2700,136 @@ def test_focus_activity_settings_dialog_round_trips(tmp_path) -> None:
     assert dialog.show_focus_status_grid() is True
     assert dialog.fade_white_minutes() == 5
     dialog.close()
+
+
+def test_focus_status_cell_delegate_reads_color_from_qbrush() -> None:
+    # QTableWidgetItem.setBackground stores a QBrush, so the delegate must read the
+    # brush's color instead of falling back to the empty shade (the invisible-color bug).
+    _app()
+    from_brush = FocusStatusCellDelegate._fill_color_from_data(QBrush(QColor("#3366cc")))
+    assert from_brush.name().lower() == "#3366cc"
+    from_color = FocusStatusCellDelegate._fill_color_from_data(QColor("#112233"))
+    assert from_color.name().lower() == "#112233"
+    # Missing/invalid data falls back to the neutral empty color, never a crash.
+    assert FocusStatusCellDelegate._fill_color_from_data(None).name().lower() == FOCUS_STATUS_EMPTY_COLOR
+    assert FocusStatusCellDelegate._fill_color_from_data(QColor()).name().lower() == FOCUS_STATUS_EMPTY_COLOR
+
+
+def test_focus_status_grid_fills_first_cell_immediately_with_focus_color() -> None:
+    app = _app()
+    grid = FocusStatusGrid()
+    # 1 second of elapsed time fills exactly the first cell with the focus color,
+    # not only after a full 10-minute bucket.
+    grid.update_status([], 1, "#3366cc")
+    app.processEvents()
+    assert grid.item(0, 0).background().color().name().lower() == "#3366cc"
+    assert grid.item(0, 1).background().color().name().lower() == FOCUS_STATUS_EMPTY_COLOR
+
+    # Ceil bucket math: 600s still fills exactly one cell; 601s fills two.
+    grid.update_status([], 600, "#3366cc")
+    app.processEvents()
+    assert grid.item(0, 0).background().color().name().lower() == "#3366cc"
+    assert grid.item(0, 1).background().color().name().lower() == FOCUS_STATUS_EMPTY_COLOR
+    grid.update_status([], 601, "#3366cc")
+    app.processEvents()
+    assert grid.item(0, 1).background().color().name().lower() == "#3366cc"
+
+
+def test_focus_status_grid_cells_are_enlarged() -> None:
+    app = _app()
+    grid = FocusStatusGrid()
+    app.processEvents()
+    # Cells are visibly taller than the previous 18px row height.
+    assert FOCUS_STATUS_ROW_HEIGHT > 18
+    assert grid.rowHeight(0) == FOCUS_STATUS_ROW_HEIGHT
+    # Still a 6-column grid after enlarging the cells.
+    assert grid.columnCount() == 6
+    # The minimum chrome height keeps 3 rows visible, while the grid can expand
+    # vertically when a taller focus panel has useful space to offer.
+    expected_chrome = FOCUS_STATUS_ROW_HEIGHT * FOCUS_STATUS_MIN_ROWS + 2 * grid.frameWidth() + 1
+    assert grid._chrome_height() == expected_chrome
+    assert grid.minimumHeight() == expected_chrome
+    assert grid.maximumHeight() > expected_chrome
+
+    grid.resize(240, grid._chrome_height(7))
+    grid.show()
+    app.processEvents()
+    assert grid.rowCount() >= 7
+    grid.close()
+
+
+def test_focus_status_cell_paints_focus_color_for_first_cell() -> None:
+    app = _app()
+    grid = FocusStatusGrid()
+    grid.set_shape("dot")
+    grid.setFixedSize(180, 80)
+    grid.show()
+    app.processEvents()
+    grid.update_status([], 60, "#3366cc")  # 1 minute elapsed -> first cell reached
+    app.processEvents()
+    rect = grid.visualItemRect(grid.item(0, 0))
+    assert rect.width() > 0 and rect.height() > 0
+    pixmap = QPixmap(grid.viewport().size())
+    pixmap.fill(QColor("#000000"))
+    grid.viewport().render(pixmap)
+    sampled = pixmap.toImage().pixelColor(rect.center())
+    # The painted dot carries the focus color, proving the QBrush color is honored.
+    assert sampled.name().lower() == "#3366cc"
+    grid.close()
+
+
+def test_focus_status_grid_set_and_get_shape() -> None:
+    app = _app()
+    grid = FocusStatusGrid()
+    assert grid.shape() == "dot"  # initialized to the default shape
+    for shape in FOCUS_STATUS_CELL_SHAPES:
+        grid.set_shape(shape)
+        assert grid.shape() == shape
+    grid.set_shape("heart")
+    grid.set_shape("triangle")  # unknown shapes normalize back to the default
+    assert grid.shape() == "dot"
+    app.processEvents()
+
+
+def test_focus_activity_settings_dialog_round_trips_shape(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    assert preferences.focus_status_cell_shape == "dot"
+
+    dialog = FocusActivitySettingsDialog(preferences)
+    app.processEvents()
+    assert dialog.focus_cell_shape() == "dot"
+
+    wave_index = dialog.shape_combo.findData("wave")
+    assert wave_index >= 0
+    dialog.shape_combo.setCurrentIndex(wave_index)
+    assert dialog.focus_cell_shape() == "wave"
+    dialog.close()
+
+
+def test_focus_activity_settings_persists_and_applies_shape(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+    assert window.focus_status_grid.shape() == "dot"
+
+    def fake_exec(self) -> int:
+        index = self.shape_combo.findData("heart")
+        self.shape_combo.setCurrentIndex(index)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+
+    # Selection is persisted to SQLite and applied to the live grid immediately.
+    assert window.preferences.focus_status_cell_shape == "heart"
+    assert window.focus_status_grid.shape() == "heart"
+    assert repository.get_preferences().focus_status_cell_shape == "heart"
+    window.close()
 
 
 def test_focus_color_picker_in_form_and_grid_above_toggle(tmp_path) -> None:
@@ -2455,7 +3025,7 @@ def test_focus_panel_keeps_timer_usable_when_tiny(tmp_path) -> None:
     assert window.pause_focus_button.isVisible()
     assert window.complete_focus_button.isVisible()
     assert window.focus_button_row.direction() == QBoxLayout.Direction.TopToBottom
-    assert "font-size: 26px" in window.remaining_time_label.styleSheet()
+    assert "font-size: 22px" in window.remaining_time_label.styleSheet()
 
     window.focus_content_panel.setFixedSize(720, 620)
     window.focus_form_toggle.setChecked(True)
@@ -2464,6 +3034,123 @@ def test_focus_panel_keeps_timer_usable_when_tiny(tmp_path) -> None:
     assert window.focus_form_panel.isVisible()
     assert window.focus_ratio_card.isVisible()
     assert all(card.isVisible() for card in window.focus_metric_cards)
+    window.close()
+
+
+def test_focus_panel_pinned_target_controls_do_not_overlap_when_squeezed(tmp_path, monkeypatch) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.show()
+    app.processEvents()
+
+    # Pin the setup form inline (same path the settings dialog uses) and turn on
+    # the 화면 지정 사용 target controls so the form grid carries the target
+    # combo/action/list rows plus the duration spin row.
+    def fake_exec(self) -> int:
+        self.keep_expanded_check.setChecked(True)
+        return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(main_window_module.FocusActivitySettingsDialog, "exec", fake_exec)
+    window.show_focus_activity_settings()
+    app.processEvents()
+    assert window.preferences.keep_focus_form_expanded is True
+    window.use_focus_target_check.setChecked(True)
+    app.processEvents()
+
+    # Squeeze the pinned panel to the reported ~620x650. The form grid used to
+    # compress below its content height so the target combo bled into the action
+    # row, the list bled into the duration spins, and the action box collapsed.
+    window.focus_content_panel.setFixedSize(620, 650)
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    panel = window.focus_content_panel
+
+    def top_in(widget) -> int:
+        return widget.mapTo(panel, QPoint(0, 0)).y()
+
+    assert window.target_combo.isVisible()
+    assert window.focus_targets_list.isVisible()
+    # Stabilized control heights are retained, not crushed.
+    assert window.target_combo.height() == PANEL_CONTROL_HEIGHT
+    assert window.planned_minutes_spin.height() == PANEL_CONTROL_HEIGHT
+    assert window.idle_cutoff_spin.height() == PANEL_CONTROL_HEIGHT
+    assert window.target_action_box.height() >= PANEL_CONTROL_HEIGHT - 4
+
+    # Rows stack top-to-bottom without overlapping: combo -> action -> list ->
+    # duration spins; the planned/idle spins share one row side by side.
+    combo_bottom = top_in(window.target_combo) + window.target_combo.height()
+    action_top = top_in(window.target_action_box)
+    action_bottom = action_top + window.target_action_box.height()
+    list_top = top_in(window.focus_targets_list)
+    list_bottom = list_top + window.focus_targets_list.height()
+    spin_top = top_in(window.planned_minutes_spin)
+    assert combo_bottom <= action_top
+    assert action_bottom <= list_top
+    assert list_bottom <= spin_top
+    assert top_in(window.planned_minutes_spin) == top_in(window.idle_cutoff_spin)
+    for widget in (
+        window.focus_dashboard_card,
+        window.focus_status_grid,
+        window.focus_form_panel,
+        window.focus_color_row,
+        window.target_combo,
+        window.target_action_box,
+        window.focus_targets_list,
+        window.planned_minutes_spin,
+        window.idle_cutoff_spin,
+    ):
+        _assert_visible_widget_within_parent(widget, panel)
+    window.close()
+
+
+def test_focus_ratio_card_stays_readable_in_compact_path(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # Compact width (< 680 triggers the compact responsive path) but >= 420 so the
+    # 집중률 ratio card is NOT in the dense path that hides it. A short panel used
+    # to compress the timer dashboard so the ratio card overlapped the progress
+    # bar, metric cards, and the 시작 button stacked below it.
+    window.focus_content_panel.setFixedSize(500, 300)
+    window.update_focus_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    panel = window.focus_content_panel
+    ratio = window.focus_ratio_card
+    assert ratio.isVisible()
+    # The card and its ring/bar stack stay readable, not collapsed.
+    assert ratio.height() >= 60
+    assert window.focus_ratio_stack.height() >= 28
+
+    def span(widget) -> tuple[int, int]:
+        top = widget.mapTo(panel, QPoint(0, 0)).y()
+        return top, top + widget.height()
+
+    ratio_top, ratio_bottom = span(ratio)
+    for widget in (window.focus_progress, window.focus_metric_cards[0], window.start_focus_button):
+        if not widget.isVisible():
+            continue
+        widget_top, widget_bottom = span(widget)
+        assert not (ratio_top < widget_bottom and widget_top < ratio_bottom), (
+            f"ratio card overlaps {widget.objectName() or widget.__class__.__name__}"
+        )
+    for widget in (
+        window.focus_dashboard_card,
+        window.focus_status_grid,
+        window.focus_form_toggle,
+        window.focus_progress,
+        window.focus_metric_cards[0],
+        window.start_focus_button,
+    ):
+        _assert_visible_widget_within_parent(widget, panel)
     window.close()
 
 
@@ -2576,6 +3263,125 @@ def test_pomodoro_panel_ports_widget_progress_card(tmp_path) -> None:
     window.close()
 
 
+def test_pomodoro_panel_keeps_timer_and_controls_readable_when_short(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # A short pomodoro panel (the reported ~620x170 squeeze) used to crush the
+    # time label to 0px and collapse the controls panel to ~43px so the 분 spin
+    # rows overlapped the 시작/일시정지/초기화 button row.
+    window.pomodoro_panel.setFixedSize(620, 170)
+    window.update_pomodoro_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    timer_card = window.pomodoro_panel.findChild(QWidget, "pomodoroTimerCard")
+    controls_panel = window.pomodoro_panel.findChild(QWidget, "pomodoroControlsPanel")
+    assert timer_card is not None
+    assert controls_panel is not None
+
+    # Timer label stays readable (non-zero), not crushed to 0px.
+    assert window.pomodoro_time_label.height() > 0
+    # The short mode hides duration inputs first and keeps the primary action row
+    # readable instead of painting half of the full control stack outside the card.
+    assert not window.pomodoro_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    assert not window.break_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    assert window.start_pomodoro_button.isVisibleTo(window.pomodoro_panel)
+    assert window.pomodoro_minutes_spin.height() == PANEL_CONTROL_HEIGHT
+    assert window.break_minutes_spin.height() == PANEL_CONTROL_HEIGHT
+    assert window.start_pomodoro_button.height() == PANEL_CONTROL_HEIGHT
+    # The visible cards keep enough height to contain their content (no internal fold).
+    assert timer_card.height() >= window.pomodoro_time_label.height()
+    timer_bottom = (
+        timer_card.mapTo(window.pomodoro_panel, QPoint(0, 0)).y()
+        + timer_card.height()
+    )
+    controls_top = controls_panel.mapTo(window.pomodoro_panel, QPoint(0, 0)).y()
+    assert timer_bottom <= controls_top
+    for widget in (
+        timer_card,
+        controls_panel,
+        window.pomodoro_time_label,
+        window.pomodoro_minutes_spin,
+        window.break_minutes_spin,
+        window.start_pomodoro_button,
+        window.pause_pomodoro_button,
+        window.reset_pomodoro_button,
+    ):
+        _assert_visible_widget_within_parent(widget, window.pomodoro_panel)
+    window.close()
+
+
+def test_pomodoro_panel_compacts_duration_inputs_before_controls_clip(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # At the screenshot-like short height, the old full stack overlapped the timer
+    # card and clipped the button row. Compact mode should keep timer and buttons
+    # separate, hiding only the duration inputs until the panel is taller.
+    window.pomodoro_panel.setFixedSize(620, 257)
+    window.update_pomodoro_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    timer_bottom = (
+        window.pomodoro_timer_card.mapTo(window.pomodoro_panel, QPoint(0, 0)).y()
+        + window.pomodoro_timer_card.height()
+    )
+    controls_top = window.pomodoro_controls_panel.mapTo(window.pomodoro_panel, QPoint(0, 0)).y()
+    assert timer_bottom <= controls_top
+    assert not window.pomodoro_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    assert not window.break_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    assert window.start_pomodoro_button.isVisibleTo(window.pomodoro_panel)
+    assert window.pause_pomodoro_button.isVisibleTo(window.pomodoro_panel)
+    assert window.reset_pomodoro_button.isVisibleTo(window.pomodoro_panel)
+    for widget in (
+        window.pomodoro_timer_card,
+        window.pomodoro_controls_panel,
+        window.pomodoro_time_label,
+        window.start_pomodoro_button,
+        window.pause_pomodoro_button,
+        window.reset_pomodoro_button,
+    ):
+        _assert_visible_widget_within_parent(widget, window.pomodoro_panel)
+
+    window.pomodoro_panel.setFixedSize(620, 320)
+    window.update_pomodoro_panel_responsive_layout()
+    app.processEvents()
+    assert window.pomodoro_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    assert window.break_minutes_spin.isVisibleTo(window.pomodoro_panel)
+    window.close()
+
+
+def test_pomodoro_status_badge_keeps_natural_height_when_timer_card_expands(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1280, 820)
+    window.show()
+    app.processEvents()
+
+    # When the timer card receives extra height, the status badge should remain a
+    # compact badge; it should not stretch into a tall vertical box.
+    window.pomodoro_panel.setFixedSize(433, 380)
+    window.update_pomodoro_panel_responsive_layout()
+    app.processEvents()
+    app.processEvents()
+
+    assert window.pomodoro_status_label.isVisibleTo(window.pomodoro_panel)
+    assert window.pomodoro_status_label.height() <= 32
+    assert window.pomodoro_status_label.height() >= window.pomodoro_status_label.sizeHint().height()
+    window.close()
+
+
 def test_same_size_feature_panels_share_inner_rhythm(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
@@ -2586,7 +3392,7 @@ def test_same_size_feature_panels_share_inner_rhythm(tmp_path) -> None:
 
     window.focus_content_panel.setFixedSize(560, 420)
     window.update_focus_panel_responsive_layout()
-    window.pomodoro_panel.setFixedSize(560, 220)
+    window.pomodoro_panel.setFixedSize(560, 320)
     window.update_pomodoro_panel_responsive_layout()
     window.memo_content_panel.setFixedSize(560, 420)
     window.update_memo_panel_responsive_layout()
@@ -2621,7 +3427,7 @@ def test_same_size_feature_panels_share_inner_rhythm(tmp_path) -> None:
     window.update_pomodoro_panel_responsive_layout()
     assert window.pomodoro_input_row.direction() == QBoxLayout.Direction.TopToBottom
     assert window.pomodoro_button_row.direction() == QBoxLayout.Direction.TopToBottom
-    assert _margins_tuple(window.pomodoro_timer_card_layout) == (12, 12, 12, 12)
+    assert _margins_tuple(window.pomodoro_timer_card_layout) == (12, 8, 12, 8)
     window.close()
 
 
@@ -6769,6 +7575,9 @@ def test_feature_resize_edges_work_without_visible_corner_grip(tmp_path) -> None
     assert focus_box._is_resize_edge(QPoint(20, focus_box.height() // 2))
     assert focus_box._is_resize_edge(QPoint(focus_box.width() - 20, focus_box.height() // 2))
     assert focus_box._is_height_resize_edge(QPoint(focus_box.width() // 2, focus_box.height() - 22))
+    pomodoro_box = window.feature_boxes["pomodoro"]
+    assert focus_box._minimum_resize_pixel_height() == 200
+    assert pomodoro_box._minimum_resize_pixel_height() == 160
     window.close()
 
 

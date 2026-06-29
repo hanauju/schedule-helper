@@ -92,6 +92,7 @@ class FocusTimerService:
         target_window_title: str = "",
         target_windows: Iterable[Mapping[str, str]] | None = None,
         task_id: int | None = None,
+        color: str = "",
         now: datetime | None = None,
     ) -> FocusSession:
         now = now or datetime.now()
@@ -113,6 +114,7 @@ class FocusTimerService:
                 planned_seconds=max(60, planned_seconds),
                 started_at=now,
                 status="running",
+                color=color.strip(),
             )
         )
         self.last_tick_at = now

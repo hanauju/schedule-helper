@@ -56,6 +56,7 @@ class Preference:
     main_always_on_top: bool = False
     show_focus_panel: bool = True
     auto_collapse_focus_form: bool = False
+    keep_focus_form_expanded: bool = False
     show_focus_status_grid: bool = True
     show_datetime_panel: bool = False
     show_current_date: bool = True
@@ -109,6 +110,7 @@ class Preference:
     focus_display_color: str = "#b9a7e8"
     focus_fade_half_minutes: int = 3
     focus_fade_white_minutes: int = 6
+    focus_status_cell_shape: str = "dot"
     main_font_family: str = ""
     main_font_size: int = 13
     label_font_size: int = 13
