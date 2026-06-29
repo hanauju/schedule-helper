@@ -5630,6 +5630,42 @@ def test_settings_add_image_panel_keeps_new_panel_embedded(tmp_path) -> None:
     window.close()
 
 
+def test_many_image_panels_rerender_without_feature_window_flicker(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    for index in range(6):
+        panel = repository.create_image_panel(f"이미지 패널 {index + 1}")
+        assert panel.id is not None
+
+    window = MainWindow(repository)
+    window.resize(1400, 900)
+    window.show()
+    app.processEvents()
+
+    recorder = _TopLevelShowRecorder()
+    app.installEventFilter(recorder)
+    try:
+        window._render_feature_dashboard()
+        app.processEvents()
+        window.add_image_panel()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(recorder)
+
+    panels = repository.list_image_panels()
+    assert len(panels) == 7
+    for panel in panels:
+        assert panel.id is not None
+        feature_key = _image_panel_feature_key(panel.id)
+        assert window.feature_cells[feature_key].parentWidget() is window.feature_grid_container
+        assert window.feature_boxes[feature_key].parentWidget() is window.feature_cells[feature_key]
+    assert all(widget.objectName() != "featureReparentBin" for widget in QApplication.topLevelWidgets())
+    assert all(widget.objectName() != "featureBox" for widget in QApplication.topLevelWidgets())
+    _assert_no_feature_panel_top_level_shows(recorder)
+
+    window.close()
+
+
 def test_context_menu_add_image_panel_keeps_new_panel_embedded(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")

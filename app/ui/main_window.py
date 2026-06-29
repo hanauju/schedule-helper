@@ -2133,6 +2133,7 @@ class DraggableFeatureBox(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Widget)
         self.feature_key = feature_key
         self.feature_title = title.strip() or "기능"
         self.swap_callback = swap_callback
@@ -2701,8 +2702,10 @@ class DraggableFeatureBox(QWidget):
 class FeatureCell(QWidget):
     def __init__(self, feature_key: str, feature_box: DraggableFeatureBox, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.Widget)
         self.feature_key = feature_key
         self.feature_box = feature_box
+        self.feature_box.setWindowFlags(Qt.WindowType.Widget)
         self.panel_height = 0
         self.panel_width = 0
         self.setObjectName("featureCell")
@@ -2714,6 +2717,7 @@ class FeatureCell(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         layout.addWidget(feature_box, 0, Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignHCenter)
+        feature_box.show()
         layout.addStretch(1)
 
     def set_panel_height(self, height: int) -> None:
@@ -11969,7 +11973,6 @@ class MainWindow(QMainWindow):
                 Qt.AlignmentFlag.AlignTop,
             )
             cell.show()
-            widget.show()
 
         for item in floating_items:
             key = str(item.get("key", ""))
@@ -11987,7 +11990,6 @@ class MainWindow(QMainWindow):
             self.feature_cells[key] = cell
             self.feature_floating_cells[key] = cell
             cell.show()
-            widget.show()
             cell.raise_()
             widget.raise_()
 
@@ -12853,7 +12855,7 @@ class MainWindow(QMainWindow):
                 for key, item_height, item_width in zip(column_items, column_heights, column_widths, strict=False):
                     widget = self.feature_boxes[key]
                     widget.hide()
-                    cell = FeatureCell(key, widget)
+                    cell = FeatureCell(key, widget, column_widget)
                     cell.hide()
                     cell.set_panel_height(item_height)
                     cell.set_panel_width(item_width)
