@@ -79,11 +79,11 @@ class Preference:
     show_today_flow_panel: bool = False
     show_quick_memo_panel: bool = True
     show_link_favorites_panel: bool = True
-    show_media_panel: bool = True
+    show_media_panel: bool = False
     media_panel_file_path: str = ""
     media_panel_image_position: str = "center"
     media_panel_image_view: str = ""
-    show_media_panel_2: bool = True
+    show_media_panel_2: bool = False
     media_panel_2_file_path: str = ""
     media_panel_2_image_position: str = "center"
     media_panel_2_image_view: str = ""
@@ -96,6 +96,7 @@ class Preference:
     media_panel_4_image_position: str = "center"
     media_panel_4_image_view: str = ""
     media_rounded_corners: bool = True
+    legacy_media_panels_migrated: bool = False
     show_compact_favorites_panel: bool = False
     favorite_display_mode: str = "text"
     time_format: str = "24h"
@@ -275,6 +276,18 @@ class LinkFavorite:
     target: str
     icon_text: str = ""
     icon_path: str = ""
+    sort_order: int = 0
+    created_at: datetime = field(default_factory=datetime.now)
+    id: int | None = None
+
+
+@dataclass(slots=True)
+class ImagePanel:
+    title: str = "이미지 패널"
+    file_path: str = ""
+    image_position: str = "center"
+    image_view: str = ""
+    visible: bool = True
     sort_order: int = 0
     created_at: datetime = field(default_factory=datetime.now)
     id: int | None = None

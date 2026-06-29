@@ -8,7 +8,7 @@ from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, QTimer
+from PySide6.QtCore import QObject, QDate, QEvent, QPoint, QPointF, QRect, QRectF, QSize, Qt, QTime, QTimer
 from PySide6.QtGui import QBrush, QColor, QIcon, QImage, QKeyEvent, QKeySequence, QMouseEvent, QPainter, QPixmap, QWheelEvent
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import (
@@ -80,6 +80,7 @@ from app.ui.main_window import (
     ItemTypeSettingsDialog,
     LayoutProfileLoadDialog,
     MainWindow,
+    MediaPreviewLabel,
     NoScrollFontComboBox,
     NoScrollSpinBox,
     OutlinedTextLabel,
@@ -107,6 +108,7 @@ from app.ui.main_window import (
     _focus_activity_cell_color,
     _format_time,
     _clip_media_corners,
+    _image_panel_feature_key,
     _record_items_for_date,
     _today_timeline_blocks,
 )
@@ -118,6 +120,28 @@ def _app() -> QApplication:
     if app is None:
         app = QApplication([])
     return app
+
+
+class _TopLevelShowRecorder(QObject):
+    def __init__(self) -> None:
+        super().__init__()
+        self.object_names: list[str] = []
+
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.Show
+            and isinstance(watched, QWidget)
+            and watched.isWindow()
+        ):
+            self.object_names.append(watched.objectName())
+        return False
+
+
+def _assert_no_feature_panel_top_level_shows(recorder: _TopLevelShowRecorder) -> None:
+    assert "featureBox" not in recorder.object_names
+    assert "featureCell" not in recorder.object_names
+    assert "mediaPanel" not in recorder.object_names
+    assert "featureReparentBin" not in recorder.object_names
 
 
 def _margins_tuple(layout) -> tuple[int, int, int, int]:
@@ -190,17 +214,35 @@ def _profile_data(repository: ScheduleRepository, name: str) -> str:
     return profile.data
 
 
-def _dashboard_support_items(start_y: int = 8, omit: set[str] | None = None) -> list[dict[str, object]]:
+def _first_image_panel_key(window: MainWindow) -> str:
+    keys = window._dynamic_media_panel_keys()
+    assert keys
+    return keys[0]
+
+
+def _image_panel_from_key(repository: ScheduleRepository, feature_key: str):
+    panel_id = int(feature_key.split(":", 1)[1])
+    panel = repository.get_image_panel(panel_id)
+    assert panel is not None
+    return panel
+
+
+def _dashboard_support_items(
+    start_y: int = 8,
+    omit: set[str] | None = None,
+    media_key: str | None = None,
+) -> list[dict[str, object]]:
     omitted = omit or set()
     items = [
         {"key": "header_banner", "x": 0, "y": start_y, "w": 12, "h": 3},
         {"key": "today_timeline", "x": 0, "y": start_y + 3, "w": 5, "h": 6},
         {"key": "today_checklist", "x": 5, "y": start_y + 3, "w": 4, "h": 4},
         {"key": "pomodoro", "x": 9, "y": start_y + 3, "w": 3, "h": 4},
-        {"key": "media_panel", "x": 0, "y": start_y + 9, "w": 3, "h": 4},
         {"key": "link_favorites", "x": 3, "y": start_y + 9, "w": 3, "h": 4},
         {"key": "datetime", "x": 6, "y": start_y + 9, "w": 3, "h": 1},
     ]
+    if media_key is not None:
+        items.insert(4, {"key": media_key, "x": 0, "y": start_y + 9, "w": 3, "h": 4})
     return [item for item in items if str(item["key"]) not in omitted]
 
 
@@ -732,7 +774,7 @@ def test_main_feature_titles_live_inside_panels_not_under_handles(tmp_path) -> N
             if label.text() == title and label.isVisibleTo(feature_box)
         ]
         assert internal_titles
-    assert window.feature_boxes["media_panel"].title_label is None
+    assert "media_panel" not in window.feature_boxes
     favorites_inner_labels = [
         label.text()
         for label in window.link_favorites_panel.findChildren(QLabel)
@@ -5063,10 +5105,13 @@ def test_task_folder_view_manage_button_opens_folder_management(tmp_path, monkey
 def test_feature_context_windows_use_new_window_label_and_always_on_top(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    image_panel = repository.create_image_panel("이미지")
+    assert image_panel.id is not None
     window = MainWindow(repository)
     window.show()
     app.processEvents()
 
+    image_key = _image_panel_feature_key(image_panel.id)
     expected_titles = {
         "focus": "집중 새창",
         "pomodoro": "뽀모도로 새창",
@@ -5074,7 +5119,7 @@ def test_feature_context_windows_use_new_window_label_and_always_on_top(tmp_path
         "today_checklist": "오늘 체크리스트 새창",
         "today_timeline": "시간표 새창",
         "link_favorites": "즐겨찾기 새창",
-        "media_panel": "이미지 새창",
+        image_key: "이미지 새창",
     }
     for feature_key, title in expected_titles.items():
         window.open_feature_widget(feature_key)
@@ -5101,6 +5146,7 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
 
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
+    preferences.show_media_panel = True
     preferences.media_panel_file_path = str(image_path)
     repository.save_preferences(preferences)
 
@@ -5108,12 +5154,13 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     window.show()
     app.processEvents()
 
+    feature_key = _first_image_panel_key(window)
     assert window.media_preview_label.pixmap() is not None
     assert not window.media_preview_label.pixmap().isNull()
-    media_buttons = {button.text() for button in window.media_panel.findChildren(QPushButton)}
+    media_buttons = {button.text() for button in window.feature_boxes[feature_key].findChildren(QPushButton)}
     assert "선택" not in media_buttons
     assert "비우기" not in media_buttons
-    window.show_media_panel_context_menu(window.media_preview_label, QPoint(4, 4))
+    window.show_media_panel_context_menu(window.media_preview_label, QPoint(4, 4), feature_key)
     app.processEvents()
     media_popup = getattr(app, "_active_light_action_popup", None)
     assert media_popup is not None
@@ -5121,17 +5168,18 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     media_popup_buttons = {button.text() for button in media_popup.findChildren(QPushButton)}
     assert "패널 고정" in media_popup_buttons
     assert "새창으로 열기" in media_popup_buttons
-    assert "메인창에서 숨기기" in media_popup_buttons
+    assert "메인창에서 숨기기" not in media_popup_buttons
     assert "이미지 변경" in media_popup_buttons
-    assert "비우기" in media_popup_buttons
-    assert "이미지 보기 조정" in media_popup_buttons
-    assert "이미지 보기 초기화" in media_popup_buttons
+    assert "이미지 비우기" in media_popup_buttons
+    assert "보기 조정" in media_popup_buttons
+    assert "보기 초기화" in media_popup_buttons
+    assert "새 이미지 패널 추가" in media_popup_buttons
     assert media_popup.minimumWidth() >= 164
     media_popup.close()
 
-    window.open_feature_widget("media_panel")
+    window.open_feature_widget(feature_key)
     app.processEvents()
-    dialog = window.feature_widget_windows["media_panel"]
+    dialog = window.feature_widget_windows[feature_key]
     assert dialog.preview_label.pixmap() is not None
     assert not dialog.preview_label.pixmap().isNull()
 
@@ -5148,6 +5196,7 @@ def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
 
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
+    preferences.show_media_panel = True
     preferences.media_panel_file_path = str(image_path)
     repository.save_preferences(preferences)
 
@@ -5156,6 +5205,7 @@ def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
     window.show()
     app.processEvents()
 
+    feature_key = _first_image_panel_key(window)
     window.preferences.show_datetime_panel = False
     window.preferences.show_focus_panel = False
     window.preferences.show_header_banner = False
@@ -5170,13 +5220,13 @@ def test_media_panel_preview_shares_card_content_baseline(tmp_path) -> None:
     window.preferences.show_link_favorites_panel = False
 
     window.feature_dashboard_items = [
-        {"key": "media_panel", "x": 0, "y": 0, "w": 3, "h": 5},
+        {"key": feature_key, "x": 0, "y": 0, "w": 3, "h": 5},
         {"key": "pomodoro", "x": 3, "y": 0, "w": 3, "h": 5},
     ]
     window._render_feature_dashboard()
     app.processEvents()
 
-    media_box = window.feature_boxes["media_panel"]
+    media_box = window.feature_boxes[feature_key]
     preview = window.media_preview_label
     media_content = media_box.findChild(QWidget, "mediaPanel")
     pomodoro_box = window.feature_boxes["pomodoro"]
@@ -5323,11 +5373,14 @@ def test_handle_panels_share_card_content_baseline(tmp_path) -> None:
 def test_handle_panel_content_press_starts_reposition(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    image_panel = repository.create_image_panel("이미지")
+    assert image_panel.id is not None
     window = MainWindow(repository)
     window.resize(1500, 900)
     window.show()
     app.processEvents()
 
+    feature_key = _image_panel_feature_key(image_panel.id)
     window.preferences.show_datetime_panel = True
     window.preferences.show_header_banner = True
     window.preferences.show_focus_panel = True
@@ -5343,7 +5396,7 @@ def test_handle_panel_content_press_starts_reposition(tmp_path) -> None:
 
     window.feature_dashboard_items = [
         {"key": "header_banner", "x": 0, "y": 0, "w": 4, "h": 5},
-        {"key": "media_panel", "x": 4, "y": 0, "w": 3, "h": 5},
+        {"key": feature_key, "x": 4, "y": 0, "w": 3, "h": 5},
         {"key": "focus", "x": 7, "y": 0, "w": 4, "h": 5},
         {"key": "datetime", "x": 0, "y": 6, "w": 3, "h": 2},
     ]
@@ -5379,7 +5432,7 @@ def test_handle_panel_content_press_starts_reposition(tmp_path) -> None:
 
     handle_panel_contents = (
         ("header_banner", window.header_banner_widget),
-        ("media_panel", window.media_preview_label),
+        (feature_key, window.media_preview_label),
         ("datetime", window.datetime_content_panel),
     )
     drag_threshold = QApplication.startDragDistance()
@@ -5456,19 +5509,167 @@ def test_extra_media_panels_copy_assets_and_keep_hidden_images(tmp_path) -> None
     window.show()
     app.processEvents()
 
-    stored_path = Path(window.preferences.media_panel_2_file_path)
+    feature_key = _first_image_panel_key(window)
+    panel = _image_panel_from_key(repository, feature_key)
+    stored_path = Path(panel.file_path)
     assert stored_path.parent == tmp_path / "media"
     assert stored_path.exists()
-    assert window.media_panel_2.isVisible()
-    preview = window.media_preview_labels["media_panel_2"]
+    assert window.feature_boxes[feature_key].isVisible()
+    preview = window.media_preview_labels[feature_key]
     assert preview.pixmap() is not None
     assert not preview.pixmap().isNull()
 
-    window.hide_feature_from_main("media_panel_2")
+    window.hide_feature_from_main(feature_key)
     app.processEvents()
     reloaded = repository.get_preferences()
+    reloaded_panel = _image_panel_from_key(repository, feature_key)
     assert not reloaded.show_media_panel_2
-    assert reloaded.media_panel_2_file_path == str(stored_path)
+    assert reloaded_panel.visible is False
+    assert reloaded_panel.file_path == str(stored_path)
+
+    window.close()
+
+
+def test_dynamic_image_panel_can_be_added_and_managed(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "dynamic.png"
+    pixmap = QPixmap(18, 12)
+    pixmap.fill(Qt.GlobalColor.darkGreen)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1400, 900)
+    window.show()
+    app.processEvents()
+
+    recorder = _TopLevelShowRecorder()
+    app.installEventFilter(recorder)
+    try:
+        window.add_image_panel()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(recorder)
+
+    panels = repository.list_image_panels()
+    assert len(panels) == 1
+    assert panels[0].id is not None
+    feature_key = f"image_panel:{panels[0].id}"
+    assert feature_key in window.feature_boxes
+    assert feature_key in window.media_preview_labels
+    assert window.feature_cells[feature_key].parentWidget() is window.feature_grid_container
+    assert window.feature_boxes[feature_key].parentWidget() is window.feature_cells[feature_key]
+    assert all(widget.objectName() != "featureReparentBin" for widget in QApplication.topLevelWidgets())
+    assert all(widget.objectName() != "featureBox" for widget in QApplication.topLevelWidgets())
+    _assert_no_feature_panel_top_level_shows(recorder)
+    assert any(item.get("key") == feature_key for item in window._current_feature_dashboard_layout())
+    assert window.current_layout_state()["visible"][feature_key] is True
+
+    window.set_media_panel_file_path(str(image_path), feature_key)
+    app.processEvents()
+
+    reloaded = repository.get_image_panel(panels[0].id)
+    assert reloaded is not None
+    stored_path = Path(reloaded.file_path)
+    assert stored_path.parent == tmp_path / "media"
+    assert stored_path.exists()
+    assert not window.media_preview_labels[feature_key].pixmap().isNull()
+
+    window.open_feature_widget(feature_key)
+    app.processEvents()
+    dialog = window.feature_widget_windows[feature_key]
+    assert dialog.windowTitle() == f"{reloaded.title} 새창"
+    assert not dialog.preview_label.pixmap().isNull()
+
+    window.hide_feature_from_main(feature_key)
+    app.processEvents()
+    hidden = repository.get_image_panel(panels[0].id)
+    assert hidden is not None
+    assert hidden.visible is False
+    assert window.current_layout_state()["visible"][feature_key] is False
+
+    dialog.close()
+    window.close()
+
+
+def test_settings_add_image_panel_keeps_new_panel_embedded(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    window = MainWindow(repository)
+    window.resize(1400, 900)
+    window.show()
+    app.processEvents()
+
+    window.show_settings_window()
+    app.processEvents()
+    dialog = window._settings_dialog
+    assert isinstance(dialog, SettingsDialog)
+    add_button = dialog.findChild(QPushButton, "addImagePanelButton")
+    assert add_button is not None
+
+    recorder = _TopLevelShowRecorder()
+    app.installEventFilter(recorder)
+    try:
+        add_button.click()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(recorder)
+
+    panels = repository.list_image_panels()
+    assert len(panels) == 1
+    assert panels[0].id is not None
+    feature_key = _image_panel_feature_key(panels[0].id)
+    assert window.feature_cells[feature_key].parentWidget() is window.feature_grid_container
+    assert window.feature_boxes[feature_key].parentWidget() is window.feature_cells[feature_key]
+    assert all(widget.objectName() != "featureReparentBin" for widget in QApplication.topLevelWidgets())
+    assert all(widget.objectName() != "featureBox" for widget in QApplication.topLevelWidgets())
+    _assert_no_feature_panel_top_level_shows(recorder)
+
+    dialog.reject()
+    app.processEvents()
+    window.close()
+
+
+def test_context_menu_add_image_panel_keeps_new_panel_embedded(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    original_panel = repository.create_image_panel("이미지")
+    assert original_panel.id is not None
+    original_feature_key = _image_panel_feature_key(original_panel.id)
+    window = MainWindow(repository)
+    window.resize(1400, 900)
+    window.show()
+    app.processEvents()
+
+    window.show_media_panel_context_menu(window.media_preview_labels[original_feature_key], QPoint(4, 4), original_feature_key)
+    app.processEvents()
+    popup = getattr(app, "_active_light_action_popup", None)
+    assert popup is not None
+    assert popup.isVisible()
+    add_button = next(
+        button
+        for button in popup.findChildren(QPushButton)
+        if button.text() == "\uc0c8 \uc774\ubbf8\uc9c0 \ud328\ub110 \ucd94\uac00"
+    )
+
+    recorder = _TopLevelShowRecorder()
+    app.installEventFilter(recorder)
+    try:
+        add_button.click()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(recorder)
+
+    panels = repository.list_image_panels()
+    assert len(panels) == 2
+    new_panel = next(panel for panel in panels if panel.id != original_panel.id)
+    assert new_panel.id is not None
+    new_feature_key = _image_panel_feature_key(new_panel.id)
+    assert window.feature_cells[new_feature_key].parentWidget() is window.feature_grid_container
+    assert window.feature_boxes[new_feature_key].parentWidget() is window.feature_cells[new_feature_key]
+    assert all(widget.objectName() != "featureReparentBin" for widget in QApplication.topLevelWidgets())
+    assert all(widget.objectName() != "featureBox" for widget in QApplication.topLevelWidgets())
+    _assert_no_feature_panel_top_level_shows(recorder)
 
     window.close()
 
@@ -5554,6 +5755,7 @@ def test_media_panel_image_position_persists_from_context_action(tmp_path) -> No
 
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     preferences = repository.get_preferences()
+    preferences.show_media_panel = True
     preferences.media_panel_file_path = str(image_path)
     repository.save_preferences(preferences)
 
@@ -5561,13 +5763,91 @@ def test_media_panel_image_position_persists_from_context_action(tmp_path) -> No
     window.show()
     app.processEvents()
 
-    window.set_media_panel_image_position("media_panel", "left")
-    assert repository.get_preferences().media_panel_image_position == "left"
+    feature_key = _first_image_panel_key(window)
+    window.set_media_panel_image_position(feature_key, "left")
+    assert _image_panel_from_key(repository, feature_key).image_position == "left"
     assert bool(window.media_preview_label.alignment() & Qt.AlignmentFlag.AlignLeft)
-    window.set_media_panel_image_view("media_panel", {"zoom": 50, "x": 20, "y": 70})
+    window.set_media_panel_image_view(feature_key, {"zoom": 50, "x": 20, "y": 70})
+    stored_view = json.loads(_image_panel_from_key(repository, feature_key).image_view)
+    assert stored_view["zoom"] == 50
+    assert stored_view["x"] == 20
+    assert stored_view["y"] == 70
+    assert stored_view["frame_w"] == window.media_preview_label.contentsRect().width()
+    assert stored_view["frame_h"] == window.media_preview_label.contentsRect().height()
+    assert window.media_preview_label.image_view == stored_view
+
+    window.close()
+
+
+def test_image_view_settings_keep_reference_frame_for_responsive_panels(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "responsive.png"
+    pixmap = QPixmap(20, 12)
+    pixmap.fill(Qt.GlobalColor.cyan)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_datetime_panel = True
+    preferences.show_header_banner = True
+    preferences.header_banner_image_path = str(image_path)
+    preferences.show_media_panel = True
+    preferences.media_panel_file_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1200, 760)
+    window.show()
+    app.processEvents()
+
+    feature_key = _first_image_panel_key(window)
+    window.set_header_banner_image_view({"zoom": 140, "x": 35, "y": 65})
+    window.set_datetime_panel_background_image_view({"zoom": 130, "x": 45, "y": 55})
+    window.set_media_panel_image_view(feature_key, {"zoom": 125, "x": 25, "y": 75})
     reloaded = repository.get_preferences()
-    assert reloaded.media_panel_image_view == '{"zoom":50,"x":20,"y":70}'
-    assert window.media_preview_label.image_view == {"zoom": 50, "x": 20, "y": 70}
+
+    header_view = json.loads(reloaded.header_banner_image_view)
+    datetime_view = json.loads(reloaded.datetime_panel_background_image_view)
+    media_view = json.loads(_image_panel_from_key(repository, feature_key).image_view)
+    for view in (header_view, datetime_view, media_view):
+        assert view["frame_w"] > 0
+        assert view["frame_h"] > 0
+    assert header_view["frame_w"] == window.header_banner_widget.contentsRect().width()
+    assert header_view["frame_h"] == window.header_banner_widget.contentsRect().height()
+    assert datetime_view["frame_w"] == window.datetime_content_panel.contentsRect().width()
+    assert datetime_view["frame_h"] == window.datetime_content_panel.contentsRect().height()
+    assert media_view["frame_w"] == window.media_preview_label.contentsRect().width()
+    assert media_view["frame_h"] == window.media_preview_label.contentsRect().height()
+
+    window.close()
+
+
+def test_default_image_view_reset_also_keeps_reference_frame(tmp_path) -> None:
+    app = _app()
+    image_path = tmp_path / "default-frame.png"
+    pixmap = QPixmap(20, 12)
+    pixmap.fill(Qt.GlobalColor.darkCyan)
+    assert pixmap.save(str(image_path))
+
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_media_panel = True
+    preferences.media_panel_file_path = str(image_path)
+    repository.save_preferences(preferences)
+
+    window = MainWindow(repository)
+    window.resize(1200, 760)
+    window.show()
+    app.processEvents()
+
+    feature_key = _first_image_panel_key(window)
+    window.reset_media_panel_image_view(feature_key)
+    stored_view = json.loads(_image_panel_from_key(repository, feature_key).image_view)
+    assert stored_view["zoom"] == 100
+    assert stored_view["x"] == 50
+    assert stored_view["y"] == 50
+    assert stored_view["frame_w"] == window.media_preview_label.contentsRect().width()
+    assert stored_view["frame_h"] == window.media_preview_label.contentsRect().height()
 
     window.close()
 
@@ -5642,6 +5922,97 @@ def test_media_image_viewport_allows_zooming_out() -> None:
     assert image.pixelColor(10, 10).red() > 200
     assert image.pixelColor(10, 10).alpha() > 200
     assert image.pixelColor(90, 90).alpha() == 0
+
+
+def test_media_image_viewport_scales_saved_frame_when_widget_aspect_changes() -> None:
+    _app()
+    widget = QWidget()
+    widget.resize(100, 100)
+
+    source = QPixmap(200, 100)
+    source.fill(Qt.GlobalColor.transparent)
+    source_painter = QPainter(source)
+    try:
+        source_painter.fillRect(QRectF(0, 0, 100, 100), Qt.GlobalColor.red)
+        source_painter.fillRect(QRectF(100, 0, 100, 100), Qt.GlobalColor.blue)
+    finally:
+        source_painter.end()
+
+    target = QPixmap(100, 100)
+    target.fill(Qt.GlobalColor.transparent)
+
+    painter = QPainter(target)
+    try:
+        _draw_image_viewport(
+            widget,
+            painter,
+            source,
+            {"zoom": 100, "x": 50, "y": 50, "frame_w": 200, "frame_h": 100},
+        )
+    finally:
+        painter.end()
+
+    image = target.toImage()
+    assert image.pixelColor(50, 10).alpha() > 200
+    assert image.pixelColor(25, 50).red() > 200
+    assert image.pixelColor(75, 50).blue() > 200
+
+
+def test_media_preview_anchors_legacy_image_view_at_first_render_size() -> None:
+    _app()
+    preview = MediaPreviewLabel()
+    preview.resize(220, 120)
+
+    source = QPixmap(220, 120)
+    source.fill(Qt.GlobalColor.green)
+    preview.set_pixmap_source(source)
+    preview.set_image_view('{"zoom":150,"x":20,"y":80}')
+
+    first_target = QPixmap(220, 120)
+    first_target.fill(Qt.GlobalColor.transparent)
+    preview.render(first_target)
+    resolved = preview._resolved_image_view()
+    assert resolved["frame_w"] == 220
+    assert resolved["frame_h"] == 120
+
+    preview.resize(110, 120)
+    preview.set_image_view('{"zoom":150,"x":20,"y":80}')
+    second_target = QPixmap(110, 120)
+    second_target.fill(Qt.GlobalColor.transparent)
+    preview.render(second_target)
+    resolved_after_resize = preview._resolved_image_view()
+    assert resolved_after_resize["frame_w"] == 220
+    assert resolved_after_resize["frame_h"] == 120
+
+
+def test_media_preview_anchors_default_image_view_at_first_render_size() -> None:
+    _app()
+    preview = MediaPreviewLabel()
+    preview.resize(220, 120)
+
+    source = QPixmap(220, 120)
+    source.fill(Qt.GlobalColor.green)
+    preview.set_pixmap_source(source)
+    preview.set_image_view("")
+
+    first_target = QPixmap(220, 120)
+    first_target.fill(Qt.GlobalColor.transparent)
+    preview.render(first_target)
+    resolved = preview._resolved_image_view()
+    assert resolved["zoom"] == 100
+    assert resolved["x"] == 50
+    assert resolved["y"] == 50
+    assert resolved["frame_w"] == 220
+    assert resolved["frame_h"] == 120
+
+    preview.resize(110, 120)
+    preview.set_image_view("")
+    second_target = QPixmap(110, 120)
+    second_target.fill(Qt.GlobalColor.transparent)
+    preview.render(second_target)
+    resolved_after_resize = preview._resolved_image_view()
+    assert resolved_after_resize["frame_w"] == 220
+    assert resolved_after_resize["frame_h"] == 120
 
 
 def test_main_window_restores_last_closed_size(tmp_path) -> None:
@@ -6736,11 +7107,9 @@ def test_default_dashboard_layout_is_cleanly_packed(tmp_path) -> None:
     assert positions["today_timeline"] == (9, 3, 3, 16)
     assert positions["pomodoro"] == (0, 19, 3, 6)
     assert positions["link_favorites"] == (3, 19, 3, 6)
-    assert positions["media_panel"] == (6, 19, 3, 6)
-    assert positions["media_panel_2"] == (9, 19, 3, 6)
     assert positions["datetime"] == (0, 25, 3, 1)
-    assert positions["media_panel_3"] == (6, 41, 4, 6)
-    assert positions["media_panel_4"] == (2, 41, 4, 6)
+    assert "media_panel" not in positions
+    assert "media_panel_2" not in positions
     window.close()
 
 
@@ -6769,13 +7138,11 @@ def test_reset_main_layout_applies_captured_default_for_existing_users(tmp_path)
 
     assert window.preferences.show_header_banner
     assert window.preferences.show_today_checklist_inline
-    assert window.preferences.show_media_panel_2
     assert not window.preferences.show_datetime_panel
 
     reloaded = repository.get_preferences()
     assert reloaded.show_header_banner
     assert reloaded.show_today_checklist_inline
-    assert reloaded.show_media_panel_2
 
     positions = {
         str(item["key"]): (int(item["x"]), int(item["y"]), int(item["w"]), int(item["h"]))
@@ -6783,8 +7150,6 @@ def test_reset_main_layout_applies_captured_default_for_existing_users(tmp_path)
     }
     assert positions["focus"] == (0, 3, 3, 16)
     assert positions["today_timeline"] == (9, 3, 3, 16)
-    assert positions["media_panel"] == (6, 19, 3, 6)
-    assert positions["media_panel_2"] == (9, 19, 3, 6)
     assert positions["datetime"] == (0, 25, 3, 1)
 
     assert reloaded.last_layout_state
@@ -6795,7 +7160,7 @@ def test_reset_main_layout_applies_captured_default_for_existing_users(tmp_path)
     assert (int(saved_focus["x"]), int(saved_focus["y"])) == (0, 3)
     assert saved_state["visible"]["header_banner"] is True
     assert saved_state["visible"]["today_checklist"] is True
-    assert saved_state["visible"]["media_panel_2"] is True
+    assert "media_panel_2" not in saved_state["visible"]
     assert saved_state["visible"]["datetime"] is False
 
     window.close()
@@ -7215,16 +7580,19 @@ def test_dashboard_media_drag_pushes_neighbors_down_instead_of_blocking(tmp_path
     # than blocking, and the drag preview matches the committed drop exactly.
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    image_panel = repository.create_image_panel("이미지")
+    assert image_panel.id is not None
     window = MainWindow(repository)
     window.resize(1500, 900)
     window.show()
     app.processEvents()
+    media_key = _image_panel_feature_key(image_panel.id)
 
     window.feature_dashboard_items = [
         {"key": "focus", "x": 0, "y": 0, "w": 5, "h": 4},
         {"key": "quick_memo", "x": 5, "y": 0, "w": 4, "h": 4},
-        {"key": "media_panel", "x": 9, "y": 0, "w": 3, "h": 4},
-        *_dashboard_support_items(6, {"focus", "quick_memo", "media_panel"}),
+        {"key": media_key, "x": 9, "y": 0, "w": 3, "h": 4},
+        *_dashboard_support_items(6, {"focus", "quick_memo", media_key}, media_key),
     ]
     window._render_feature_dashboard()
     app.processEvents()
@@ -7233,18 +7601,18 @@ def test_dashboard_media_drag_pushes_neighbors_down_instead_of_blocking(tmp_path
     drag_offset = QPoint(10, 10)
     drop_global = window.feature_grid_container.mapToGlobal(QPoint(int(round(column_step * 2)) + 10, 10))
 
-    preview = window._dashboard_preview_item("media_panel", drop_global, drag_offset)
+    preview = window._dashboard_preview_item(media_key, drop_global, drag_offset)
     assert preview is not None
     # Preview shows the dragged panel at the target slot...
     assert (int(preview["x"]), int(preview["y"])) == (2, 0)
 
-    window.finish_feature_reposition("media_panel", drop_global, drag_offset)
+    window.finish_feature_reposition(media_key, drop_global, drag_offset)
     app.processEvents()
 
     items = [dict(item) for item in window._current_feature_dashboard_layout()]
     positions = {str(item["key"]): (int(item["x"]), int(item["y"])) for item in items}
     # ...and the commit matches the preview, with the overlapped panel pushed down.
-    assert positions["media_panel"] == (2, 0)
+    assert positions[media_key] == (2, 0)
     assert positions["focus"] == (0, 4)
     assert positions["quick_memo"] == (5, 0)
     assert _dashboard_layout_has_no_overlap(items)
@@ -7254,17 +7622,20 @@ def test_dashboard_media_drag_pushes_neighbors_down_instead_of_blocking(tmp_path
 def test_dashboard_banner_drag_prefers_grid_position_and_pushes_neighbors_down(tmp_path) -> None:
     app = _app()
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    image_panel = repository.create_image_panel("이미지")
+    assert image_panel.id is not None
     window = MainWindow(repository)
     window.resize(1500, 900)
     window.show()
     app.processEvents()
+    media_key = _image_panel_feature_key(image_panel.id)
 
     window.feature_dashboard_items = [
         {"key": "header_banner", "x": 0, "y": 0, "w": 12, "h": 3},
         {"key": "focus", "x": 0, "y": 3, "w": 5, "h": 4},
         {"key": "quick_memo", "x": 5, "y": 3, "w": 4, "h": 4},
-        {"key": "media_panel", "x": 9, "y": 3, "w": 3, "h": 4},
-        *_dashboard_support_items(9, {"header_banner", "focus", "quick_memo", "media_panel"}),
+        {"key": media_key, "x": 9, "y": 3, "w": 3, "h": 4},
+        *_dashboard_support_items(9, {"header_banner", "focus", "quick_memo", media_key}, media_key),
     ]
     window._render_feature_dashboard()
     app.processEvents()
@@ -7288,7 +7659,7 @@ def test_dashboard_banner_drag_prefers_grid_position_and_pushes_neighbors_down(t
     assert positions["focus"] != (0, 0)
     assert positions["focus"][1] >= 6
     assert positions["quick_memo"][1] >= 6
-    assert positions["media_panel"][1] >= 6
+    assert positions[media_key][1] >= 6
     window.close()
 
 

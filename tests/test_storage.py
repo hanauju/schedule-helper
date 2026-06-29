@@ -48,6 +48,93 @@ def test_default_app_title_is_orot(tmp_path) -> None:
     assert legacy_repository.get_preferences().app_title == "오롯"
 
 
+def test_dynamic_image_panels_round_trip(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+
+    panel = repository.create_image_panel("참고 이미지")
+    assert panel.id is not None
+    panel.file_path = "C:/Images/reference.png"
+    panel.image_position = "right"
+    panel.image_view = '{"zoom":140,"x":70,"y":30,"frame_w":320,"frame_h":180}'
+    panel.visible = False
+    repository.save_image_panel(panel)
+
+    panels = repository.list_image_panels()
+    assert len(panels) == 1
+    assert panels[0].title == "참고 이미지"
+    assert panels[0].file_path == "C:/Images/reference.png"
+    assert panels[0].image_position == "right"
+    assert panels[0].image_view == '{"zoom":140,"x":70,"y":30,"frame_w":320,"frame_h":180}'
+    assert panels[0].visible is False
+
+    panel.visible = True
+    repository.save_image_panel(panel)
+    reloaded = repository.get_image_panel(panel.id)
+    assert reloaded is not None
+    assert reloaded.visible is True
+
+    repository.delete_image_panel(panel.id)
+    assert repository.list_image_panels() == []
+
+
+def test_legacy_media_panels_migrate_to_dynamic_image_panels(tmp_path) -> None:
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    preferences = repository.get_preferences()
+    preferences.show_media_panel = True
+    preferences.media_panel_file_path = "C:/Images/reference.png"
+    preferences.media_panel_image_position = "left"
+    preferences.media_panel_image_view = '{"zoom":140,"x":70,"y":30}'
+    preferences.show_media_panel_2 = True
+    preferences.media_panel_2_file_path = "C:/Images/reference-2.png"
+    preferences.last_layout_state = json.dumps(
+        {
+            "layout": {
+                "dashboard": [
+                    {"key": "media_panel", "x": 1, "y": 2, "w": 3, "h": 4},
+                    {"key": "media_panel_2", "x": 5, "y": 2, "w": 3, "h": 4},
+                ]
+            },
+            "visible": {"media_panel": True, "media_panel_2": True},
+        }
+    )
+    repository.save_preferences(preferences)
+    repository.save_layout_profile(LayoutProfile(name="legacy", data=preferences.last_layout_state))
+
+    mapping = repository.migrate_legacy_media_panels_to_image_panels()
+
+    assert set(mapping) == {"media_panel", "media_panel_2"}
+    assert all(value.startswith("image_panel:") for value in mapping.values())
+    panels = repository.list_image_panels()
+    assert [panel.file_path for panel in panels] == [
+        "C:/Images/reference.png",
+        "C:/Images/reference-2.png",
+    ]
+    assert panels[0].image_position == "left"
+    assert panels[0].image_view == '{"zoom":140,"x":70,"y":30}'
+    reloaded = repository.get_preferences()
+    assert reloaded.legacy_media_panels_migrated
+    assert not reloaded.show_media_panel
+    assert not reloaded.show_media_panel_2
+
+    state = json.loads(reloaded.last_layout_state)
+    assert [item["key"] for item in state["layout"]["dashboard"]] == [
+        mapping["media_panel"],
+        mapping["media_panel_2"],
+    ]
+    assert set(state["visible"]) == {mapping["media_panel"], mapping["media_panel_2"]}
+
+    profile = repository.get_layout_profile("legacy")
+    assert profile is not None
+    profile_state = json.loads(profile.data)
+    assert [item["key"] for item in profile_state["layout"]["dashboard"]] == [
+        mapping["media_panel"],
+        mapping["media_panel_2"],
+    ]
+
+    assert repository.migrate_legacy_media_panels_to_image_panels() == {}
+    assert len(repository.list_image_panels()) == 2
+
+
 def test_default_preference_dataclass_uses_first_run_palette() -> None:
     preferences = Preference()
 
@@ -110,28 +197,28 @@ def test_default_preferences_show_captured_dashboard_panels(tmp_path) -> None:
     defaults = Preference()
 
     assert defaults.show_today_checklist_inline
-    assert defaults.show_media_panel_2
+    assert not defaults.show_media_panel_2
     assert defaults.show_header_banner
     assert defaults.show_focus_panel
     assert defaults.show_quick_memo_panel
     assert defaults.show_today_timeline_inline
     assert defaults.show_pomodoro_controls
     assert defaults.show_link_favorites_panel
-    assert defaults.show_media_panel
+    assert not defaults.show_media_panel
     assert not defaults.show_datetime_panel
 
     repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
     seeded = repository.get_preferences()
 
     assert seeded.show_today_checklist_inline
-    assert seeded.show_media_panel_2
+    assert not seeded.show_media_panel_2
     assert seeded.show_header_banner
     assert seeded.show_focus_panel
     assert seeded.show_quick_memo_panel
     assert seeded.show_today_timeline_inline
     assert seeded.show_pomodoro_controls
     assert seeded.show_link_favorites_panel
-    assert seeded.show_media_panel
+    assert not seeded.show_media_panel
     assert not seeded.show_datetime_panel
 
 

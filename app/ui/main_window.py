@@ -92,7 +92,19 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from app.models import Event, FocusSession, ItemType, LayoutProfile, LinkFavorite, Preference, QuickNote, QuickNoteFolder, Tag, Task
+from app.models import (
+    Event,
+    FocusSession,
+    ImagePanel,
+    ItemType,
+    LayoutProfile,
+    LinkFavorite,
+    Preference,
+    QuickNote,
+    QuickNoteFolder,
+    Tag,
+    Task,
+)
 from app.services.app_usage import WindowsActiveWindowProvider
 from app.services.focus_timer import FocusTimerService, decode_focus_targets
 from app.ui.metadata_widgets import PinBadge, SortDirectionButton, TagAssignmentDialog, TagBadge
@@ -131,13 +143,34 @@ PANEL_HANDLE_CONTENT_GAP = 1
 PANEL_HEADER_HEIGHT = PANEL_MOVE_BAR_HEIGHT
 PANEL_CORNER_RADIUS = 16  # keep in sync with normal card "border-radius: 16px" in the stylesheet
 DASHBOARD_GRID_GAP = 12
-MEDIA_PANEL_KEYS = ("media_panel", "media_panel_2", "media_panel_3", "media_panel_4")
+MEDIA_PANEL_KEYS: tuple[str, ...] = ()
+IMAGE_PANEL_FEATURE_PREFIX = "image_panel:"
+IMAGE_VIEW_DEFAULT: Final[dict[str, int]] = {"zoom": 100, "x": 50, "y": 50}
+IMAGE_VIEW_FRAME_MAX = 8192
 WRITING_EDITOR_KEY: Final = "writing_editor"  # reserved for deferred writing/commission/weekly-plan features
 WRITING_LIBRARY_KEY: Final = "writing_library"  # reserved for deferred writing/commission/weekly-plan features
 COMMISSION_SUMMARY_KEY: Final = "commission_summary"  # reserved for deferred writing/commission/weekly-plan features
 WEEKLY_PLAN_KEY: Final = "weekly_plan"  # reserved for deferred writing/commission/weekly-plan features
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
 WORKSPACE_BUTTON_MAX_WIDTH = 180  # px; longer workspace names elide with "…" and show full name as tooltip
+
+
+def _image_panel_feature_key(panel_id: int) -> str:
+    return f"{IMAGE_PANEL_FEATURE_PREFIX}{int(panel_id)}"
+
+
+def _image_panel_id_from_feature_key(feature_key: str) -> int | None:
+    if not str(feature_key).startswith(IMAGE_PANEL_FEATURE_PREFIX):
+        return None
+    try:
+        panel_id = int(str(feature_key)[len(IMAGE_PANEL_FEATURE_PREFIX) :])
+    except ValueError:
+        return None
+    return panel_id if panel_id > 0 else None
+
+
+def _is_media_panel_feature_key(feature_key: str) -> bool:
+    return _image_panel_id_from_feature_key(feature_key) is not None
 KOREAN_FONT_FILES = (
     "malgun.ttf",
     "malgunbd.ttf",
@@ -171,7 +204,7 @@ def _normalize_image_position(value: object) -> str:
 
 def _image_view_from_position(position: object) -> dict[str, int]:
     normalized = _normalize_image_position(position)
-    view = {"zoom": 100, "x": 50, "y": 50}
+    view = dict(IMAGE_VIEW_DEFAULT)
     if normalized == "left":
         view["x"] = 0
     elif normalized == "right":
@@ -181,6 +214,24 @@ def _image_view_from_position(position: object) -> dict[str, int]:
     elif normalized == "bottom":
         view["y"] = 100
     return view
+
+
+def _image_view_frame_dimension(value: object) -> int | None:
+    try:
+        dimension = int(value)
+    except (TypeError, ValueError):
+        return None
+    return min(IMAGE_VIEW_FRAME_MAX, max(1, dimension)) if dimension > 0 else None
+
+
+def _image_view_has_reference_frame(view: dict[str, int]) -> bool:
+    return _image_view_frame_dimension(view.get("frame_w")) is not None and _image_view_frame_dimension(
+        view.get("frame_h")
+    ) is not None
+
+
+def _image_view_uses_default_crop(view: dict[str, int]) -> bool:
+    return {key: view.get(key) for key in IMAGE_VIEW_DEFAULT} == IMAGE_VIEW_DEFAULT
 
 
 def _normalize_image_view(value: object, fallback_position: object = "center") -> dict[str, int]:
@@ -204,6 +255,15 @@ def _normalize_image_view(value: object, fallback_position: object = "center") -
     except (TypeError, ValueError):
         return fallback
     return {
+        **(
+            {
+                "frame_w": frame_width,
+                "frame_h": frame_height,
+            }
+            if (frame_width := _image_view_frame_dimension(data.get("frame_w"))) is not None
+            and (frame_height := _image_view_frame_dimension(data.get("frame_h"))) is not None
+            else {}
+        ),
         "zoom": min(300, max(25, zoom)),
         "x": min(100, max(0, x)),
         "y": min(100, max(0, y)),
@@ -212,9 +272,54 @@ def _normalize_image_view(value: object, fallback_position: object = "center") -
 
 def _encode_image_view(view: dict[str, int] | None) -> str:
     normalized = _normalize_image_view(json.dumps(view or {}))
-    if normalized == {"zoom": 100, "x": 50, "y": 50}:
+    if _image_view_uses_default_crop(normalized) and not _image_view_has_reference_frame(normalized):
         return ""
-    return json.dumps(normalized, separators=(",", ":"))
+    encoded = {
+        "zoom": normalized["zoom"],
+        "x": normalized["x"],
+        "y": normalized["y"],
+    }
+    if _image_view_has_reference_frame(normalized):
+        encoded["frame_w"] = normalized["frame_w"]
+        encoded["frame_h"] = normalized["frame_h"]
+    return json.dumps(encoded, separators=(",", ":"))
+
+
+def _image_view_with_reference_frame(
+    view: dict[str, int] | str,
+    widget: QWidget | None,
+    fallback_position: object = "center",
+) -> dict[str, int]:
+    normalized = _normalize_image_view(view, fallback_position)
+    if _image_view_has_reference_frame(normalized) or widget is None:
+        return normalized
+    size = widget.contentsRect().size()
+    if size.width() <= 0 or size.height() <= 0:
+        return normalized
+    with_frame = dict(normalized)
+    with_frame["frame_w"] = min(IMAGE_VIEW_FRAME_MAX, max(1, size.width()))
+    with_frame["frame_h"] = min(IMAGE_VIEW_FRAME_MAX, max(1, size.height()))
+    return with_frame
+
+
+def _image_view_with_reference_size(view: dict[str, int], size: QSize) -> dict[str, int]:
+    normalized = _normalize_image_view(view)
+    if _image_view_has_reference_frame(normalized):
+        return normalized
+    if size.width() <= 0 or size.height() <= 0:
+        return normalized
+    with_frame = dict(normalized)
+    with_frame["frame_w"] = min(IMAGE_VIEW_FRAME_MAX, max(1, size.width()))
+    with_frame["frame_h"] = min(IMAGE_VIEW_FRAME_MAX, max(1, size.height()))
+    return with_frame
+
+
+def _image_view_reference_size(view: dict[str, int]) -> QSize:
+    frame_width = _image_view_frame_dimension(view.get("frame_w"))
+    frame_height = _image_view_frame_dimension(view.get("frame_h"))
+    if frame_width is None or frame_height is None:
+        return QSize()
+    return QSize(frame_width, frame_height)
 
 
 def _draw_image_viewport(widget: QWidget, painter: QPainter, pixmap: QPixmap, view: dict[str, int]) -> None:
@@ -225,20 +330,36 @@ def _draw_image_viewport(widget: QWidget, painter: QPainter, pixmap: QPixmap, vi
         return
     source_width = max(1, pixmap.width())
     source_height = max(1, pixmap.height())
-    cover_scale = max(available.width() / source_width, available.height() / source_height)
+    frame_width = _image_view_frame_dimension(view.get("frame_w"))
+    frame_height = _image_view_frame_dimension(view.get("frame_h"))
+    if frame_width is not None and frame_height is not None:
+        reference = QRectF(0, 0, float(frame_width), float(frame_height))
+        frame_scale = max(available.width() / reference.width(), available.height() / reference.height())
+        frame_x = available.x() + (available.width() - reference.width() * frame_scale) / 2
+        frame_y = available.y() + (available.height() - reference.height() * frame_scale) / 2
+    else:
+        reference = QRectF(available)
+        frame_scale = 1.0
+        frame_x = available.x()
+        frame_y = available.y()
+    cover_scale = max(reference.width() / source_width, reference.height() / source_height)
     zoom_scale = max(0.25, min(3.0, float(view.get("zoom", 100)) / 100.0))
-    draw_width = source_width * cover_scale * zoom_scale
-    draw_height = source_height * cover_scale * zoom_scale
+    reference_draw_width = source_width * cover_scale * zoom_scale
+    reference_draw_height = source_height * cover_scale * zoom_scale
     focus_x = max(0.0, min(1.0, float(view.get("x", 50)) / 100.0))
     focus_y = max(0.0, min(1.0, float(view.get("y", 50)) / 100.0))
-    if draw_width >= available.width():
-        draw_x = available.x() - (draw_width - available.width()) * focus_x
+    if reference_draw_width >= reference.width():
+        reference_draw_x = reference.x() - (reference_draw_width - reference.width()) * focus_x
     else:
-        draw_x = available.x() + (available.width() - draw_width) * focus_x
-    if draw_height >= available.height():
-        draw_y = available.y() - (draw_height - available.height()) * focus_y
+        reference_draw_x = reference.x() + (reference.width() - reference_draw_width) * focus_x
+    if reference_draw_height >= reference.height():
+        reference_draw_y = reference.y() - (reference_draw_height - reference.height()) * focus_y
     else:
-        draw_y = available.y() + (available.height() - draw_height) * focus_y
+        reference_draw_y = reference.y() + (reference.height() - reference_draw_height) * focus_y
+    draw_x = frame_x + reference_draw_x * frame_scale
+    draw_y = frame_y + reference_draw_y * frame_scale
+    draw_width = reference_draw_width * frame_scale
+    draw_height = reference_draw_height * frame_scale
     painter.setClipRect(available, Qt.ClipOperation.IntersectClip)
     painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
@@ -521,12 +642,16 @@ def _start_feature_drag(source: QWidget, feature_key: str) -> None:
 
 def _hidden_reparent_bin_for(widget: QWidget) -> QWidget | None:
     window = widget.window()
-    owner = window if isinstance(window, QWidget) and window is not widget else QApplication.instance()
+    owner = window if isinstance(window, QWidget) and window is not widget else None
     if owner is None:
+        active_window = QApplication.activeWindow()
+        if isinstance(active_window, QWidget) and active_window is not widget:
+            owner = active_window
+    if not isinstance(owner, QWidget):
         return None
     bin_widget = getattr(owner, "_feature_reparent_bin", None)
     if not isinstance(bin_widget, QWidget):
-        bin_widget = QWidget(owner if isinstance(owner, QWidget) else None)
+        bin_widget = QWidget(owner)
         bin_widget.setObjectName("featureReparentBin")
         bin_widget.setFixedSize(1, 1)
         bin_widget.hide()
@@ -1329,6 +1454,7 @@ class HeaderBannerWidget(QLabel):
         self.surface_color = "#f3f6f4"
         self.image_position = "center"
         self.image_view = _normalize_image_view("", self.image_position)
+        self._image_reference_size = QSize()
         self.rounded_corners = True
         self.setObjectName("headerBannerPreview")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1392,10 +1518,22 @@ class HeaderBannerWidget(QLabel):
         self.image_position = _normalize_image_position(position)
         self.setAlignment(_image_alignment(self.image_position))
         self.image_view = _normalize_image_view("", self.image_position)
+        self._image_reference_size = QSize()
         self._apply_current_media_size()
 
     def set_image_view(self, view: str | dict[str, int]) -> None:
+        previous_view = dict(self.image_view)
+        previous_reference_size = QSize(self._image_reference_size)
         self.image_view = _normalize_image_view(json.dumps(view) if isinstance(view, dict) else view, self.image_position)
+        reference_size = _image_view_reference_size(self.image_view)
+        if (
+            reference_size.width() <= 0
+            and reference_size.height() <= 0
+            and self.image_view == previous_view
+        ):
+            self._image_reference_size = previous_reference_size
+        else:
+            self._image_reference_size = reference_size
         self._apply_current_media_size()
 
     def set_rounded_corners(self, rounded: bool) -> None:
@@ -1460,13 +1598,22 @@ class HeaderBannerWidget(QLabel):
             return
         self.update()
 
+    def _resolved_image_view(self) -> dict[str, int]:
+        if _image_view_has_reference_frame(self.image_view):
+            return self.image_view
+        if self._image_reference_size.width() <= 0 or self._image_reference_size.height() <= 0:
+            size = self.contentsRect().size()
+            if size.width() > 0 and size.height() > 0:
+                self._image_reference_size = QSize(size.width(), size.height())
+        return _image_view_with_reference_size(self.image_view, self._image_reference_size)
+
     def paintEvent(self, event) -> None:
         if self.has_media():
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             _clip_media_corners(self, painter, self.rounded_corners)
             source = self.movie.currentPixmap() if self.movie is not None else self._source_pixmap
-            _draw_image_viewport(self, painter, source, self.image_view)
+            _draw_image_viewport(self, painter, source, self._resolved_image_view())
             return
         super().paintEvent(event)
 
@@ -1481,6 +1628,7 @@ class MediaPreviewLabel(QLabel):
         self._select_press_position: QPoint | None = None
         self.image_position = "center"
         self.image_view = _normalize_image_view("", self.image_position)
+        self._image_reference_size = QSize()
         self.rounded_corners = True
         self.setObjectName("mediaPreviewLabel")
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -1519,13 +1667,25 @@ class MediaPreviewLabel(QLabel):
         self.image_position = _normalize_image_position(position)
         self.setAlignment(_image_alignment(self.image_position))
         self.image_view = _normalize_image_view("", self.image_position)
+        self._image_reference_size = QSize()
         if self._source_movie is not None:
             self._apply_movie_size()
         elif not self._source_pixmap.isNull():
             self._apply_scaled_pixmap()
 
     def set_image_view(self, view: str | dict[str, int]) -> None:
+        previous_view = dict(self.image_view)
+        previous_reference_size = QSize(self._image_reference_size)
         self.image_view = _normalize_image_view(json.dumps(view) if isinstance(view, dict) else view, self.image_position)
+        reference_size = _image_view_reference_size(self.image_view)
+        if (
+            reference_size.width() <= 0
+            and reference_size.height() <= 0
+            and self.image_view == previous_view
+        ):
+            self._image_reference_size = previous_reference_size
+        else:
+            self._image_reference_size = reference_size
         if self._source_movie is not None:
             self._apply_movie_size()
         elif not self._source_pixmap.isNull():
@@ -1591,13 +1751,22 @@ class MediaPreviewLabel(QLabel):
             return
         self.update()
 
+    def _resolved_image_view(self) -> dict[str, int]:
+        if _image_view_has_reference_frame(self.image_view):
+            return self.image_view
+        if self._image_reference_size.width() <= 0 or self._image_reference_size.height() <= 0:
+            size = self.contentsRect().size()
+            if size.width() > 0 and size.height() > 0:
+                self._image_reference_size = QSize(size.width(), size.height())
+        return _image_view_with_reference_size(self.image_view, self._image_reference_size)
+
     def paintEvent(self, event) -> None:
         if self.has_media():
             painter = QPainter(self)
             painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
             _clip_media_corners(self, painter, self.rounded_corners)
             source = self._source_movie.currentPixmap() if self._source_movie is not None else self._source_pixmap
-            _draw_image_viewport(self, painter, source, self.image_view)
+            _draw_image_viewport(self, painter, source, self._resolved_image_view())
             return
         super().paintEvent(event)
 
@@ -1607,6 +1776,7 @@ class DateTimePanelWidget(QWidget):
         super().__init__(parent)
         self.image_path = ""
         self.image_view = _normalize_image_view("")
+        self._image_reference_size = QSize()
         self._source_pixmap = QPixmap()
         self._source_movie: QMovie | None = None
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
@@ -1641,7 +1811,18 @@ class DateTimePanelWidget(QWidget):
         self.update()
 
     def set_image_view(self, view: str | dict[str, int]) -> None:
+        previous_view = dict(self.image_view)
+        previous_reference_size = QSize(self._image_reference_size)
         self.image_view = _normalize_image_view(json.dumps(view) if isinstance(view, dict) else view)
+        reference_size = _image_view_reference_size(self.image_view)
+        if (
+            reference_size.width() <= 0
+            and reference_size.height() <= 0
+            and self.image_view == previous_view
+        ):
+            self._image_reference_size = previous_reference_size
+        else:
+            self._image_reference_size = reference_size
         self.update()
 
     def has_media(self) -> bool:
@@ -1652,6 +1833,15 @@ class DateTimePanelWidget(QWidget):
             self._source_movie.stop()
             self._source_movie = None
 
+    def _resolved_image_view(self) -> dict[str, int]:
+        if _image_view_has_reference_frame(self.image_view):
+            return self.image_view
+        if self._image_reference_size.width() <= 0 or self._image_reference_size.height() <= 0:
+            size = self.contentsRect().size()
+            if size.width() > 0 and size.height() > 0:
+                self._image_reference_size = QSize(size.width(), size.height())
+        return _image_view_with_reference_size(self.image_view, self._image_reference_size)
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
         if not self.has_media():
@@ -1660,7 +1850,7 @@ class DateTimePanelWidget(QWidget):
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         _clip_media_corners(self, painter, True)
         source = self._source_movie.currentPixmap() if self._source_movie is not None else self._source_pixmap
-        _draw_image_viewport(self, painter, source, self.image_view)
+        _draw_image_viewport(self, painter, source, self._resolved_image_view())
 
 
 class OutlinedTextLabel(QLabel):
@@ -3368,7 +3558,13 @@ class MainWindow(QMainWindow):
         self._fullscreen_pre_size: QSize | None = None
         self._fullscreen_hint_shown = False
         self.break_until: datetime | None = None
+        self.repository.migrate_legacy_media_panels_to_image_panels()
         self.preferences = self.repository.get_preferences()
+        self.dynamic_image_panels: dict[int, ImagePanel] = {
+            int(panel.id): panel
+            for panel in self.repository.list_image_panels()
+            if panel.id is not None
+        }
         self._active_workspace_filters = self._normalize_workspace_filters({})
         stored_preferences = self._preferences_with_stored_media_assets(self.preferences)
         if stored_preferences != self.preferences:
@@ -3543,13 +3739,6 @@ class MainWindow(QMainWindow):
 
         self.link_favorites_panel = self._wrap_feature("link_favorites", "즐겨찾기", self._build_link_favorites_panel())
         self.right_splitter.addWidget(self.link_favorites_panel)
-        self.media_panel = self._wrap_feature("media_panel", "이미지 패널 1", self._build_media_panel("media_panel"))
-        self.right_splitter.addWidget(self.media_panel)
-        for media_index in range(2, 5):
-            media_key = f"media_panel_{media_index}"
-            media_box = self._wrap_feature(media_key, f"이미지 패널 {media_index}", self._build_media_panel(media_key))
-            setattr(self, media_key, media_box)
-            self.right_splitter.addWidget(media_box)
         for index in range(self.right_splitter.count()):
             self.right_splitter.setStretchFactor(index, 1)
         self.right_splitter.setSizes([320, 320, 280, 280, 280])
@@ -3576,6 +3765,8 @@ class MainWindow(QMainWindow):
             self.feature_dashboard_layout.setColumnMinimumWidth(column, 28)
         self.dashboard_guide_overlay = DashboardGridGuideOverlay(self.feature_grid_container)
         self.feature_grid_container.set_resize_callback(self._reposition_dashboard_floating_overlays)
+        for image_panel in self.dynamic_image_panels.values():
+            self._create_dynamic_image_panel_box(image_panel)
         workspace_layout.addWidget(self.feature_grid_container, 1)
         self._apply_feature_layout(self.default_layout_state().get("layout"))
 
@@ -3722,21 +3913,29 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.header_focus_time_label)
         return card
 
-    def _wrap_feature(self, feature_key: str, title: str, content: QWidget) -> DraggableFeatureBox:
+    def _wrap_feature(
+        self,
+        feature_key: str,
+        title: str,
+        content: QWidget,
+        parent: QWidget | None = None,
+    ) -> DraggableFeatureBox:
         expand_content = feature_key != "datetime"
-        content_direct_drag = feature_key in {"header_banner", *MEDIA_PANEL_KEYS, *FLOATING_OVERLAY_FEATURE_KEYS}
+        content_direct_drag = (
+            feature_key in {"header_banner", *FLOATING_OVERLAY_FEATURE_KEYS}
+            or _is_media_panel_feature_key(feature_key)
+        )
         widget_callback = (
             self.open_feature_widget
-            if feature_key
-            in {
+            if feature_key in {
                 "focus",
                 "pomodoro",
                 "today_checklist",
                 "quick_memo",
                 "today_timeline",
                 "link_favorites",
-                *MEDIA_PANEL_KEYS,
             }
+            or _is_media_panel_feature_key(feature_key)
             else None
         )
         box = DraggableFeatureBox(
@@ -3746,9 +3945,10 @@ class MainWindow(QMainWindow):
             self.swap_feature_panels,
             expand_content,
             widget_callback,
-            self.hide_feature_from_main,
+            None if _is_media_panel_feature_key(feature_key) else self.hide_feature_from_main,
             show_title_bar=True,
             content_drag_enabled=content_direct_drag,
+            parent=parent,
         )
         box.resize_callback = self.resize_feature_panel_width
         box.resize_edge_callback = self.resize_feature_panel_width_from_edge
@@ -5475,7 +5675,7 @@ class MainWindow(QMainWindow):
             lambda source, position, key=feature_key: self.show_media_panel_context_menu(source, position, key)
         )
         self.media_preview_labels[feature_key] = preview
-        if feature_key == "media_panel":
+        if not hasattr(self, "media_preview_label"):
             self.media_preview_label = preview
         layout.addWidget(preview, 1)
         self.refresh_media_panel(feature_key)
@@ -7267,7 +7467,7 @@ class MainWindow(QMainWindow):
         self.refresh_compact_notes()
         self.refresh_link_favorites()
         self.refresh_compact_favorites()
-        for media_key in MEDIA_PANEL_KEYS:
+        for media_key in [*MEDIA_PANEL_KEYS, *self._dynamic_media_panel_keys()]:
             self.refresh_media_panel(media_key)
         self.refresh_history()
         self.update_focus_display()
@@ -7283,7 +7483,7 @@ class MainWindow(QMainWindow):
             self.refresh_today,
             self.refresh_notes,
             self.refresh_link_favorites,
-            lambda: [self.refresh_media_panel(media_key) for media_key in MEDIA_PANEL_KEYS],
+            lambda: [self.refresh_media_panel(media_key) for media_key in [*MEDIA_PANEL_KEYS, *self._dynamic_media_panel_keys()]],
             self.refresh_compact_notes,
             self.refresh_compact_favorites,
             self.refresh_history,
@@ -8184,6 +8384,34 @@ class MainWindow(QMainWindow):
             time_label = _format_datetime(note.created_at, self.preferences)
         return f"{time_label}  {body}{folder_label}{attachment_label}"
 
+    def _dynamic_media_panel_widget_name(self, panel_id: int) -> str:
+        return f"dynamic_media_panel_{int(panel_id)}"
+
+    def _dynamic_image_panel(self, feature_key: str) -> ImagePanel | None:
+        panel_id = _image_panel_id_from_feature_key(feature_key)
+        if panel_id is None:
+            return None
+        return self.dynamic_image_panels.get(panel_id)
+
+    def _dynamic_media_panel_keys(self) -> list[str]:
+        return [
+            _image_panel_feature_key(panel_id)
+            for panel_id, _panel in sorted(
+                self.dynamic_image_panels.items(),
+                key=lambda item: (int(item[1].sort_order), int(item[0])),
+            )
+        ]
+
+    def _save_dynamic_image_panel(self, panel: ImagePanel) -> ImagePanel:
+        saved = self.repository.save_image_panel(panel)
+        if saved.id is not None:
+            self.dynamic_image_panels[int(saved.id)] = saved
+            feature_key = _image_panel_feature_key(saved.id)
+            feature_box = self.feature_boxes.get(feature_key)
+            if isinstance(feature_box, DraggableFeatureBox):
+                feature_box.set_title(saved.title)
+        return saved
+
     def _media_panel_number(self, feature_key: str) -> int:
         if feature_key == "media_panel":
             return 1
@@ -8209,25 +8437,43 @@ class MainWindow(QMainWindow):
         return "show_media_panel" if number == 1 else f"show_media_panel_{number}"
 
     def _media_panel_file_path(self, feature_key: str) -> str:
+        if panel := self._dynamic_image_panel(feature_key):
+            return panel.file_path.strip()
         return str(getattr(self.preferences, self._media_panel_file_attribute(feature_key), "")).strip()
 
     def _media_panel_image_position(self, feature_key: str) -> str:
+        if panel := self._dynamic_image_panel(feature_key):
+            return _normalize_image_position(panel.image_position)
         return _normalize_image_position(getattr(self.preferences, self._media_panel_position_attribute(feature_key), "center"))
 
     def _media_panel_image_view(self, feature_key: str) -> dict[str, int]:
+        if panel := self._dynamic_image_panel(feature_key):
+            return _normalize_image_view(panel.image_view, self._media_panel_image_position(feature_key))
         return _normalize_image_view(
             getattr(self.preferences, self._media_panel_view_attribute(feature_key), ""),
             self._media_panel_image_position(feature_key),
         )
 
     def _set_media_panel_preference_path(self, feature_key: str, image_path: str) -> None:
+        if panel := self._dynamic_image_panel(feature_key):
+            panel.file_path = image_path.strip()
+            self._save_dynamic_image_panel(panel)
+            return
         setattr(self.preferences, self._media_panel_file_attribute(feature_key), image_path.strip())
 
     def _set_media_panel_preference_position(self, feature_key: str, position: str) -> None:
+        if panel := self._dynamic_image_panel(feature_key):
+            panel.image_position = _normalize_image_position(position)
+            self._save_dynamic_image_panel(panel)
+            return
         setattr(self.preferences, self._media_panel_position_attribute(feature_key), _normalize_image_position(position))
 
     def _set_media_panel_preference_view(self, feature_key: str, view: dict[str, int] | str) -> None:
         encoded = _encode_image_view(_normalize_image_view(view) if isinstance(view, str) else view)
+        if panel := self._dynamic_image_panel(feature_key):
+            panel.image_view = encoded
+            self._save_dynamic_image_panel(panel)
+            return
         setattr(self.preferences, self._media_panel_view_attribute(feature_key), encoded)
 
     def _store_media_asset(self, image_path: str) -> str:
@@ -8284,9 +8530,13 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("시간 배경 이미지를 업데이트했습니다." if stored_path else "시간 배경 이미지를 비웠습니다.", 1800)
 
     def set_datetime_panel_background_image_view(self, view: dict[str, int] | str, persist: bool = True) -> None:
-        normalized_view = _normalize_image_view(view)
-        if hasattr(self, "datetime_content_panel") and isinstance(self.datetime_content_panel, DateTimePanelWidget):
-            self.datetime_content_panel.set_image_view(normalized_view)
+        panel = getattr(self, "datetime_content_panel", None)
+        normalized_view = _image_view_with_reference_frame(
+            view,
+            panel if isinstance(panel, DateTimePanelWidget) else None,
+        )
+        if isinstance(panel, DateTimePanelWidget):
+            panel.set_image_view(normalized_view)
         if not persist:
             return
         self.preferences.datetime_panel_background_image_view = _encode_image_view(normalized_view)
@@ -8329,19 +8579,116 @@ class MainWindow(QMainWindow):
         feature_key: str = "media_panel",
     ) -> None:
         pinned = self.feature_panel_pinned(feature_key)
+        dynamic_panel = self._dynamic_image_panel(feature_key)
+        has_image = bool(self._media_panel_file_path(feature_key))
+        actions: list[tuple[str, Callable[[], None], bool]] = [
+            ("이미지 변경", lambda: self.choose_media_panel_file(feature_key), True),
+            ("이미지 비우기", lambda: self.clear_media_panel_file(feature_key), has_image),
+            ("보기 조정", lambda: self.adjust_media_panel_image_view(feature_key), has_image),
+            ("보기 초기화", lambda: self.reset_media_panel_image_view(feature_key), has_image),
+            ("새창으로 열기", lambda: self.open_feature_widget(feature_key), True),
+            ("새 이미지 패널 추가", self.add_image_panel, True),
+            ("패널 고정 해제" if pinned else "패널 고정", lambda: self.set_feature_panel_pinned(feature_key, not pinned), True),
+        ]
+        if dynamic_panel is not None:
+            actions.extend(
+                [
+                    ("이름 변경", lambda: self.rename_image_panel(feature_key), True),
+                    ("패널 삭제", lambda: self.delete_image_panel(feature_key), True),
+                ]
+            )
         _show_light_action_popup(
             source_widget,
             position,
-            [
-                ("패널 고정 해제" if pinned else "패널 고정", lambda: self.set_feature_panel_pinned(feature_key, not pinned), True),
-                ("새창으로 열기", lambda: self.open_feature_widget(feature_key), True),
-                ("메인창에서 숨기기", lambda: self.hide_feature_from_main(feature_key), True),
-                ("이미지 변경", lambda: self.choose_media_panel_file(feature_key), True),
-                ("비우기", lambda: self.clear_media_panel_file(feature_key), bool(self._media_panel_file_path(feature_key))),
-                ("이미지 보기 조정", lambda: self.adjust_media_panel_image_view(feature_key), bool(self._media_panel_file_path(feature_key))),
-                ("이미지 보기 초기화", lambda: self.reset_media_panel_image_view(feature_key), bool(self._media_panel_file_path(feature_key))),
-            ],
+            actions,
         )
+
+    def _create_dynamic_image_panel_box(self, panel: ImagePanel) -> DraggableFeatureBox | None:
+        if panel.id is None:
+            return None
+        feature_key = _image_panel_feature_key(panel.id)
+        existing = self.feature_boxes.get(feature_key)
+        if existing is not None:
+            return existing
+        dashboard_container = getattr(self, "feature_grid_container", None)
+        parent = dashboard_container if isinstance(dashboard_container, QWidget) else self
+        media_box = self._wrap_feature(feature_key, panel.title, self._build_media_panel(feature_key), parent=parent)
+        setattr(self, self._dynamic_media_panel_widget_name(panel.id), media_box)
+        media_box.hide()
+        return media_box
+
+    def add_image_panel(self) -> None:
+        panel = self.repository.create_image_panel()
+        if panel.id is None:
+            return
+        self.dynamic_image_panels[int(panel.id)] = panel
+        feature_key = _image_panel_feature_key(panel.id)
+        self._create_dynamic_image_panel_box(panel)
+        if hasattr(self, "feature_dashboard_layout"):
+            self._render_feature_dashboard()
+            self.apply_preferences(refresh_content=True, sync_dashboard=False)
+        else:
+            self.apply_preferences(refresh_content=True)
+        self.save_last_layout_state()
+        QTimer.singleShot(0, lambda key=feature_key: self._scroll_to_feature_panel(key))
+        self.statusBar().showMessage(f"{panel.title}을 추가했습니다.", 1800)
+
+    def rename_image_panel(self, feature_key: str) -> None:
+        panel = self._dynamic_image_panel(feature_key)
+        if panel is None:
+            return
+        title, accepted = QInputDialog.getText(
+            self,
+            "이미지 패널 이름 변경",
+            "패널 이름",
+            QLineEdit.EchoMode.Normal,
+            panel.title,
+        )
+        if not accepted:
+            return
+        title = title.strip()
+        if not title:
+            return
+        panel.title = title
+        self._save_dynamic_image_panel(panel)
+        dialog = self.feature_widget_windows.get(feature_key)
+        if isinstance(dialog, QDialog):
+            dialog.setWindowTitle(f"{title} 새창")
+        self.save_last_layout_state()
+        self.statusBar().showMessage("이미지 패널 이름을 변경했습니다.", 1400)
+
+    def delete_image_panel(self, feature_key: str) -> None:
+        panel = self._dynamic_image_panel(feature_key)
+        if panel is None or panel.id is None:
+            return
+        answer = QMessageBox.question(
+            self,
+            "이미지 패널 삭제",
+            f"'{panel.title}' 패널을 삭제할까요?",
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        dialog = self.feature_widget_windows.pop(feature_key, None)
+        if isinstance(dialog, QDialog):
+            dialog.close()
+        self.feature_dashboard_items = [
+            dict(item)
+            for item in self._current_feature_dashboard_layout()
+            if str(item.get("key", "")) != feature_key
+        ]
+        self.repository.delete_image_panel(panel.id)
+        self.dynamic_image_panels.pop(int(panel.id), None)
+        self.hidden_panel_positions.pop(feature_key, None)
+        self.media_preview_labels.pop(feature_key, None)
+        if hasattr(self, "feature_dashboard_layout"):
+            self._render_feature_dashboard()
+        feature_box = self.feature_boxes.pop(feature_key, None)
+        if isinstance(feature_box, QWidget):
+            feature_box.hide()
+            _park_widget_for_reparent(feature_box)
+            feature_box.deleteLater()
+        self.save_last_layout_state()
+        self.statusBar().showMessage("이미지 패널을 삭제했습니다.", 1600)
 
     def choose_header_banner_file(self) -> None:
         image_path, _selected_filter = QFileDialog.getOpenFileName(
@@ -8405,18 +8752,30 @@ class MainWindow(QMainWindow):
 
     def set_header_banner_image_position(self, position: str) -> None:
         self.preferences.header_banner_image_position = _normalize_image_position(position)
+        banner = getattr(self, "header_banner_widget", None)
+        position_view = _image_view_with_reference_frame(
+            _image_view_from_position(self.preferences.header_banner_image_position),
+            banner if isinstance(banner, HeaderBannerWidget) else None,
+            self.preferences.header_banner_image_position,
+        )
         self.preferences.header_banner_image_view = _encode_image_view(
-            _image_view_from_position(self.preferences.header_banner_image_position)
+            position_view
         )
         self.preferences = self.repository.save_preferences(self.preferences)
-        if hasattr(self, "header_banner_widget"):
-            self.header_banner_widget.set_image_position(self.preferences.header_banner_image_position)
+        if isinstance(banner, HeaderBannerWidget):
+            banner.set_image_position(self.preferences.header_banner_image_position)
+            banner.set_image_view(position_view)
         self.statusBar().showMessage("배너 이미지 위치를 바꿨습니다.", 1400)
 
     def set_header_banner_image_view(self, view: dict[str, int] | str, persist: bool = True) -> None:
-        normalized_view = _normalize_image_view(view, self.preferences.header_banner_image_position)
-        if hasattr(self, "header_banner_widget"):
-            self.header_banner_widget.set_image_view(normalized_view)
+        banner = getattr(self, "header_banner_widget", None)
+        normalized_view = _image_view_with_reference_frame(
+            view,
+            banner if isinstance(banner, HeaderBannerWidget) else None,
+            self.preferences.header_banner_image_position,
+        )
+        if isinstance(banner, HeaderBannerWidget):
+            banner.set_image_view(normalized_view)
         if not persist:
             return
         self.preferences.header_banner_image_view = _encode_image_view(normalized_view)
@@ -8458,11 +8817,17 @@ class MainWindow(QMainWindow):
 
     def set_media_panel_image_position(self, feature_key: str, position: str) -> None:
         self._set_media_panel_preference_position(feature_key, position)
-        self._set_media_panel_preference_view(feature_key, _image_view_from_position(position))
-        self.preferences = self.repository.save_preferences(self.preferences)
         preview = getattr(self, "media_preview_labels", {}).get(feature_key)
+        position_view = _image_view_with_reference_frame(
+            _image_view_from_position(position),
+            preview if isinstance(preview, MediaPreviewLabel) else None,
+            self._media_panel_image_position(feature_key),
+        )
+        self._set_media_panel_preference_view(feature_key, position_view)
+        self.preferences = self.repository.save_preferences(self.preferences)
         if isinstance(preview, MediaPreviewLabel):
             preview.set_image_position(self._media_panel_image_position(feature_key))
+            preview.set_image_view(position_view)
         self.refresh_feature_widget(feature_key)
         self.statusBar().showMessage(f"{self._feature_display_name(feature_key)} 위치를 바꿨습니다.", 1400)
 
@@ -8472,8 +8837,12 @@ class MainWindow(QMainWindow):
         view: dict[str, int] | str,
         persist: bool = True,
     ) -> None:
-        normalized_view = _normalize_image_view(view, self._media_panel_image_position(feature_key))
         preview = getattr(self, "media_preview_labels", {}).get(feature_key)
+        normalized_view = _image_view_with_reference_frame(
+            view,
+            preview if isinstance(preview, MediaPreviewLabel) else None,
+            self._media_panel_image_position(feature_key),
+        )
         if isinstance(preview, MediaPreviewLabel):
             preview.set_image_view(normalized_view)
         dialog = getattr(self, "feature_widget_windows", {}).get(feature_key)
@@ -9200,8 +9569,12 @@ class MainWindow(QMainWindow):
             self.link_favorites_panel.setVisible(self.preferences.show_link_favorites_panel)
             if refresh_content and self.preferences.show_link_favorites_panel:
                 self.refresh_link_favorites()
-        for media_key in MEDIA_PANEL_KEYS:
+        for media_key in [*MEDIA_PANEL_KEYS, *self._dynamic_media_panel_keys()]:
             panel = getattr(self, media_key, None)
+            if panel is None:
+                panel_id = _image_panel_id_from_feature_key(media_key)
+                if panel_id is not None:
+                    panel = getattr(self, self._dynamic_media_panel_widget_name(panel_id), None)
             if isinstance(panel, QWidget):
                 visible = self._feature_should_be_visible(media_key)
                 panel.setVisible(visible)
@@ -9579,6 +9952,15 @@ class MainWindow(QMainWindow):
         return False
 
     def hide_feature_from_main(self, feature_key: str) -> None:
+        if panel := self._dynamic_image_panel(feature_key):
+            if not panel.visible:
+                return
+            self._record_hidden_panel_position(feature_key)
+            panel.visible = False
+            self._save_dynamic_image_panel(panel)
+            self.apply_preferences()
+            self.statusBar().showMessage(f"{self._feature_display_name(feature_key)}을 메인창에서 숨겼습니다.", 2200)
+            return
         attribute = self._feature_visibility_attribute(feature_key)
         if attribute is None:
             return
@@ -9630,6 +10012,8 @@ class MainWindow(QMainWindow):
         }.get(feature_key)
 
     def _feature_display_name(self, feature_key: str) -> str:
+        if panel := self._dynamic_image_panel(feature_key):
+            return panel.title
         return {
             "datetime": "날짜/시간",
             "focus": "집중",
@@ -9738,6 +10122,21 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage("기본 배치로 되돌렸습니다.", 2500)
 
     def current_layout_state(self) -> dict[str, object]:
+        visible = {
+            "datetime": self.preferences.show_datetime_panel,
+            "focus": self.preferences.show_focus_panel,
+            "pomodoro": self.preferences.show_pomodoro_controls,
+            "header_banner": self.preferences.show_header_banner,
+            "today_timeline": self.preferences.show_today_timeline_inline,
+            "today_timeline_waiting": self.preferences.show_today_timeline_waiting_panel,
+            "today_timeline_waiting_pinned": self.preferences.show_today_timeline_waiting_pinned,
+            "today_checklist": self.preferences.show_today_checklist_inline,
+            "quick_memo": self.preferences.show_quick_memo_panel,
+            "link_favorites": self.preferences.show_link_favorites_panel,
+            "compact_favorites": self.preferences.show_compact_favorites_panel,
+        }
+        for panel_id, panel in self.dynamic_image_panels.items():
+            visible[_image_panel_feature_key(panel_id)] = bool(panel.visible)
         return {
             "version": 1,
             "window": {
@@ -9764,23 +10163,7 @@ class MainWindow(QMainWindow):
                 "lower": self._splitter_child_tokens(self.lower_splitter),
                 "right": self._splitter_child_tokens(self.right_splitter),
             },
-            "visible": {
-                "datetime": self.preferences.show_datetime_panel,
-                "focus": self.preferences.show_focus_panel,
-                "pomodoro": self.preferences.show_pomodoro_controls,
-                "header_banner": self.preferences.show_header_banner,
-                "today_timeline": self.preferences.show_today_timeline_inline,
-                "today_timeline_waiting": self.preferences.show_today_timeline_waiting_panel,
-                "today_timeline_waiting_pinned": self.preferences.show_today_timeline_waiting_pinned,
-                "today_checklist": self.preferences.show_today_checklist_inline,
-                "quick_memo": self.preferences.show_quick_memo_panel,
-                "link_favorites": self.preferences.show_link_favorites_panel,
-                "media_panel": self.preferences.show_media_panel,
-                "media_panel_2": self.preferences.show_media_panel_2,
-                "media_panel_3": self.preferences.show_media_panel_3,
-                "media_panel_4": self.preferences.show_media_panel_4,
-                "compact_favorites": self.preferences.show_compact_favorites_panel,
-            },
+            "visible": visible,
             "filters": self._normalize_workspace_filters(getattr(self, "_active_workspace_filters", {})),
         }
 
@@ -9914,8 +10297,22 @@ class MainWindow(QMainWindow):
                 setattr(self.preferences, attribute, value)
                 changed = True
 
+        dynamic_changed = False
+        for key, raw_value in visible_state.items():
+            if not isinstance(key, str):
+                continue
+            panel = self._dynamic_image_panel(key)
+            if panel is None:
+                continue
+            value = bool(raw_value)
+            if panel.visible != value:
+                panel.visible = value
+                self._save_dynamic_image_panel(panel)
+                dynamic_changed = True
+
         if changed:
             self.preferences = self.repository.save_preferences(self.preferences)
+        if changed or dynamic_changed:
             # A layout/workspace apply only toggles panel visibility + filters: the
             # global stylesheet is unchanged (skip the costly setStyleSheet), the
             # caller re-renders the dashboard right after via _apply_feature_layout
@@ -9925,12 +10322,13 @@ class MainWindow(QMainWindow):
             self._schedule_workspace_autosave()
 
     def default_feature_layout(self) -> dict[str, list[str]]:
+        media_panel_keys = [*MEDIA_PANEL_KEYS, *self._dynamic_media_panel_keys()]
         layout = {
             "body": ["group:left", "group:center", "group:right"],
             "left": ["datetime", "focus", "pomodoro", "today_checklist", "group:lower"],
             "center": ["today_timeline"],
             "lower": ["quick_memo"],
-            "right": ["link_favorites", *MEDIA_PANEL_KEYS],
+            "right": ["link_favorites", *media_panel_keys],
         }
         banner_position = _normalize_header_banner_position(self.preferences.header_banner_position)
         target_column = {
@@ -9949,16 +10347,13 @@ class MainWindow(QMainWindow):
             {"key": "today_timeline", "span": 3},
             {"key": "today_checklist", "span": 1},
             {"key": "link_favorites", "span": 1},
-            {"key": "media_panel", "span": 1},
-            {"key": "media_panel_2", "span": 1},
-            {"key": "media_panel_3", "span": 1},
-            {"key": "media_panel_4", "span": 1},
+            *({"key": key, "span": 1} for key in self._dynamic_media_panel_keys()),
             {"key": "header_banner", "span": 3},
             {"key": "datetime", "span": 1},
         ]
 
     def default_feature_dashboard_layout(self) -> list[dict[str, object]]:
-        return [
+        items = [
             {"key": "header_banner", "x": 0, "y": 0, "w": 12, "h": 3},
             {"key": "focus", "x": 0, "y": 3, "w": 3, "h": 16},
             {"key": "quick_memo", "x": 3, "y": 3, "w": 3, "h": 16},
@@ -9966,12 +10361,36 @@ class MainWindow(QMainWindow):
             {"key": "today_timeline", "x": 9, "y": 3, "w": 3, "h": 16},
             {"key": "pomodoro", "x": 0, "y": 19, "w": 3, "h": 6},
             {"key": "link_favorites", "x": 3, "y": 19, "w": 3, "h": 6},
-            {"key": "media_panel", "x": 6, "y": 19, "w": 3, "h": 6},
-            {"key": "media_panel_2", "x": 9, "y": 19, "w": 3, "h": 6},
             {"key": "datetime", "x": 0, "y": 25, "w": 3, "h": 1},
-            {"key": "media_panel_3", "x": 6, "y": 41, "w": 4, "h": 6},
-            {"key": "media_panel_4", "x": 2, "y": 41, "w": 4, "h": 6},
         ]
+        image_panel_slots = [
+            (6, 19),
+            (9, 19),
+            (3, 25),
+            (6, 25),
+            (9, 25),
+            (0, 32),
+            (3, 32),
+            (6, 32),
+            (9, 32),
+        ]
+        for index, key in enumerate(self._dynamic_media_panel_keys()):
+            if index < len(image_panel_slots):
+                x, y = image_panel_slots[index]
+            else:
+                overflow_index = index - len(image_panel_slots)
+                x = (overflow_index % 4) * 3
+                y = 39 + (overflow_index // 4) * 6
+            items.append(
+                {
+                    "key": key,
+                    "x": x,
+                    "y": y,
+                    "w": 3,
+                    "h": 6,
+                }
+            )
+        return items
 
     def default_feature_rows_layout(self) -> list[dict[str, object]]:
         return self._rows_from_grid_items(self.default_feature_grid_layout())
@@ -10623,6 +11042,8 @@ class MainWindow(QMainWindow):
         return None
 
     def _default_feature_dashboard_width(self, feature_key: str) -> int:
+        if _is_media_panel_feature_key(feature_key):
+            return 3
         return {
             "header_banner": 12,
             "today_timeline": 5,
@@ -10630,15 +11051,13 @@ class MainWindow(QMainWindow):
             "quick_memo": 4,
             "today_checklist": 4,
             "link_favorites": 3,
-            "media_panel": 3,
-            "media_panel_2": 3,
-            "media_panel_3": 3,
-            "media_panel_4": 3,
             "pomodoro": 3,
             "datetime": 3,
         }.get(feature_key, 6)
 
     def _default_feature_dashboard_height(self, feature_key: str) -> int:
+        if _is_media_panel_feature_key(feature_key):
+            return 6
         return {
             "header_banner": 3,
             "today_timeline": 11,
@@ -10646,10 +11065,6 @@ class MainWindow(QMainWindow):
             "quick_memo": 12,
             "today_checklist": 6,
             "link_favorites": 6,
-            "media_panel": 8,
-            "media_panel_2": 6,
-            "media_panel_3": 6,
-            "media_panel_4": 6,
             "pomodoro": 4,
             "datetime": 1,
         }.get(feature_key, 5)
@@ -10662,6 +11077,8 @@ class MainWindow(QMainWindow):
         return min(DASHBOARD_GRID_COLUMNS, max(1, value))
 
     def _minimum_feature_dashboard_width(self, feature_key: str) -> int:
+        if _is_media_panel_feature_key(feature_key):
+            return 1
         return {
             "focus": 3,
             "quick_memo": 3,
@@ -10670,14 +11087,12 @@ class MainWindow(QMainWindow):
             "link_favorites": 1,
             "pomodoro": 1,
             "datetime": 1,
-            "media_panel": 1,
-            "media_panel_2": 1,
-            "media_panel_3": 1,
-            "media_panel_4": 1,
             "header_banner": 1,
         }.get(feature_key, 2)
 
     def _minimum_feature_dashboard_height(self, feature_key: str) -> int:
+        if _is_media_panel_feature_key(feature_key):
+            return 2
         return {
             "focus": 4,
             "quick_memo": 3,
@@ -10686,10 +11101,6 @@ class MainWindow(QMainWindow):
             "link_favorites": 2,
             "pomodoro": 2,
             "datetime": 1,
-            "media_panel": 2,
-            "media_panel_2": 2,
-            "media_panel_3": 2,
-            "media_panel_4": 2,
             "header_banner": 1,
         }.get(feature_key, 2)
 
@@ -11544,7 +11955,7 @@ class MainWindow(QMainWindow):
             width = self._normalized_dashboard_width(item.get("w"))
             height = self._normalized_dashboard_height(item.get("h"))
             widget.hide()
-            cell = FeatureCell(key, widget)
+            cell = FeatureCell(key, widget, self.feature_grid_container)
             cell.hide()
             cell.set_panel_height(self._dashboard_cell_pixel_height(height))
             cell.set_panel_width(self._dashboard_item_pixel_width(width), fixed=False)
@@ -12512,6 +12923,8 @@ class MainWindow(QMainWindow):
             splitter.setVisible(visible)
 
     def _feature_should_be_visible(self, feature_key: str) -> bool:
+        if panel := self._dynamic_image_panel(feature_key):
+            return bool(panel.visible)
         attribute = self._feature_visibility_attribute(feature_key)
         return True if attribute is None else bool(getattr(self.preferences, attribute))
 
@@ -13548,7 +13961,7 @@ class MainWindow(QMainWindow):
             )
         elif feature_key == "link_favorites":
             dialog = FavoritesWidgetDialog(self)
-        elif feature_key in MEDIA_PANEL_KEYS:
+        elif _is_media_panel_feature_key(feature_key):
             dialog = MediaPanelWidgetDialog(self, feature_key)
         else:
             return
@@ -19934,21 +20347,17 @@ class SettingsDialog(QDialog):
         header_image_row.addWidget(clear_header_image_button)
         image_form.addRow("배너 이미지", header_image_row)
 
-        self.show_media_panel_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_check.setChecked(preferences.show_media_panel)
-        image_form.addRow("이미지 패널 1", self.show_media_panel_check)
-
-        self.show_media_panel_2_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_2_check.setChecked(getattr(preferences, "show_media_panel_2", False))
-        image_form.addRow("이미지 패널 2", self.show_media_panel_2_check)
-
-        self.show_media_panel_3_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_3_check.setChecked(getattr(preferences, "show_media_panel_3", False))
-        image_form.addRow("이미지 패널 3", self.show_media_panel_3_check)
-
-        self.show_media_panel_4_check = SwitchCheckBox("메인 화면에 표시")
-        self.show_media_panel_4_check.setChecked(getattr(preferences, "show_media_panel_4", False))
-        image_form.addRow("이미지 패널 4", self.show_media_panel_4_check)
+        add_image_panel_row = QWidget()
+        add_image_panel_layout = QHBoxLayout(add_image_panel_row)
+        add_image_panel_layout.setContentsMargins(0, 0, 0, 0)
+        add_image_panel_layout.setSpacing(8)
+        add_image_panel_button = QPushButton("새 패널 추가")
+        add_image_panel_button.setObjectName("addImagePanelButton")
+        _stabilize_control(add_image_panel_button, 108)
+        add_image_panel_button.clicked.connect(lambda: self.run_parent_layout_action("add_image_panel"))
+        add_image_panel_layout.addWidget(add_image_panel_button)
+        add_image_panel_layout.addStretch(1)
+        image_form.addRow("이미지 패널", add_image_panel_row)
 
         self.media_rounded_corners_check.setChecked(getattr(preferences, "media_rounded_corners", True))
         image_form.addRow("이미지 모서리", self.media_rounded_corners_check)
@@ -20446,10 +20855,6 @@ class SettingsDialog(QDialog):
         self.show_today_checklist_inline_check.setChecked(preferences.show_today_checklist_inline)
         self.show_quick_memo_panel_check.setChecked(preferences.show_quick_memo_panel)
         self.show_link_favorites_panel_check.setChecked(preferences.show_link_favorites_panel)
-        self.show_media_panel_check.setChecked(preferences.show_media_panel)
-        self.show_media_panel_2_check.setChecked(getattr(preferences, "show_media_panel_2", False))
-        self.show_media_panel_3_check.setChecked(getattr(preferences, "show_media_panel_3", False))
-        self.show_media_panel_4_check.setChecked(getattr(preferences, "show_media_panel_4", False))
         self.show_compact_favorites_panel_check.setChecked(preferences.show_compact_favorites_panel)
         self._source = preferences
         self._live_preview_enabled = previous_preview_state
@@ -20485,23 +20890,24 @@ class SettingsDialog(QDialog):
             show_today_flow_panel=False,
             show_quick_memo_panel=self.show_quick_memo_panel_check.isChecked(),
             show_link_favorites_panel=self.show_link_favorites_panel_check.isChecked(),
-            show_media_panel=self.show_media_panel_check.isChecked(),
+            show_media_panel=False,
             media_panel_file_path=self._source.media_panel_file_path,
             media_panel_image_position=getattr(self._source, "media_panel_image_position", "center"),
             media_panel_image_view=getattr(self._source, "media_panel_image_view", ""),
-            show_media_panel_2=self.show_media_panel_2_check.isChecked(),
+            show_media_panel_2=False,
             media_panel_2_file_path=getattr(self._source, "media_panel_2_file_path", ""),
             media_panel_2_image_position=getattr(self._source, "media_panel_2_image_position", "center"),
             media_panel_2_image_view=getattr(self._source, "media_panel_2_image_view", ""),
-            show_media_panel_3=self.show_media_panel_3_check.isChecked(),
+            show_media_panel_3=False,
             media_panel_3_file_path=getattr(self._source, "media_panel_3_file_path", ""),
             media_panel_3_image_position=getattr(self._source, "media_panel_3_image_position", "center"),
             media_panel_3_image_view=getattr(self._source, "media_panel_3_image_view", ""),
-            show_media_panel_4=self.show_media_panel_4_check.isChecked(),
+            show_media_panel_4=False,
             media_panel_4_file_path=getattr(self._source, "media_panel_4_file_path", ""),
             media_panel_4_image_position=getattr(self._source, "media_panel_4_image_position", "center"),
             media_panel_4_image_view=getattr(self._source, "media_panel_4_image_view", ""),
             media_rounded_corners=self.media_rounded_corners_check.isChecked(),
+            legacy_media_panels_migrated=getattr(self._source, "legacy_media_panels_migrated", False),
             show_compact_favorites_panel=self.show_compact_favorites_panel_check.isChecked(),
             favorite_display_mode=self._source.favorite_display_mode,
             appearance_theme=str(self.theme_combo.currentData()),

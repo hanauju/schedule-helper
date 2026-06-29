@@ -17,6 +17,7 @@ from app.models import (
     Event,
     FocusEvent,
     FocusSession,
+    ImagePanel,
     ItemType,
     LinkFavorite,
     LayoutProfile,
@@ -46,6 +47,41 @@ _TAG_TARGET_TABLES: Final[dict[str, str]] = {
     "event": "events",
     "quick_note": "quick_notes",
 }
+_LEGACY_MEDIA_PANEL_SLOTS: Final[tuple[tuple[str, int, str, str, str, str], ...]] = (
+    (
+        "media_panel",
+        1,
+        "show_media_panel",
+        "media_panel_file_path",
+        "media_panel_image_position",
+        "media_panel_image_view",
+    ),
+    (
+        "media_panel_2",
+        2,
+        "show_media_panel_2",
+        "media_panel_2_file_path",
+        "media_panel_2_image_position",
+        "media_panel_2_image_view",
+    ),
+    (
+        "media_panel_3",
+        3,
+        "show_media_panel_3",
+        "media_panel_3_file_path",
+        "media_panel_3_image_position",
+        "media_panel_3_image_view",
+    ),
+    (
+        "media_panel_4",
+        4,
+        "show_media_panel_4",
+        "media_panel_4_file_path",
+        "media_panel_4_image_position",
+        "media_panel_4_image_view",
+    ),
+)
+_IMAGE_PANEL_FEATURE_PREFIX: Final = "image_panel:"
 
 WorkspaceFilters = TypedDict(
     "WorkspaceFilters",
@@ -57,6 +93,35 @@ WorkspaceFilters = TypedDict(
         "checklist.show_completed": bool,
     },
 )
+
+
+def _image_panel_feature_key(panel_id: int) -> str:
+    return f"{_IMAGE_PANEL_FEATURE_PREFIX}{int(panel_id)}"
+
+
+def _replace_layout_feature_keys(value: object, mapping: dict[str, str]) -> object:
+    if isinstance(value, str):
+        return mapping.get(value, value)
+    if isinstance(value, list):
+        return [_replace_layout_feature_keys(item, mapping) for item in value]
+    if isinstance(value, dict):
+        replaced: dict[object, object] = {}
+        for key, item in value.items():
+            replaced_key = mapping.get(key, key) if isinstance(key, str) else key
+            replaced[replaced_key] = _replace_layout_feature_keys(item, mapping)
+        return replaced
+    return value
+
+
+def _rewrite_layout_feature_keys(raw_data: str, mapping: dict[str, str]) -> str:
+    if not mapping or not raw_data.strip():
+        return raw_data
+    try:
+        parsed = json.loads(raw_data)
+    except json.JSONDecodeError:
+        return raw_data
+    rewritten = _replace_layout_feature_keys(parsed, mapping)
+    return json.dumps(rewritten, ensure_ascii=False)
 
 
 def _app_title(value: object) -> str:
@@ -240,6 +305,15 @@ def _image_view(value: object) -> str:
         "x": min(100, max(0, x)),
         "y": min(100, max(0, y)),
     }
+    try:
+        frame_w = int(data.get("frame_w", 0))
+        frame_h = int(data.get("frame_h", 0))
+    except (TypeError, ValueError):
+        frame_w = 0
+        frame_h = 0
+    if frame_w > 0 and frame_h > 0:
+        normalized["frame_w"] = min(8192, max(1, frame_w))
+        normalized["frame_h"] = min(8192, max(1, frame_h))
     if normalized == {"zoom": 100, "x": 50, "y": 50}:
         return ""
     return json.dumps(normalized, separators=(",", ":"))
@@ -418,11 +492,11 @@ class ScheduleRepository:
                     show_today_flow_panel INTEGER NOT NULL DEFAULT 0,
                     show_quick_memo_panel INTEGER NOT NULL DEFAULT 1,
                     show_link_favorites_panel INTEGER NOT NULL DEFAULT 1,
-                    show_media_panel INTEGER NOT NULL DEFAULT 1,
+                    show_media_panel INTEGER NOT NULL DEFAULT 0,
                     media_panel_file_path TEXT NOT NULL DEFAULT '',
                     media_panel_image_position TEXT NOT NULL DEFAULT 'center',
                     media_panel_image_view TEXT NOT NULL DEFAULT '',
-                    show_media_panel_2 INTEGER NOT NULL DEFAULT 1,
+                    show_media_panel_2 INTEGER NOT NULL DEFAULT 0,
                     media_panel_2_file_path TEXT NOT NULL DEFAULT '',
                     media_panel_2_image_position TEXT NOT NULL DEFAULT 'center',
                     media_panel_2_image_view TEXT NOT NULL DEFAULT '',
@@ -435,6 +509,7 @@ class ScheduleRepository:
                     media_panel_4_image_position TEXT NOT NULL DEFAULT 'center',
                     media_panel_4_image_view TEXT NOT NULL DEFAULT '',
                     media_rounded_corners INTEGER NOT NULL DEFAULT 1,
+                    legacy_media_panels_migrated INTEGER NOT NULL DEFAULT 0,
                     show_compact_favorites_panel INTEGER NOT NULL DEFAULT 0,
                     favorite_display_mode TEXT NOT NULL DEFAULT 'text',
                     time_format TEXT NOT NULL DEFAULT '24h',
@@ -591,6 +666,17 @@ class ScheduleRepository:
                     created_at TEXT NOT NULL
                 );
 
+                CREATE TABLE IF NOT EXISTS image_panels (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    file_path TEXT NOT NULL DEFAULT '',
+                    image_position TEXT NOT NULL DEFAULT 'center',
+                    image_view TEXT NOT NULL DEFAULT '',
+                    visible INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
                 CREATE INDEX IF NOT EXISTS idx_focus_sessions_started
                     ON focus_sessions (started_at, ended_at);
 
@@ -599,6 +685,9 @@ class ScheduleRepository:
 
                 CREATE INDEX IF NOT EXISTS idx_quick_note_attachments_note
                     ON quick_note_attachments (quick_note_id);
+
+                CREATE INDEX IF NOT EXISTS idx_image_panels_order
+                    ON image_panels (sort_order, id);
                 """
             )
             item_type_columns = {row["name"] for row in connection.execute("PRAGMA table_info(item_types)")}
@@ -726,7 +815,7 @@ class ScheduleRepository:
                     "ALTER TABLE preferences ADD COLUMN show_link_favorites_panel INTEGER NOT NULL DEFAULT 1"
                 )
             if "show_media_panel" not in preference_columns:
-                connection.execute("ALTER TABLE preferences ADD COLUMN show_media_panel INTEGER NOT NULL DEFAULT 1")
+                connection.execute("ALTER TABLE preferences ADD COLUMN show_media_panel INTEGER NOT NULL DEFAULT 0")
             if "media_panel_file_path" not in preference_columns:
                 connection.execute("ALTER TABLE preferences ADD COLUMN media_panel_file_path TEXT NOT NULL DEFAULT ''")
             if "media_panel_image_position" not in preference_columns:
@@ -741,7 +830,7 @@ class ScheduleRepository:
                 position_column = f"media_panel_{index}_image_position"
                 view_column = f"media_panel_{index}_image_view"
                 if visible_column not in preference_columns:
-                    default_visible = 1 if index == 2 else 0
+                    default_visible = 0
                     connection.execute(
                         f"ALTER TABLE preferences ADD COLUMN {visible_column} INTEGER NOT NULL DEFAULT {default_visible}"
                     )
@@ -756,6 +845,10 @@ class ScheduleRepository:
             if "media_rounded_corners" not in preference_columns:
                 connection.execute(
                     "ALTER TABLE preferences ADD COLUMN media_rounded_corners INTEGER NOT NULL DEFAULT 1"
+                )
+            if "legacy_media_panels_migrated" not in preference_columns:
+                connection.execute(
+                    "ALTER TABLE preferences ADD COLUMN legacy_media_panels_migrated INTEGER NOT NULL DEFAULT 0"
                 )
             if "show_compact_favorites_panel" not in preference_columns:
                 connection.execute(
@@ -856,6 +949,30 @@ class ScheduleRepository:
                 connection.execute("ALTER TABLE link_favorites ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
                 connection.execute("UPDATE link_favorites SET sort_order = id WHERE sort_order = 0")
 
+            image_panel_columns = {row["name"] for row in connection.execute("PRAGMA table_info(image_panels)")}
+            if "title" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN title TEXT NOT NULL DEFAULT '이미지 패널'")
+            if "file_path" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN file_path TEXT NOT NULL DEFAULT ''")
+            if "image_position" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN image_position TEXT NOT NULL DEFAULT 'center'")
+            if "image_view" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN image_view TEXT NOT NULL DEFAULT ''")
+            if "visible" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN visible INTEGER NOT NULL DEFAULT 1")
+            if "sort_order" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+                connection.execute("UPDATE image_panels SET sort_order = id WHERE sort_order = 0")
+            if "created_at" not in image_panel_columns:
+                connection.execute("ALTER TABLE image_panels ADD COLUMN created_at TEXT")
+                connection.execute(
+                    "UPDATE image_panels SET created_at = ? WHERE created_at IS NULL OR created_at = ''",
+                    (_dt_exact(datetime.now()),),
+                )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_image_panels_order ON image_panels (sort_order, id)"
+            )
+
             layout_profile_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(layout_profiles)")
             }
@@ -940,7 +1057,7 @@ class ScheduleRepository:
                        show_header_banner, header_banner_image_path,
                        header_banner_height, header_banner_position, header_banner_span,
                        focus_rate_display)
-                    VALUES (1, 480, 10, 'deadline_priority', 0, '오롯', 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 1, '', 1, 0, 'text', '24h', 'light', '#68a8f5', '#d9e7f5', '#d9e7f5', '#d9e7f5', '#fafafa', '#fafafa', '#111315', '', 13, 13, 13, 1, '', 132, 'center', 1, 'ring')
+                    VALUES (1, 480, 10, 'deadline_priority', 0, '오롯', 0, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 1, 1, 0, '', 0, 0, 'text', '24h', 'light', '#68a8f5', '#d9e7f5', '#d9e7f5', '#d9e7f5', '#fafafa', '#fafafa', '#111315', '', 13, 13, 13, 1, '', 132, 'center', 1, 'ring')
                     """
                 )
 
@@ -1478,6 +1595,7 @@ class ScheduleRepository:
             media_panel_4_image_position=_image_position(row["media_panel_4_image_position"]),
             media_panel_4_image_view=_image_view(row["media_panel_4_image_view"]),
             media_rounded_corners=bool(row["media_rounded_corners"]),
+            legacy_media_panels_migrated=bool(row["legacy_media_panels_migrated"]),
             show_compact_favorites_panel=bool(row["show_compact_favorites_panel"]),
             favorite_display_mode=_favorite_display_mode(str(row["favorite_display_mode"])),
             time_format=_time_format(str(row["time_format"])),
@@ -1553,6 +1671,7 @@ class ScheduleRepository:
         preferences.media_panel_4_file_path = preferences.media_panel_4_file_path.strip()
         preferences.media_panel_4_image_position = _image_position(preferences.media_panel_4_image_position)
         preferences.media_panel_4_image_view = _image_view(preferences.media_panel_4_image_view)
+        preferences.legacy_media_panels_migrated = bool(preferences.legacy_media_panels_migrated)
         preferences.header_banner_image_path = preferences.header_banner_image_path.strip()
         preferences.header_banner_image_position = _image_position(preferences.header_banner_image_position)
         preferences.header_banner_image_view = _image_view(preferences.header_banner_image_view)
@@ -1721,7 +1840,8 @@ class ScheduleRepository:
                     checklist_sort_direction = ?,
                     active_workspace_id = ?,
                     focus_status_cell_shape = ?,
-                    keep_focus_form_expanded = ?
+                    keep_focus_form_expanded = ?,
+                    legacy_media_panels_migrated = ?
                 WHERE id = 1
                 """,
                 (
@@ -1756,6 +1876,7 @@ class ScheduleRepository:
                     preferences.active_workspace_id,
                     preferences.focus_status_cell_shape,
                     int(preferences.keep_focus_form_expanded),
+                    int(preferences.legacy_media_panels_migrated),
                 ),
             )
         return preferences
@@ -2877,6 +2998,166 @@ class ScheduleRepository:
         with self.connect() as connection:
             connection.execute("DELETE FROM link_favorites WHERE id = ?", (favorite_id,))
 
+    def migrate_legacy_media_panels_to_image_panels(self) -> dict[str, str]:
+        preferences = self.get_preferences()
+        if preferences.legacy_media_panels_migrated:
+            return {}
+
+        key_mapping: dict[str, str] = {}
+        for legacy_key, slot_number, visible_attr, file_attr, position_attr, view_attr in _LEGACY_MEDIA_PANEL_SLOTS:
+            visible = bool(getattr(preferences, visible_attr, False))
+            file_path = str(getattr(preferences, file_attr, "") or "").strip()
+            image_position = _image_position(getattr(preferences, position_attr, "center"))
+            image_view = _image_view(getattr(preferences, view_attr, ""))
+            if not (file_path or image_position != "center" or image_view):
+                continue
+            stored_file_path = file_path
+            if file_path:
+                try:
+                    stored_file_path = self.copy_media_asset(file_path)
+                except (FileNotFoundError, OSError):
+                    stored_file_path = file_path
+            panel = self.save_image_panel(
+                ImagePanel(
+                    title=f"이미지 패널 {slot_number}",
+                    file_path=stored_file_path,
+                    image_position=image_position,
+                    image_view=image_view,
+                    visible=visible,
+                )
+            )
+            if panel.id is not None:
+                key_mapping[legacy_key] = _image_panel_feature_key(panel.id)
+
+        if key_mapping:
+            preferences.last_layout_state = _rewrite_layout_feature_keys(
+                preferences.last_layout_state,
+                key_mapping,
+            )
+            self._rewrite_layout_profile_feature_keys(key_mapping)
+
+        for _legacy_key, _slot_number, visible_attr, _file_attr, _position_attr, _view_attr in _LEGACY_MEDIA_PANEL_SLOTS:
+            setattr(preferences, visible_attr, False)
+        preferences.legacy_media_panels_migrated = True
+        self.save_preferences(preferences)
+        return key_mapping
+
+    def _rewrite_layout_profile_feature_keys(self, mapping: dict[str, str]) -> None:
+        if not mapping:
+            return
+        now = _dt_exact(datetime.now())
+        with self.connect() as connection:
+            rows = connection.execute("SELECT id, data FROM layout_profiles").fetchall()
+            for row in rows:
+                raw_data = str(row["data"] or "")
+                rewritten_data = _rewrite_layout_feature_keys(raw_data, mapping)
+                if rewritten_data == raw_data:
+                    continue
+                connection.execute(
+                    "UPDATE layout_profiles SET data = ?, updated_at = ? WHERE id = ?",
+                    (rewritten_data, now, int(row["id"])),
+                )
+
+    def create_image_panel(self, title: str | None = None, visible: bool = True) -> ImagePanel:
+        with self.connect() as connection:
+            count = int(connection.execute("SELECT COUNT(*) FROM image_panels").fetchone()[0])
+            sort_order = int(
+                connection.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM image_panels").fetchone()[0]
+            )
+            panel_title = (title or f"이미지 패널 {count + 1}").strip() or "이미지 패널"
+            now = datetime.now()
+            cursor = connection.execute(
+                """
+                INSERT INTO image_panels
+                  (title, file_path, image_position, image_view, visible, sort_order, created_at)
+                VALUES (?, '', 'center', '', ?, ?, ?)
+                """,
+                (panel_title, int(visible), sort_order, _dt_exact(now)),
+            )
+            panel_id = int(cursor.lastrowid)
+        return ImagePanel(
+            id=panel_id,
+            title=panel_title,
+            visible=visible,
+            sort_order=sort_order,
+            created_at=now,
+        )
+
+    def save_image_panel(self, panel: ImagePanel) -> ImagePanel:
+        title = panel.title.strip() or "이미지 패널"
+        file_path = panel.file_path.strip()
+        image_position = _image_position(panel.image_position)
+        image_view = _image_view(panel.image_view)
+        with self.connect() as connection:
+            if panel.id is None:
+                sort_order = int(
+                    connection.execute("SELECT COALESCE(MAX(sort_order), 0) + 1 FROM image_panels").fetchone()[0]
+                )
+                cursor = connection.execute(
+                    """
+                    INSERT INTO image_panels
+                      (title, file_path, image_position, image_view, visible, sort_order, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        title,
+                        file_path,
+                        image_position,
+                        image_view,
+                        int(panel.visible),
+                        sort_order,
+                        _dt_exact(panel.created_at),
+                    ),
+                )
+                panel.id = int(cursor.lastrowid)
+                panel.sort_order = sort_order
+            else:
+                connection.execute(
+                    """
+                    UPDATE image_panels
+                    SET title = ?,
+                        file_path = ?,
+                        image_position = ?,
+                        image_view = ?,
+                        visible = ?,
+                        sort_order = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        title,
+                        file_path,
+                        image_position,
+                        image_view,
+                        int(panel.visible),
+                        int(panel.sort_order),
+                        int(panel.id),
+                    ),
+                )
+        panel.title = title
+        panel.file_path = file_path
+        panel.image_position = image_position
+        panel.image_view = image_view
+        return panel
+
+    def list_image_panels(self) -> list[ImagePanel]:
+        with self.connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM image_panels
+                ORDER BY sort_order ASC, id ASC
+                """
+            ).fetchall()
+        return [self._image_panel_from_row(row) for row in rows]
+
+    def get_image_panel(self, panel_id: int) -> ImagePanel | None:
+        with self.connect() as connection:
+            row = connection.execute("SELECT * FROM image_panels WHERE id = ?", (int(panel_id),)).fetchone()
+        return self._image_panel_from_row(row) if row else None
+
+    def delete_image_panel(self, panel_id: int) -> None:
+        with self.connect() as connection:
+            connection.execute("DELETE FROM image_panels WHERE id = ?", (int(panel_id),))
+
     def _set_pinned(self, table: str, item_id: int, pinned: bool) -> bool:
         with self.connect() as connection:
             cursor = connection.execute(
@@ -3180,6 +3461,20 @@ class ScheduleRepository:
             icon_text=str(row["icon_text"]),
             icon_path=str(row["icon_path"]),
             sort_order=int(row["sort_order"]) if "sort_order" in row.keys() else int(row["id"]),
+            created_at=created_at,
+        )
+
+    @staticmethod
+    def _image_panel_from_row(row: sqlite3.Row) -> ImagePanel:
+        created_at = _parse_dt(row["created_at"]) or datetime.now()
+        return ImagePanel(
+            id=int(row["id"]),
+            title=str(row["title"] or "이미지 패널").strip() or "이미지 패널",
+            file_path=str(row["file_path"] or "").strip(),
+            image_position=_image_position(row["image_position"]),
+            image_view=_image_view(row["image_view"]),
+            visible=bool(row["visible"]),
+            sort_order=int(row["sort_order"]) if row["sort_order"] is not None else int(row["id"]),
             created_at=created_at,
         )
 
