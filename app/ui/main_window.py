@@ -153,6 +153,19 @@ COMMISSION_SUMMARY_KEY: Final = "commission_summary"  # reserved for deferred wr
 WEEKLY_PLAN_KEY: Final = "weekly_plan"  # reserved for deferred writing/commission/weekly-plan features
 FLOATING_OVERLAY_FEATURE_KEYS = {"datetime"}
 WORKSPACE_BUTTON_MAX_WIDTH = 180  # px; longer workspace names elide with "…" and show full name as tooltip
+EMBEDDED_FEATURE_WINDOW_OBJECT_NAMES: Final = {
+    "featureBox",
+    "featureCell",
+    "mediaPanel",
+    "mediaPreviewLabel",
+    "featureHeaderBand",
+    "featureMoveBar",
+    "featureResizeGrip",
+    "featureRowSplitter",
+    "featureColumn",
+    "featureWidthSpacer",
+    "dashboardGridGuideOverlay",
+}
 
 
 def _image_panel_feature_key(panel_id: int) -> str:
@@ -3544,6 +3557,11 @@ def _windows_chrome_api() -> _WindowsChromeApi | None:
 class MainWindow(QMainWindow):
     def __init__(self, repository: ScheduleRepository) -> None:
         super().__init__()
+        self._feature_window_guard_installed = False
+        app = QApplication.instance()
+        if isinstance(app, QApplication):
+            app.installEventFilter(self)
+            self._feature_window_guard_installed = True
         self.repository = repository
         self.window_provider: WindowsActiveWindowProvider | None = None
         self.focus_timer: FocusTimerService | None = None
@@ -5668,12 +5686,14 @@ class MainWindow(QMainWindow):
 
     def _build_media_panel(self, feature_key: str = "media_panel") -> QWidget:
         panel = QWidget()
+        panel.setWindowFlags(Qt.WindowType.Widget)
         panel.setObjectName("mediaPanel")
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        preview = MediaPreviewLabel()
+        preview = MediaPreviewLabel(panel)
+        preview.setWindowFlags(Qt.WindowType.Widget)
         preview.select_callback = lambda key=feature_key: self.choose_media_panel_file(key)
         preview.context_callback = (
             lambda source, position, key=feature_key: self.show_media_panel_context_menu(source, position, key)
@@ -12828,7 +12848,8 @@ class MainWindow(QMainWindow):
             if not columns:
                 continue
             sizes = self._normalized_row_sizes(row.get("sizes"), len(columns))
-            splitter = QSplitter(Qt.Orientation.Horizontal)
+            splitter = QSplitter(Qt.Orientation.Horizontal, rows_splitter)
+            splitter.setWindowFlags(Qt.WindowType.Widget)
             splitter.hide()
             splitter.setObjectName("featureRowSplitter")
             splitter.setChildrenCollapsible(False)
@@ -12848,7 +12869,8 @@ class MainWindow(QMainWindow):
                     fallback=sizes[column_index] if column_index < len(sizes) else 1000,
                 )
                 column_preferred_width = max(160, max(column_widths, default=240))
-                column_widget = FeatureColumn(column_items, self.swap_feature_panels)
+                column_widget = FeatureColumn(column_items, self.swap_feature_panels, splitter)
+                column_widget.setWindowFlags(Qt.WindowType.Widget)
                 column_widget.hide()
                 column_widget.setMinimumWidth(0)
                 column_widget.setMaximumWidth(column_preferred_width)
@@ -12867,7 +12889,8 @@ class MainWindow(QMainWindow):
                 splitter.setStretchFactor(splitter.count() - 1, 0)
                 splitter_sizes.append(column_preferred_width)
                 stack_heights.append(sum(column_heights) + 14 * max(0, len(column_items) - 1))
-            spacer = QWidget()
+            spacer = QWidget(splitter)
+            spacer.setWindowFlags(Qt.WindowType.Widget)
             spacer.setObjectName("featureWidthSpacer")
             spacer.setMinimumWidth(0)
             spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -12908,9 +12931,11 @@ class MainWindow(QMainWindow):
                     cell = getattr(self, "feature_cells", {}).get(key)
                     if isinstance(cell, FeatureCell):
                         cell.setVisible(visible)
-                    widget = self.feature_boxes.get(key)
-                    if isinstance(widget, QWidget):
-                        widget.setVisible(visible)
+                    else:
+                        widget = self.feature_boxes.get(key)
+                        if isinstance(widget, QWidget):
+                            widget.setWindowFlags(Qt.WindowType.Widget)
+                            widget.setVisible(visible)
                 for column_index in range(splitter.count()):
                     column_widget = splitter.widget(column_index)
                     if isinstance(column_widget, FeatureColumn):
@@ -14013,6 +14038,20 @@ class MainWindow(QMainWindow):
         self._remember_normal_window_size()
         self._hide_dashboard_drag_guides()
 
+    def eventFilter(self, watched, event) -> bool:
+        if (
+            event.type() == QEvent.Type.Show
+            and isinstance(watched, QWidget)
+            and watched is not self
+            and watched.isWindow()
+            and watched.objectName() in EMBEDDED_FEATURE_WINDOW_OBJECT_NAMES
+        ):
+            watched.hide()
+            watched.setWindowFlags(Qt.WindowType.Widget)
+            _park_widget_for_reparent(watched)
+            return True
+        return super().eventFilter(watched, event)
+
     def closeEvent(self, event) -> None:
         self.save_last_window_size()
         self._flush_workspace_autosave()
@@ -14047,6 +14086,9 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
         event.accept()
         app = QApplication.instance()
+        if isinstance(app, QApplication) and self._feature_window_guard_installed:
+            app.removeEventFilter(self)
+            self._feature_window_guard_installed = False
         if app is not None:
             QTimer.singleShot(0, app.quit)
 
