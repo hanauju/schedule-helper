@@ -142,6 +142,14 @@ def _assert_no_feature_panel_top_level_shows(recorder: _TopLevelShowRecorder) ->
     assert "featureCell" not in recorder.object_names
     assert "mediaPanel" not in recorder.object_names
     assert "featureReparentBin" not in recorder.object_names
+    assert "favoritesPanel" not in recorder.object_names
+    assert "favoritesShelfArea" not in recorder.object_names
+    assert "favoritesShelf" not in recorder.object_names
+    assert "favoriteButton" not in recorder.object_names
+    assert "compactFavoritesPanel" not in recorder.object_names
+    assert "compactFavoritesShelfArea" not in recorder.object_names
+    assert "compactFavoritesShelf" not in recorder.object_names
+    assert "compactFavoriteButton" not in recorder.object_names
 
 
 def _margins_tuple(layout) -> tuple[int, int, int, int]:
@@ -5155,6 +5163,7 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     app.processEvents()
 
     feature_key = _first_image_panel_key(window)
+    assert window.feature_boxes[feature_key].widget_callback is None
     assert window.media_preview_label.pixmap() is not None
     assert not window.media_preview_label.pixmap().isNull()
     media_buttons = {button.text() for button in window.feature_boxes[feature_key].findChildren(QPushButton)}
@@ -5167,12 +5176,12 @@ def test_media_panel_loads_saved_image_in_main_and_window(tmp_path) -> None:
     assert media_popup.isVisible()
     media_popup_buttons = {button.text() for button in media_popup.findChildren(QPushButton)}
     assert "패널 고정" in media_popup_buttons
-    assert "새창으로 열기" in media_popup_buttons
+    assert "새창으로 열기" not in media_popup_buttons
     assert "메인창에서 숨기기" not in media_popup_buttons
     assert "이미지 변경" in media_popup_buttons
     assert "이미지 비우기" in media_popup_buttons
     assert "보기 조정" in media_popup_buttons
-    assert "보기 초기화" in media_popup_buttons
+    assert "보기 초기화" not in media_popup_buttons
     assert "새 이미지 패널 추가" in media_popup_buttons
     assert media_popup.minimumWidth() >= 164
     media_popup.close()
@@ -5661,6 +5670,34 @@ def test_many_image_panels_rerender_without_feature_window_flicker(tmp_path) -> 
         assert window.feature_boxes[feature_key].parentWidget() is window.feature_cells[feature_key]
     assert all(widget.objectName() != "featureReparentBin" for widget in QApplication.topLevelWidgets())
     assert all(widget.objectName() != "featureBox" for widget in QApplication.topLevelWidgets())
+    _assert_no_feature_panel_top_level_shows(recorder)
+
+    window.close()
+
+
+def test_add_image_panel_with_link_favorite_does_not_flash_favorite_window(tmp_path) -> None:
+    app = _app()
+    repository = ScheduleRepository(tmp_path / "schedule.sqlite3")
+    repository.save_link_favorite(LinkFavorite(title="유튜브", target="https://youtube.com"))
+
+    window = MainWindow(repository)
+    window.resize(1400, 900)
+    window.show()
+    window.refresh_link_favorites()
+    app.processEvents()
+
+    recorder = _TopLevelShowRecorder()
+    app.installEventFilter(recorder)
+    try:
+        window.refresh_link_favorites()
+        app.processEvents()
+        window.add_image_panel()
+        app.processEvents()
+    finally:
+        app.removeEventFilter(recorder)
+
+    assert "favoriteButton" not in recorder.object_names
+    assert all(widget.objectName() != "favoriteButton" for widget in QApplication.topLevelWidgets())
     _assert_no_feature_panel_top_level_shows(recorder)
 
     window.close()

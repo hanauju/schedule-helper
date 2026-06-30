@@ -165,6 +165,14 @@ EMBEDDED_FEATURE_WINDOW_OBJECT_NAMES: Final = {
     "featureColumn",
     "featureWidthSpacer",
     "dashboardGridGuideOverlay",
+    "favoritesPanel",
+    "favoritesShelfArea",
+    "favoritesShelf",
+    "favoriteButton",
+    "compactFavoritesPanel",
+    "compactFavoritesShelfArea",
+    "compactFavoritesShelf",
+    "compactFavoriteButton",
 }
 
 
@@ -3957,7 +3965,6 @@ class MainWindow(QMainWindow):
                 "today_timeline",
                 "link_favorites",
             }
-            or _is_media_panel_feature_key(feature_key)
             else None
         )
         box = DraggableFeatureBox(
@@ -5619,6 +5626,7 @@ class MainWindow(QMainWindow):
         self.link_favorite_buttons_by_id: dict[int, QWidget] = {}
         self._link_favorites_stretch_rows = 0
         panel.setObjectName("favoritesPanel")
+        panel.setWindowFlags(Qt.WindowType.Widget)
         panel.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         layout = QVBoxLayout(panel)
         self.link_favorites_panel_layout = layout
@@ -5639,14 +5647,16 @@ class MainWindow(QMainWindow):
         heading_row.addWidget(favorites_settings_button)
         layout.addLayout(heading_row)
 
-        self.link_favorites_area = QScrollArea()
+        self.link_favorites_area = QScrollArea(panel)
         self.link_favorites_area.setObjectName("favoritesShelfArea")
+        self.link_favorites_area.setWindowFlags(Qt.WindowType.Widget)
         self.link_favorites_area.setWidgetResizable(True)
         self.link_favorites_area.setFrameShape(QFrame.Shape.NoFrame)
         self.link_favorites_area.setMinimumHeight(120)
 
-        favorites_widget = QWidget()
+        favorites_widget = QWidget(self.link_favorites_area)
         favorites_widget.setObjectName("favoritesShelf")
+        favorites_widget.setWindowFlags(Qt.WindowType.Widget)
         favorites_widget.setMinimumWidth(0)
         self.link_favorites_layout = QGridLayout(favorites_widget)
         self.link_favorites_layout.setContentsMargins(0, 0, 0, 0)
@@ -5708,6 +5718,7 @@ class MainWindow(QMainWindow):
     def _build_compact_favorites_panel(self) -> QWidget:
         panel = QWidget()
         panel.setObjectName("compactFavoritesPanel")
+        panel.setWindowFlags(Qt.WindowType.Widget)
         layout = QVBoxLayout(panel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
@@ -5724,14 +5735,18 @@ class MainWindow(QMainWindow):
         header.addWidget(settings_button)
         layout.addLayout(header)
 
-        self.compact_favorites_area = QScrollArea()
+        self.compact_favorites_area = QScrollArea(panel)
+        self.compact_favorites_area.setObjectName("compactFavoritesShelfArea")
+        self.compact_favorites_area.setWindowFlags(Qt.WindowType.Widget)
         self.compact_favorites_area.setWidgetResizable(True)
         self.compact_favorites_area.setFrameShape(QFrame.Shape.NoFrame)
         self.compact_favorites_area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         self.compact_favorites_area.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.compact_favorites_area.setMaximumHeight(72)
 
-        favorites_widget = QWidget()
+        favorites_widget = QWidget(self.compact_favorites_area)
+        favorites_widget.setObjectName("compactFavoritesShelf")
+        favorites_widget.setWindowFlags(Qt.WindowType.Widget)
         favorites_widget.setMinimumWidth(0)
         self.compact_favorites_layout = QHBoxLayout(favorites_widget)
         self.compact_favorites_layout.setContentsMargins(0, 0, 0, 0)
@@ -8609,8 +8624,6 @@ class MainWindow(QMainWindow):
             ("이미지 변경", lambda: self.choose_media_panel_file(feature_key), True),
             ("이미지 비우기", lambda: self.clear_media_panel_file(feature_key), has_image),
             ("보기 조정", lambda: self.adjust_media_panel_image_view(feature_key), has_image),
-            ("보기 초기화", lambda: self.reset_media_panel_image_view(feature_key), has_image),
-            ("새창으로 열기", lambda: self.open_feature_widget(feature_key), True),
             ("새 이미지 패널 추가", self.add_image_panel, True),
             ("패널 고정 해제" if pinned else "패널 고정", lambda: self.set_feature_panel_pinned(feature_key, not pinned), True),
         ]
@@ -8955,17 +8968,23 @@ class MainWindow(QMainWindow):
             item = self.link_favorites_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
-                widget.setParent(None)
+                _park_widget_for_reparent(widget)
                 widget.deleteLater()
         for column in range(3):
             self.link_favorites_layout.setColumnStretch(column, 1 if column < columns else 0)
         for row in range(getattr(self, "_link_favorites_stretch_rows", 0) + 2):
             self.link_favorites_layout.setRowStretch(row, 0)
 
+        favorites_parent = self.link_favorites_area.widget()
+        if not isinstance(favorites_parent, QWidget):
+            favorites_parent = None
         favorites = self.repository.list_link_favorites()
         if not favorites:
             empty_label = QLabel("저장된 즐겨찾기가 없습니다. 설정에서 추가하세요.")
+            if favorites_parent is not None:
+                empty_label.setParent(favorites_parent)
             empty_label.setObjectName("mutedLabel")
+            empty_label.setWindowFlags(Qt.WindowType.Widget)
             empty_label.setWordWrap(True)
             self.link_favorites_layout.addWidget(empty_label, 0, 0, 1, columns)
             self.link_favorites_layout.setRowStretch(1, 1)
@@ -8974,7 +8993,7 @@ class MainWindow(QMainWindow):
             return
 
         for index, favorite in enumerate(favorites):
-            button = self._build_favorite_button(favorite)
+            button = self._build_favorite_button(favorite, favorites_parent)
             row, column = divmod(index, columns)
             self.link_favorites_layout.addWidget(button, row, column)
         row_count = (len(favorites) + columns - 1) // columns
@@ -8982,7 +9001,7 @@ class MainWindow(QMainWindow):
         self._link_favorites_stretch_rows = row_count
         self.refresh_compact_widget()
 
-    def _build_favorite_button(self, favorite: LinkFavorite) -> QWidget:
+    def _build_favorite_button(self, favorite: LinkFavorite, parent: QWidget | None = None) -> QWidget:
         mode = self.preferences.favorite_display_mode
         secondary_label = _favorite_secondary_label(favorite)
         if mode == "text":
@@ -8990,11 +9009,12 @@ class MainWindow(QMainWindow):
                 favorite.id,
                 self.handle_link_favorite_reorder_drop,
                 f"{favorite.title}\n{secondary_label}" if secondary_label else favorite.title,
+                parent,
             )
             button.setObjectName("favoriteButton")
             button.setMinimumHeight(56 if secondary_label else 40)
         else:
-            button = FavoriteDragToolButton(favorite.id, self.handle_link_favorite_reorder_drop)
+            button = FavoriteDragToolButton(favorite.id, self.handle_link_favorite_reorder_drop, parent)
             button.setObjectName("favoriteButton")
             if mode == "icon_only":
                 button.setText("")
@@ -9016,6 +9036,7 @@ class MainWindow(QMainWindow):
             else:
                 title_text = f"{favorite.title}\n{secondary_label}" if secondary_label else favorite.title
                 button.setText(f"{_favorite_icon_text(favorite)}\n{title_text}")
+        button.setWindowFlags(Qt.WindowType.Widget)
         button.setMinimumWidth(0)
         button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         button.setToolTip(f"{favorite.title}\n{favorite.target}")
@@ -9075,31 +9096,38 @@ class MainWindow(QMainWindow):
             item = self.compact_favorites_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                _park_widget_for_reparent(widget)
                 widget.deleteLater()
 
+        favorites_parent = self.compact_favorites_area.widget()
+        if not isinstance(favorites_parent, QWidget):
+            favorites_parent = None
         favorites = self.repository.list_link_favorites()
         if not favorites:
             empty_label = QLabel("없음")
+            if favorites_parent is not None:
+                empty_label.setParent(favorites_parent)
             empty_label.setObjectName("mutedLabel")
+            empty_label.setWindowFlags(Qt.WindowType.Widget)
             self.compact_favorites_layout.addWidget(empty_label)
             self.compact_favorites_layout.addStretch(1)
             return
 
         for favorite in favorites:
-            button = self._build_compact_favorite_button(favorite)
+            button = self._build_compact_favorite_button(favorite, favorites_parent)
             self.compact_favorites_layout.addWidget(button)
         self.compact_favorites_layout.addStretch(1)
 
-    def _build_compact_favorite_button(self, favorite: LinkFavorite) -> QWidget:
+    def _build_compact_favorite_button(self, favorite: LinkFavorite, parent: QWidget | None = None) -> QWidget:
         mode = self.preferences.favorite_display_mode
         if mode == "text":
-            button = QPushButton(_shorten(favorite.title, 12))
+            button = QPushButton(_shorten(favorite.title, 12), parent)
             button.setObjectName("compactFavoriteButton")
             button.setMinimumWidth(70)
             button.setMaximumWidth(98)
             button.setMinimumHeight(34)
         else:
-            button = QToolButton()
+            button = QToolButton(parent)
             button.setObjectName("compactFavoriteButton")
             button.setMinimumWidth(54)
             button.setMaximumWidth(76 if mode == "icon_only" else 92)
@@ -9120,6 +9148,7 @@ class MainWindow(QMainWindow):
             else:
                 button.setText(f"{_favorite_icon_text(favorite)}\n{_shorten(favorite.title, 10)}")
                 button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        button.setWindowFlags(Qt.WindowType.Widget)
         button.setToolTip(f"{favorite.title}\n{favorite.target}")
         button.clicked.connect(lambda _checked=False, favorite_id=favorite.id: self.open_link_favorite(favorite_id))
         button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -14256,18 +14285,25 @@ class IntegratedWidgetDialog(QDialog):
             item = self.favorites_layout.takeAt(0)
             widget = item.widget()
             if widget is not None:
+                _park_widget_for_reparent(widget)
                 widget.deleteLater()
         if not self.owner.preferences.show_compact_favorites_panel:
             return
+        favorites_parent = self.favorites_area.widget()
+        if not isinstance(favorites_parent, QWidget):
+            favorites_parent = None
         favorites = self.owner.repository.list_link_favorites()
         if not favorites:
             empty = QLabel("없음")
+            if favorites_parent is not None:
+                empty.setParent(favorites_parent)
             empty.setObjectName("mutedLabel")
+            empty.setWindowFlags(Qt.WindowType.Widget)
             self.favorites_layout.addWidget(empty)
             self.favorites_layout.addStretch(1)
             return
         for favorite in favorites:
-            self.favorites_layout.addWidget(self.owner._build_compact_favorite_button(favorite))
+            self.favorites_layout.addWidget(self.owner._build_compact_favorite_button(favorite, favorites_parent))
         self.favorites_layout.addStretch(1)
 
     def save_note(self) -> None:
@@ -14841,10 +14877,10 @@ class FavoritesWidgetDialog(QDialog):
         header.addWidget(settings_button)
         layout.addLayout(header)
 
-        self.area = QScrollArea()
+        self.area = QScrollArea(self)
         self.area.setWidgetResizable(True)
         self.area.setFrameShape(QFrame.Shape.NoFrame)
-        content = QWidget()
+        content = QWidget(self.area)
         self.items_layout = QVBoxLayout(content)
         self.items_layout.setContentsMargins(0, 0, 0, 0)
         self.items_layout.setSpacing(8)
@@ -14855,15 +14891,21 @@ class FavoritesWidgetDialog(QDialog):
 
     def refresh(self) -> None:
         _clear_layout(self.items_layout)
+        items_parent = self.area.widget()
+        if not isinstance(items_parent, QWidget):
+            items_parent = None
         favorites = self.owner.repository.list_link_favorites()
         if not favorites:
             empty = QLabel("저장된 즐겨찾기가 없습니다.")
+            if items_parent is not None:
+                empty.setParent(items_parent)
             empty.setObjectName("mutedLabel")
+            empty.setWindowFlags(Qt.WindowType.Widget)
             self.items_layout.addWidget(empty)
             self.items_layout.addStretch(1)
             return
         for favorite in favorites:
-            self.items_layout.addWidget(self.owner._build_compact_favorite_button(favorite))
+            self.items_layout.addWidget(self.owner._build_compact_favorite_button(favorite, items_parent))
         self.items_layout.addStretch(1)
 
     def show_settings(self) -> None:
